@@ -122,7 +122,7 @@ Expected: `gh --version` prints a version string.
 
 - [ ] **Step 4: Enable lingering for the service account**
 
-Task 9 installs Hermes as a system-level systemd service (`--system`), which doesn't strictly need lingering. Enable it anyway as a cheap safety net in case a user-level service is ever used instead (e.g. during troubleshooting):
+Task 10 installs Hermes as a system-level systemd service (`--system`), which doesn't strictly need lingering. Enable it anyway as a cheap safety net in case a user-level service is ever used instead (e.g. during troubleshooting):
 
 ```bash
 sudo loginctl enable-linger $USER
@@ -208,7 +208,46 @@ Expected: output containing `pong`.
 
 ---
 
-### Task 5: Generate Hermes' own git identity
+### Task 5: Enable free web search (DDGS/DuckDuckGo)
+
+**Files:**
+- Modifies: `~/.hermes/config.yaml` (sets the `web_search` backend)
+
+**Interfaces:**
+- Consumes: `hermes` CLI from Task 3.
+- Produces: a working `web_search` tool call the agent can use mid-experiment (e.g. to look up a dataset, an API, or a technique) with no API key and no cost.
+
+- [ ] **Step 1: Select DDGS as the web search backend**
+
+```bash
+hermes tools
+```
+
+Navigate to **Web Search & Extract** → choose **DDGS (DuckDuckGo)**. No API key is required.
+
+- [ ] **Step 2: Install the DDGS package if it isn't lazy-installed automatically**
+
+```bash
+pip install ddgs
+```
+
+(Hermes lazy-installs this into its own venv on first use if `security.allow_lazy_installs` is left at its default of `true` — this step is just a fallback if that fails.)
+
+- [ ] **Step 3: Verify web search works**
+
+```bash
+hermes -p "Search the web for the current version of Ubuntu Server LTS and tell me what it is."
+```
+
+Expected: a response naming a real, current Ubuntu LTS version, showing the `web_search` tool was actually invoked rather than answered from training data.
+
+:::note
+DDGS is search-only — no `web_extract` (full page content). If a later experiment needs to pull full article/doc content rather than just search snippets, revisit this task and add a `web_extract`-capable backend (Firecrawl's free tier is the natural next step: 500 credits/month, needs an API key from firecrawl.dev).
+:::
+
+---
+
+### Task 6: Generate Hermes' own git identity
 
 **Files:**
 - Creates: `~/.ssh/id_ed25519_hermes`, `~/.ssh/id_ed25519_hermes.pub`
@@ -216,7 +255,7 @@ Expected: output containing `pong`.
 - Modifies: `~/.gitconfig` (sets a `[user]` name/email — see note in Step 4 about scope)
 
 **Interfaces:**
-- Produces: the `github.com-hermes` SSH host alias and `Hermes Agent <hermes-agent@...>` commit identity that Task 6 verifies and Task 7's SOUL.md instructions reference.
+- Produces: the `github.com-hermes` SSH host alias and `Hermes Agent <hermes-agent@...>` commit identity that Task 7 verifies and Task 8's SOUL.md instructions reference.
 
 - [ ] **Step 1: Generate the keypair**
 
@@ -262,12 +301,12 @@ Expected: `Hi <owner-github-username>! You've successfully authenticated, but Gi
 
 ---
 
-### Task 6: Verify the git identity end-to-end with a scratch repo
+### Task 7: Verify the git identity end-to-end with a scratch repo
 
 **Files:** none permanent — uses a throwaway repo
 
 **Interfaces:**
-- Consumes: `github.com-hermes` alias and commit identity from Task 5.
+- Consumes: `github.com-hermes` alias and commit identity from Task 6.
 - Produces: confirmation that clone → branch → commit → push → PR works before wiring it into Hermes' standing instructions.
 
 - [ ] **Step 1: Create a scratch repo on GitHub**
@@ -307,7 +346,7 @@ gh repo delete hermes-harness-smoketest --yes
 
 ---
 
-### Task 7: Author the standing experiment workflow instructions
+### Task 8: Author the standing experiment workflow instructions
 
 **Files:**
 - Modifies: `~/.hermes/SOUL.md`
@@ -356,7 +395,7 @@ Expected: a response referencing branch creation and opening a PR (confirms SOUL
 
 ---
 
-### Task 8: Set up the Telegram bot and gateway with an owner-only allowlist
+### Task 9: Set up the Telegram bot and gateway with an owner-only allowlist
 
 **Files:**
 - Modifies: `~/.hermes/.env` (adds `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS`)
@@ -398,17 +437,17 @@ hermes config set TELEGRAM_ALLOWED_USERS <your-telegram-user-id>
 hermes gateway
 ```
 
-Run in the foreground temporarily. Message the bot from your own Telegram account — expect a normal reply. Have someone else (or a second Telegram account) message the bot — expect no response (silently denied per the security doc). Then `Ctrl+C` to stop the foreground run before moving to Task 9.
+Run in the foreground temporarily. Message the bot from your own Telegram account — expect a normal reply. Have someone else (or a second Telegram account) message the bot — expect no response (silently denied per the security doc). Then `Ctrl+C` to stop the foreground run before moving to Task 10.
 
 ---
 
-### Task 9: Install the gateway as a boot-time systemd service
+### Task 10: Install the gateway as a boot-time systemd service
 
 **Files:**
 - Creates: `~/.config/systemd/user/hermes-gateway.service` (or the system-level unit if using `--system`)
 
 **Interfaces:**
-- Consumes: the configured gateway from Task 8.
+- Consumes: the configured gateway from Task 9.
 - Produces: an always-on gateway process that survives reboots and crashes.
 
 - [ ] **Step 1: Install the service**
@@ -447,12 +486,12 @@ Double-check `config/config.yaml.example` contains no API keys before committing
 
 ---
 
-### Task 10: Reboot verification test
+### Task 11: Reboot verification test
 
 **Files:** none
 
 **Interfaces:**
-- Consumes: the systemd service from Task 9.
+- Consumes: the systemd service from Task 10.
 - Produces: confirmation the whole stack survives a real reboot unattended.
 
 - [ ] **Step 1: Reboot the machine**
@@ -475,12 +514,12 @@ Message the bot. Expect a normal reply with no manual restart needed.
 
 ---
 
-### Task 11: End-to-end experiment test
+### Task 12: End-to-end experiment test
 
 **Files:** none permanent — uses a throwaway repo
 
 **Interfaces:**
-- Consumes: everything from Tasks 5-9.
+- Consumes: everything from Tasks 6-10.
 - Produces: proof the full "message → experiment → PR" loop works as designed.
 
 - [ ] **Step 1: Create a trivial scratch repo**
@@ -518,12 +557,12 @@ gh repo delete hermes-e2e-test --yes
 
 ---
 
-### Task 12: Access-control verification test
+### Task 13: Access-control verification test
 
 **Files:** none
 
 **Interfaces:**
-- Consumes: the `TELEGRAM_ALLOWED_USERS` allowlist from Task 8.
+- Consumes: the `TELEGRAM_ALLOWED_USERS` allowlist from Task 9.
 - Produces: confirmation the box can't be triggered by strangers.
 
 - [ ] **Step 1: Message the bot from a non-allowlisted account**
