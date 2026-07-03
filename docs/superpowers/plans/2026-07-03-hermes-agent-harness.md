@@ -208,24 +208,39 @@ Expected: output containing `pong`.
 
 ---
 
-### Task 5: Enable free web search (DDGS/DuckDuckGo)
+### Task 5: Enable free web search (DDGS) and free-tier extract (Firecrawl)
 
 **Files:**
-- Modifies: `~/.hermes/config.yaml` (sets the `web_search` backend)
+- Modifies: `~/.hermes/.env` (adds `FIRECRAWL_API_KEY`)
+- Modifies: `~/.hermes/config.yaml` (sets `web.search_backend` and `web.extract_backend`)
 
 **Interfaces:**
 - Consumes: `hermes` CLI from Task 3.
-- Produces: a working `web_search` tool call the agent can use mid-experiment (e.g. to look up a dataset, an API, or a technique) with no API key and no cost.
+- Produces: a working `web_search` tool (DDGS, no key, no cost) and a working `web_extract` tool (Firecrawl free tier, 500 credits/month) the agent can use mid-experiment — e.g. to search for a technique, then pull the full content of a paper or doc page rather than just a snippet.
 
-- [ ] **Step 1: Select DDGS as the web search backend**
+- [ ] **Step 1: Get a Firecrawl API key**
+
+Sign up at https://firecrawl.dev and copy an API key from the dashboard (free tier: 500 credits/month, no card required).
+
+- [ ] **Step 2: Set the Firecrawl key**
 
 ```bash
-hermes tools
+hermes config set FIRECRAWL_API_KEY fc-your-key-here
 ```
 
-Navigate to **Web Search & Extract** → choose **DDGS (DuckDuckGo)**. No API key is required.
+- [ ] **Step 3: Split search and extract to different backends**
 
-- [ ] **Step 2: Install the DDGS package if it isn't lazy-installed automatically**
+DDGS stays the search backend (free, no key). Firecrawl becomes the extract-only backend, since DDGS has no extract capability:
+
+```bash
+cat >> ~/.hermes/config.yaml <<'EOF'
+web:
+  search_backend: "ddgs"
+  extract_backend: "firecrawl"
+EOF
+```
+
+- [ ] **Step 4: Install the DDGS package if it isn't lazy-installed automatically**
 
 ```bash
 pip install ddgs
@@ -233,7 +248,7 @@ pip install ddgs
 
 (Hermes lazy-installs this into its own venv on first use if `security.allow_lazy_installs` is left at its default of `true` — this step is just a fallback if that fails.)
 
-- [ ] **Step 3: Verify web search works**
+- [ ] **Step 5: Verify web search works**
 
 ```bash
 hermes -p "Search the web for the current version of Ubuntu Server LTS and tell me what it is."
@@ -241,9 +256,13 @@ hermes -p "Search the web for the current version of Ubuntu Server LTS and tell 
 
 Expected: a response naming a real, current Ubuntu LTS version, showing the `web_search` tool was actually invoked rather than answered from training data.
 
-:::note
-DDGS is search-only — no `web_extract` (full page content). If a later experiment needs to pull full article/doc content rather than just search snippets, revisit this task and add a `web_extract`-capable backend (Firecrawl's free tier is the natural next step: 500 credits/month, needs an API key from firecrawl.dev).
-:::
+- [ ] **Step 6: Verify web extract works**
+
+```bash
+hermes -p "Use web_extract to fetch https://ubuntu.com/server and summarize what the page says in 2 sentences."
+```
+
+Expected: a 2-sentence summary reflecting actual page content (not a generic guess), confirming Firecrawl extract is wired up and being billed against the free-tier credits rather than failing over to a no-op.
 
 ---
 
