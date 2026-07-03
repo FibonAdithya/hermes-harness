@@ -4,16 +4,16 @@
 
 **Goal:** Turn this laptop into an always-on Hermes Agent box, reachable via Telegram, that clones a named repo, runs an ML/data-science experiment, and opens a GitHub PR with the results — using a git identity that's clearly separate from the owner's own commits.
 
-**Architecture:** Ubuntu Server 24.04 LTS (headless) running the Hermes Agent gateway as a boot-time systemd service. Telegram is the messaging front end, restricted to a single allowlisted owner user ID. OpenRouter provides the model. A dedicated SSH keypair + `~/.ssh/config` host alias give Hermes its own git identity, layered on top of the owner's existing GitHub account (not a separate account). The bundled `github-auth` and `github-pr-workflow` Hermes skills handle the actual git/PR mechanics; a `SOUL.md` standing instruction pins the branch-naming and PR-only convention so it doesn't need to be repeated per message.
+**Architecture:** Ubuntu Server 24.04 LTS (headless) running the Hermes Agent gateway as a boot-time systemd service. Telegram is the messaging front end, restricted to a single allowlisted owner user ID. OpenRouter provides the model. The agent's own command execution (`terminal`/`execute_code`/file tools) runs inside a persistent, root-capable Docker sandbox container — not on the host — so it can install anything it needs (`apt`, `rustup`, etc.) without hitting Hermes' command-approval prompts, while the host OS stays untouched no matter what happens inside. A dedicated SSH keypair + `~/.ssh/config` host alias, bind-mounted into the container, give Hermes its own git identity, layered on top of the owner's existing GitHub account (not a separate account). The bundled `github-auth` and `github-pr-workflow` Hermes skills handle the actual git/PR mechanics; a `SOUL.md` standing instruction pins the branch-naming and PR-only convention so it doesn't need to be repeated per message.
 
-**Tech Stack:** Ubuntu Server 24.04 LTS, Hermes Agent (installed via official install script), systemd (user service), Telegram Bot API, OpenRouter, git + GitHub CLI (`gh`).
+**Tech Stack:** Ubuntu Server 24.04 LTS, Docker Engine, Hermes Agent (installed via official install script), systemd (user service), Telegram Bot API, OpenRouter, git + GitHub CLI (`gh`).
 
 ## Global Constraints
 
 - OS: Ubuntu Server 24.04 LTS, no desktop environment (per spec section 1).
 - Messaging: Telegram only, allowlisted to the owner's Telegram user ID only — no open access (per spec section 2, and `website/docs/user-guide/security.md` "Best Practices for Production Deployment" #1).
 - Model provider: OpenRouter, starting on a free-tier model (per spec section 2).
-- Execution: direct on host, no container sandbox — this is a dedicated single-purpose machine (spec section 2, "Out of scope").
+- Execution: inside a persistent Docker sandbox container (`terminal.backend: docker`), running as root (`docker_run_as_host_user: false`) so it can install anything without approval friction — the container, not command-level approval, is the safety boundary (spec section 2).
 - Git identity: a **new** SSH keypair + distinct `user.name`/`user.email`, added as an extra key on the owner's **existing** GitHub account — not a new account (spec section 2, updated during brainstorming).
 - Git workflow: every experiment is a fresh `experiment/<slug>` branch, ending in a PR. **Never** push directly to `main`/`master` (spec section 4).
 - No default experiments repo — every message names which repo/directory to work in (spec section 3).
@@ -120,9 +120,25 @@ sudo apt install gh -y
 
 Expected: `gh --version` prints a version string.
 
-- [ ] **Step 4: Enable lingering for the service account**
+- [ ] **Step 4: Install Docker Engine**
 
-Task 10 installs Hermes as a system-level systemd service (`--system`), which doesn't strictly need lingering. Enable it anyway as a cheap safety net in case a user-level service is ever used instead (e.g. during troubleshooting):
+```bash
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker $USER
+```
+
+Log out and back in (or `newgrp docker`) so the group membership takes effect, then verify:
+
+```bash
+docker version
+docker run --rm hello-world
+```
+
+Expected: `docker version` prints both Client and Server sections with no errors, and `hello-world` prints its "Hello from Docker!" message.
+
+- [ ] **Step 5: Enable lingering for the service account**
+
+Task 11 installs Hermes as a system-level systemd service (`--system`), which doesn't strictly need lingering. Enable it anyway as a cheap safety net in case a user-level service is ever used instead (e.g. during troubleshooting):
 
 ```bash
 sudo loginctl enable-linger $USER
@@ -274,7 +290,7 @@ Expected: a 2-sentence summary reflecting actual page content (not a generic gue
 - Modifies: `~/.gitconfig` (sets a `[user]` name/email — see note in Step 4 about scope)
 
 **Interfaces:**
-- Produces: the `github.com-hermes` SSH host alias and `Hermes Agent <hermes-agent@...>` commit identity that Task 7 verifies and Task 8's SOUL.md instructions reference.
+- Produces: the `github.com-hermes` SSH host alias and `Hermes Agent <hermes-agent@...>` commit identity that Task 8 verifies and Task 9's SOUL.md instructions reference.
 
 - [ ] **Step 1: Generate the keypair**
 
@@ -320,7 +336,76 @@ Expected: `Hi <owner-github-username>! You've successfully authenticated, but Gi
 
 ---
 
-### Task 7: Verify the git identity end-to-end with a scratch repo
+### Task 7: Configure the Docker sandbox backend
+
+**Files:**
+- Modifies: `~/.hermes/config.yaml` (adds the `terminal:` block)
+
+**Interfaces:**
+- Consumes: Docker Engine from Task 2, the `~/.ssh` directory (key + `github.com-hermes` alias) and git identity from Task 6.
+- Produces: every future `terminal`/`execute_code`/file-tool call the agent makes runs inside this container instead of on the host, with root access, the mounted git identity, and a persistent filesystem — used by Task 8 (verify from inside the container) onward.
+
+- [ ] **Step 1: Set the terminal backend to Docker**
+
+```bash
+hermes config set terminal.backend docker
+```
+
+- [ ] **Step 2: Pick a base image and set resource limits**
+
+```bash
+cat >> ~/.hermes/config.yaml <<'EOF'
+terminal:
+  backend: docker
+  docker_image: "nikolaik/python-nodejs:python3.11-nodejs20"
+  docker_run_as_host_user: false
+  container_persistent: true
+  docker_persist_across_processes: true
+  container_cpu: 2
+  container_memory: 6144
+  container_disk: 51200
+EOF
+```
+
+`nikolaik/python-nodejs` is a reasonable ML/data-science starting image (Python 3.11 + Node 20 + pip). Since the container runs as root, the agent can `apt install`/`rustup`/etc. anything else it needs on top of this base — nothing here is a hard ceiling.
+
+- [ ] **Step 3: Mount the Hermes SSH identity into the container**
+
+```bash
+cat >> ~/.hermes/config.yaml <<EOF
+  docker_volumes:
+    - "$HOME/.ssh:/root/.ssh:ro"
+  docker_env:
+    GIT_AUTHOR_NAME: "Hermes Agent"
+    GIT_AUTHOR_EMAIL: "hermes-agent@<owner-domain>"
+    GIT_COMMITTER_NAME: "Hermes Agent"
+    GIT_COMMITTER_EMAIL: "hermes-agent@<owner-domain>"
+EOF
+```
+
+Mounting the whole `~/.ssh` directory read-only gives the container root user (whose home is `/root`, matching the `~/.ssh/config` paths) access to `id_ed25519_hermes`, the `github.com-hermes` alias, and `known_hosts` without duplicating any files. The `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env vars replace the need for a separate in-container `.gitconfig` — git reads them directly.
+
+- [ ] **Step 4: Verify Docker sandbox is active and the git identity is reachable from inside it**
+
+```bash
+hermes -p "Run: whoami && ssh -T git@github.com-hermes ; echo done"
+```
+
+Expected: `whoami` prints `root` (confirming it's running in the container, not as the host user), the SSH command prints `Hi <owner-github-username>! ... does not provide shell access.`, confirming the mounted key works from inside the sandbox.
+
+- [ ] **Step 5: Verify persistence across a session reset**
+
+```bash
+hermes -p "Run: touch /workspace/persistence-check.txt"
+hermes -p "/new"
+hermes -p "Run: ls /workspace/persistence-check.txt"
+```
+
+Expected: the file still exists after `/new` starts a fresh conversation — confirming `container_persistent: true` is keeping the same container/filesystem across sessions rather than starting fresh each time.
+
+---
+
+### Task 8: Verify the git identity end-to-end with a scratch repo
 
 **Files:** none permanent — uses a throwaway repo
 
@@ -365,7 +450,7 @@ gh repo delete hermes-harness-smoketest --yes
 
 ---
 
-### Task 8: Author the standing experiment workflow instructions
+### Task 9: Author the standing experiment workflow instructions
 
 **Files:**
 - Modifies: `~/.hermes/SOUL.md`
@@ -414,7 +499,7 @@ Expected: a response referencing branch creation and opening a PR (confirms SOUL
 
 ---
 
-### Task 9: Set up the Telegram bot and gateway with an owner-only allowlist
+### Task 10: Set up the Telegram bot and gateway with an owner-only allowlist
 
 **Files:**
 - Modifies: `~/.hermes/.env` (adds `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS`)
@@ -456,17 +541,17 @@ hermes config set TELEGRAM_ALLOWED_USERS <your-telegram-user-id>
 hermes gateway
 ```
 
-Run in the foreground temporarily. Message the bot from your own Telegram account — expect a normal reply. Have someone else (or a second Telegram account) message the bot — expect no response (silently denied per the security doc). Then `Ctrl+C` to stop the foreground run before moving to Task 10.
+Run in the foreground temporarily. Message the bot from your own Telegram account — expect a normal reply. Have someone else (or a second Telegram account) message the bot — expect no response (silently denied per the security doc). Then `Ctrl+C` to stop the foreground run before moving to Task 11.
 
 ---
 
-### Task 10: Install the gateway as a boot-time systemd service
+### Task 11: Install the gateway as a boot-time systemd service
 
 **Files:**
 - Creates: `~/.config/systemd/user/hermes-gateway.service` (or the system-level unit if using `--system`)
 
 **Interfaces:**
-- Consumes: the configured gateway from Task 9.
+- Consumes: the configured gateway from Task 10.
 - Produces: an always-on gateway process that survives reboots and crashes.
 
 - [ ] **Step 1: Install the service**
@@ -505,12 +590,12 @@ Double-check `config/config.yaml.example` contains no API keys before committing
 
 ---
 
-### Task 11: Reboot verification test
+### Task 12: Reboot verification test
 
 **Files:** none
 
 **Interfaces:**
-- Consumes: the systemd service from Task 10.
+- Consumes: the systemd service from Task 11.
 - Produces: confirmation the whole stack survives a real reboot unattended.
 
 - [ ] **Step 1: Reboot the machine**
@@ -533,12 +618,12 @@ Message the bot. Expect a normal reply with no manual restart needed.
 
 ---
 
-### Task 12: End-to-end experiment test
+### Task 13: End-to-end experiment test
 
 **Files:** none permanent — uses a throwaway repo
 
 **Interfaces:**
-- Consumes: everything from Tasks 6-10.
+- Consumes: everything from Tasks 6-11.
 - Produces: proof the full "message → experiment → PR" loop works as designed.
 
 - [ ] **Step 1: Create a trivial scratch repo**
@@ -576,12 +661,12 @@ gh repo delete hermes-e2e-test --yes
 
 ---
 
-### Task 13: Access-control verification test
+### Task 14: Access-control verification test
 
 **Files:** none
 
 **Interfaces:**
-- Consumes: the `TELEGRAM_ALLOWED_USERS` allowlist from Task 9.
+- Consumes: the `TELEGRAM_ALLOWED_USERS` allowlist from Task 10.
 - Produces: confirmation the box can't be triggered by strangers.
 
 - [ ] **Step 1: Message the bot from a non-allowlisted account**
