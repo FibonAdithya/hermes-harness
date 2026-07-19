@@ -1,5 +1,14 @@
 # Hermes Agent Harness Implementation Plan
 
+> **STATUS (2026-07-19): EXECUTED.** The harness is built and verified on the
+> Mint box `ramiz` (192.168.1.20). Do not follow this plan as written — parts
+> of it are wrong. Read the **As-built corrections** section of the spec
+> first. In particular: sandbox config is `.env`/`TERMINAL_ENV`, not
+> `config.yaml`; `docker_volumes`/`docker_env` are inert; tools must be baked
+> into a custom image because only `/root` and `/workspace` persist; the wiki
+> sync runs inside a container, not as the host user; and the one-shot CLI
+> flag is `hermes -z --yolo`, not `hermes -p`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Turn this laptop into an always-on Hermes Agent box, reachable via Telegram, that clones a named repo, runs an ML/data-science experiment, and opens a GitHub PR with the results — using a git identity clearly separate from the owner's own commits, a self-managed knowledge wiki it grows over time, and disk hygiene that keeps it lean without ever handing the agent host-level delete power.

@@ -3,6 +3,9 @@
 Date: 2026-07-03
 Revised: 2026-07-12 — keep Linux Mint instead of reflashing; add agent disk
 hygiene and a self-managed memory wiki.
+Revised: 2026-07-19 — corrected after implementation. Several mechanisms in
+the original design turned out not to work as written; see the **As-built
+corrections** section at the end for what actually holds.
 
 ## Purpose
 
@@ -218,3 +221,48 @@ growth is handled by OS-owned timers.
   or a store that itself grows.
 - Giving the agent host-level uninstall/delete power — explicitly rejected;
   host hygiene stays with OS-owned timers so the sandbox boundary holds.
+
+## As-built corrections (2026-07-19)
+
+The design above is accurate in intent, but four mechanisms it names do not
+work the way it describes. These were found during implementation and are
+recorded here so the doc is not quietly misleading.
+
+1. **Backend selection lives in `.env`, not `config.yaml`.**
+   `terminal.backend: docker` in `config.yaml` is *not* honoured at runtime.
+   The authoritative switch is `TERMINAL_ENV=docker` in `~/.hermes/.env`;
+   a stale `TERMINAL_ENV=local` there silently overrides everything else.
+   The failure mode is dangerous: `hermes config show` still reports
+   "Backend: docker" while commands execute directly **on the host**. Verify
+   with `id -u` (expect `0`) and the presence of `/.dockerenv`, never by
+   reading the config. Hermes also drives Docker through the `docker` Python
+   SDK, which must be installed into its venv — without it, Hermes silently
+   falls back to local execution rather than erroring.
+
+2. **`docker_volumes` / `docker_env` in `config.yaml` are inert.**
+   Hermes manages its own mounts and ignores these keys. The container's
+   `/root` is a bind mount of
+   `~/.hermes/sandboxes/docker/default/home` on the host, so the SSH key,
+   `.gitconfig`, and `gh` credentials are placed **directly into that
+   directory** rather than mounted or injected. The image is selected by
+   `TERMINAL_DOCKER_IMAGE` in `.env`.
+
+3. **Only `/root` and `/workspace` persist — durable tools must be baked
+   into the image.** Anything `apt install`ed lands in `/usr` and is lost
+   when the container is recreated. A custom image (`hermes-sandbox:latest`)
+   carries `git`, `gh`, `ripgrep`, and `jq`. §5's "agent self-pruning" still
+   holds, but the agent cannot durably *install* — only the image can.
+
+4. **The wiki auto-commit timer cannot run as the host user.** §5 assumed a
+   host-side `git` invocation using the host-resident key. In practice the
+   agent writes wiki files as container-root, so they are not writable by
+   the host user and `git add` fails. The timer instead runs git inside a
+   throwaway root container over the same bind mount. An early version of
+   this script swallowed that failure and reported "no changes" — the sync
+   must fail loudly, per §4's no-silent-failure rule.
+
+Additionally: `TELEGRAM_ALLOWED_USERS` matches the **numeric** Telegram user
+ID, not the username. A username there matches nothing and locks out the
+owner. Note also that Hermes' primary auth gate fails *closed* on an empty
+allowlist but a secondary fallback gate fails *open* — the allowlist must
+never be blanked.
