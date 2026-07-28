@@ -38,11 +38,17 @@ This task is manual and owner-performed — it creates the machine everything el
 
 - [ ] **Step 1: Create the server**
 
-In the provider console (Hetzner Cloud or equivalent), create a server:
-- Image: **Ubuntu 24.04 LTS**
-- Type: **CX22-class** (2 vCPU / 4 GB RAM / 40 GB disk)
-- SSH key: upload the owner's existing public key
-- Enable **backups/snapshots** if offered
+In the DigitalOcean console, Create → Droplets:
+- Image: **Ubuntu 24.04 (LTS) x64**
+- Type: **Basic → Regular → 4 GB / 2 vCPU**
+- Authentication: **SSH Key** — the owner's existing `~/.ssh/id_ed25519.pub`
+- Hostname: `hermes-assistant`
+- Monitoring: enabled (free)
+- Automated backups: skip — the manual snapshot in Step 7 is the recovery
+  artefact, and is much cheaper
+
+Disk can only be resized upward on DigitalOcean, so do not undersize it
+expecting to shrink-and-grow later. CPU and RAM resize both ways.
 
 Note the public IPv4 address.
 
