@@ -1,5 +1,10 @@
 # Hermes Agent Harness — Design
 
+> **Superseded (2026-07-28)** by `2026-07-28-hermes-assistant-vm-design.md`,
+> which moves the harness to a cloud VM and repositions the agent as a
+> personal assistant. The "As-built corrections" below still apply and are
+> carried forward into the new spec.
+
 Date: 2026-07-03
 Revised: 2026-07-12 — keep Linux Mint instead of reflashing; add agent disk
 hygiene and a self-managed memory wiki.
