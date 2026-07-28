@@ -1,5 +1,9 @@
 # Hermes Agent Harness Implementation Plan
 
+> **SUPERSEDED (2026-07-28)** by `2026-07-28-hermes-assistant-vm.md`. This plan
+> builds the laptop-hosted experiment runner, which has been replaced by a
+> cloud-VM personal assistant. Kept for the as-built lessons it records.
+
 > **STATUS (2026-07-19): EXECUTED.** The harness is built and verified on the
 > Mint box `ramiz` (192.168.1.20). Do not follow this plan as written — parts
 > of it are wrong. Read the **As-built corrections** section of the spec
