@@ -217,6 +217,56 @@ From the previous build. These cost real debugging time and still apply:
    an empty allowlist but a secondary fallback gate fails **open** — the
    allowlist must never be blanked.
 
+## As-built corrections (2026-07-29)
+
+Found while building on DigitalOcean with Hermes v0.19.0. Recorded so the doc
+is not quietly misleading.
+
+1. **The sandbox has full network egress by default, and this is the real
+   injection risk.** §3 argued the sandbox contains blast radius, which is true
+   for the *host* but not for *confidentiality*: an injected turn can read mail
+   via MCP and `curl` it to an arbitrary host. Verified — `curl https://example.com`
+   from inside the sandbox returned HTTP 200. Hermes exposes an undocumented
+   `TERMINAL_DOCKER_NETWORK=false` (absent from `.env.example`, but covered by
+   `tests/tools/test_docker_network_config.py`) which passes `--network=none`.
+   The agent needs no network of its own — the wiki is cloned host-side into the
+   bind mount, the sync timer runs git in a separate container, and Google/web
+   access is host-side MCP — so egress is disabled outright. This closes the
+   exfiltration path structurally rather than relying on the model's judgement,
+   which matters more given a small free-tier model is in use.
+
+2. **`model:` in `config.yaml` is a mapping, not a scalar.** The value belongs
+   at `model.default`, with `model.provider` alongside it. Writing
+   `model: "..."` over the key produces invalid YAML; Hermes then falls back to
+   default config and **silently ignores every user override**, including the
+   terminal backend. It does print a warning and save a `.corrupt` backup.
+   Validate with a YAML parse after editing, never by eye.
+
+3. **Hermes' venv has no `pip`.** It is uv-managed, so the docker SDK must be
+   installed with
+   `uv pip install --python ~/.hermes/hermes-agent/venv/bin/python docker`.
+
+4. **The one-shot flag takes its prompt immediately:** `hermes --yolo -z "..."`.
+   Writing `hermes -z --yolo "..."` makes argparse consume `--yolo` as the
+   prompt argument and fail.
+
+5. **`hermes` and `uvx` install to `~/.local/bin`, which is not on the PATH for
+   non-interactive shells or systemd units.** Both are symlinked into
+   `/usr/local/bin` so Hermes can launch the MCP server as a subprocess.
+
+6. **`TERMINAL_TIMEOUT` defaults to 60s**, which is too short for the initial
+   wiki clone. Raised to 300. `TERMINAL_LIFETIME_SECONDS=300` also tears down
+   idle containers, which is harmless because `/root` and `/workspace` are host
+   bind mounts.
+
+7. **DigitalOcean's "Launch Droplet Console" is an SSH client that connects as
+   `root`,** so `PermitRootLogin no` breaks it with "all auth methods failed"
+   (confirmed: `ROOT LOGIN REFUSED FROM 162.243.190.66`). It is therefore
+   useless as a recovery tool anyway, since it depends on the very sshd that
+   would be broken. The real out-of-band path is the **Recovery Console**
+   (hypervisor serial/VGA), which needs a **password set on the login user** —
+   a key-created droplet has none. See `runbooks/recovery.md`.
+
 ## Out of scope
 
 - **Burst/GPU dispatch and the experiment-PR workflow.** Considered during
