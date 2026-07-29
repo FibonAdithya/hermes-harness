@@ -1,5 +1,23 @@
 # Hermes Personal Assistant on a Cloud VM — Implementation Plan
 
+> **STATUS (2026-07-29): PARTIALLY EXECUTED** on DigitalOcean droplet
+> `hermes-assistant` (139.59.168.236, lon1, Ubuntu 24.04, 2 vCPU / 4 GB).
+>
+> **Done:** Tasks 1–7 (provisioning, hardening, base OS, Hermes v0.19.0,
+> sandbox image + Docker backend, git identity, wiki clone, sync timer),
+> 11 (memory), 12 (SOUL), 13 (Telegram — replying end to end), 15 (janitor).
+>
+> **Remaining:** Tasks 8–10 (Google OAuth client, MCP server, tool allowlist),
+> 14 (briefing cron), 16–17 (security + end-to-end verification).
+>
+> **Deviations from the plan as written:** the sandbox is additionally run with
+> `TERMINAL_DOCKER_NETWORK=false` (`--network=none`) to close the exfiltration
+> path; the wiki is cloned **host-side** rather than by the agent, since the
+> agent now has no network; the model is a free-tier
+> `nvidia/nemotron-3-super-120b-a12b:free` pending OpenRouter credits; and the
+> gateway installed as a **user** service (with lingering) rather than
+> `--system`. See the spec's As-built corrections before following any step.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Stand up Hermes Agent as an always-on personal assistant on a small cloud VM — triaging Gmail, managing Google Calendar, delivering scheduled briefings and reminders to Telegram, and maintaining a git-backed Obsidian-compatible knowledge graph — with credentials structurally out of the agent's reach.

@@ -269,7 +269,17 @@ is not quietly misleading.
    correctly `NetworkMode=none`. Recorded because it looks alarming in
    `docker ps` and because an upstream fix would change what is observed here.
 
-8. **DigitalOcean's "Launch Droplet Console" is an SSH client that connects as
+8. **Auxiliary side-task models need pinning when the account has no credits.**
+   Hermes runs context compression, title generation, and web-extract
+   summarisation on "auxiliary" models defaulting to `provider: auto`, which
+   tries OpenRouter → Nous Portal → main. With an uncredited OpenRouter key
+   both paid paths return payment errors, so every side task failed and
+   retried (`marking nous unhealthy … (payment / credit error)`). Pinned to
+   the same free model, with `title_generation` disabled. Compression failing
+   silently would degrade long conversations, so this is worth fixing even
+   though the warnings look cosmetic.
+
+9. **DigitalOcean's "Launch Droplet Console" is an SSH client that connects as
    `root`,** so `PermitRootLogin no` breaks it with "all auth methods failed"
    (confirmed: `ROOT LOGIN REFUSED FROM 162.243.190.66`). It is therefore
    useless as a recovery tool anyway, since it depends on the very sshd that
