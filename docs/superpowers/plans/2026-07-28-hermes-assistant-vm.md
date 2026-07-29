@@ -1303,6 +1303,41 @@ git commit -m "docs: snapshot non-secret assistant config"
 
 ---
 
+## Resume here (paused 2026-07-29)
+
+The assistant is live on Telegram and answering. Pick up with these, in order:
+
+1. **Add OpenRouter credits and switch off the free model — do this _before_
+   connecting Gmail.** Free endpoints commonly permit training on submitted
+   prompts; once Google is wired up, those prompts contain the owner's email.
+   `qwen/qwen3-235b-a22b-2507` (~$0.09/$0.55 per M) was the intended target.
+   Model lives at `model.default` in `~/.hermes/config.yaml`; the auxiliary
+   block at the end of that file is pinned to the free model too and should
+   move with it.
+2. **Google OAuth client → MCP server → tool allowlist** (Tasks 8–10). The
+   allowlist check in Task 10 Step 2 is the one that matters: if
+   `send_gmail_message` is registered, the security model has a hole.
+3. **Briefing cron** (Task 14), then **verification** (Tasks 16–17). Re-run the
+   injection test against whichever model is actually in production — a result
+   on the free model says nothing about the paid one.
+
+Two unfinished items from earlier tasks:
+
+- **The DigitalOcean Recovery Console drill was never completed.** Task 1's
+  console step failed against the hardened sshd (see spec As-built #9), and
+  the hypervisor Recovery Console path has not yet been verified to work with
+  the password set on `hermes`. This is the capability the whole migration
+  exists for and is still unproven.
+- **The DigitalOcean account still trusts a leaked SSH key.** A private key was
+  exposed on 2026-07-29 (terminal copy-buffer accident). It was revoked from
+  the droplet and rotated to `~/.ssh/hermes_vm_ed25519`, and it turned out
+  never to have been registered on GitHub — but it is still uploaded to the
+  DigitalOcean account, so future droplets would trust it. Delete it at
+  Settings → Security → SSH Keys.
+
+A stale `Hermes-Agent` SSH key from the decommissioned laptop build
+(added 2026-07-12) also remains on the GitHub account and can be removed.
+
 ## Post-implementation notes
 
 Record any behaviour that differs from this plan in an **As-built corrections**
