@@ -259,7 +259,17 @@ is not quietly misleading.
    idle containers, which is harmless because `/root` and `/workspace` are host
    bind mounts.
 
-7. **DigitalOcean's "Launch Droplet Console" is an SSH client that connects as
+7. **A second container, `prompt-backend-probe`, ignores the network toggle.**
+   `agent/prompt_builder.py` builds its `container_config` without a
+   `docker_network` key, so it falls back to the default `True` and runs on
+   `NetworkMode=bridge` even when the operator has requested an air gap. It is
+   **not** an exfiltration path — that container only ever runs one hardcoded
+   `printf`/`uname` probe to describe the environment for the system prompt,
+   and the agent's own terminal tool runs in the `default` task, which is
+   correctly `NetworkMode=none`. Recorded because it looks alarming in
+   `docker ps` and because an upstream fix would change what is observed here.
+
+8. **DigitalOcean's "Launch Droplet Console" is an SSH client that connects as
    `root`,** so `PermitRootLogin no` breaks it with "all auth methods failed"
    (confirmed: `ROOT LOGIN REFUSED FROM 162.243.190.66`). It is therefore
    useless as a recovery tool anyway, since it depends on the very sshd that
