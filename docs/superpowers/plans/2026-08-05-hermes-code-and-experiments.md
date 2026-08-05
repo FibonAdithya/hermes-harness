@@ -1,5 +1,33 @@
 # Hermes: Code, Experiments, and Pull Requests — Implementation Plan
 
+> **STATUS (2026-08-05): NOT STARTED — planned only.** Spec and plan are written
+> and committed (`321364e`, `ef4b760`). No task has been executed: nothing has
+> been deployed, no code exists under `broker/` or `executor/` yet, and neither
+> `tig-server` nor the droplet has been touched by this work.
+>
+> **Start at Task 1.** Tasks 1–3, 5, and 6 are pure TDD and run on the laptop
+> (`cd broker && uv run --extra dev pytest`); they need no machine access and
+> can be done in any sitting. Tasks 4, 7, and 8 need the owner present for
+> things only they can do:
+>
+> - **BotFather** — create the `Hermes Approvals` bot and keep the token (Task 7 Step 1)
+> - **GitHub** — a fine-grained PAT scoped to the allowlisted personal repos, plus branch protection on each (Task 4 Step 6, Task 8 Step 1)
+> - **Claude Code credential** — `claude setup-token`, or the existing `~/.claude/.credentials.json` (Task 4 Step 6)
+> - **Owner's numeric Telegram ID** — the same value as `TELEGRAM_ALLOWED_USERS` in `~/.hermes/.env`
+>
+> **Findings already banked from the planning session,** so they need not be
+> rediscovered: the `gpuq` runner is a live process on `tig-gpu` (laptop
+> independent); `gpuq` lives at `/venv/main/bin/gpuq` and is off the
+> non-interactive `PATH`; `/workspace/gpuq.toml`'s `[project.*]` registry is the
+> compute allowlist; `tig-server` is a bare Ubuntu 26.04 box with no Docker and
+> no non-root user; and the spec's gateway-hook approval mechanism does not
+> exist — see **Deviation from the spec** below, which is the one thing to read
+> before starting.
+>
+> **Open question deferred to execution:** whether `claude setup-token` exists on
+> the installed Claude Code version, or the credentials file must be mounted
+> instead (Task 4 Step 6). Record whichever worked.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Give the Hermes assistant a gated path to run experiments on `tig-gpu` via `gpuq` and to have Claude Code do software work on `tig-server` that ends in a pull request, without the assistant writing code or holding a credential.
