@@ -13,7 +13,12 @@ class Unreachable(RuntimeError):
     pass
 
 
-def run_ssh(target: str, argv: list[str], timeout: int = 60) -> tuple[int, str, str]:
+def run_ssh(
+    target: str,
+    argv: list[str],
+    timeout: int = 60,
+    stdin_text: str | None = None,
+) -> tuple[int, str, str]:
     command = [
         "ssh",
         "-o", "BatchMode=yes",
@@ -25,7 +30,12 @@ def run_ssh(target: str, argv: list[str], timeout: int = 60) -> tuple[int, str, 
     ]
     try:
         proc = subprocess.run(
-            command, capture_output=True, text=True, timeout=timeout, check=False
+            command,
+            input=stdin_text,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
         )
     except subprocess.TimeoutExpired as exc:
         raise Unreachable(f"{target}: timed out after {timeout}s") from exc
