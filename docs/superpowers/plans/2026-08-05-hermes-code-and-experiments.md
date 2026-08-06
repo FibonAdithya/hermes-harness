@@ -1,19 +1,42 @@
 # Hermes: Code, Experiments, and Pull Requests — Implementation Plan
 
-> **STATUS (2026-08-05): NOT STARTED — planned only.** Spec and plan are written
-> and committed (`321364e`, `ef4b760`). No task has been executed: nothing has
-> been deployed, no code exists under `broker/` or `executor/` yet, and neither
-> `tig-server` nor the droplet has been touched by this work.
+> **STATUS (2026-08-06): CODE COMPLETE, NOTHING DEPLOYED.** All laptop-side work
+> is done on branch `feat/hermes-dispatch`. **45 tests pass**
+> (`cd broker && uv run --extra dev pytest`). Every file the plan calls for now
+> exists and is committed. Nothing has been deployed: the droplet, `tig-server`,
+> and `tig-gpu` have not been touched, and no credential has been created.
 >
-> **Start at Task 1.** Tasks 1–3, 5, and 6 are pure TDD and run on the laptop
-> (`cd broker && uv run --extra dev pytest`); they need no machine access and
-> can be done in any sitting. Tasks 4, 7, and 8 need the owner present for
-> things only they can do:
+> | Task | State |
+> |---|---|
+> | 1 — grant state machine | **done** (`7ed3b04`, 13 tests) |
+> | 2 — approval parsing and listener | **done** (`4601da7`, 10 tests) |
+> | 3 — config, SSH, gpuq builders | **done** (`8de5a61`, 11 tests) |
+> | 4 — executor image and run script | **files written** (`1d79017`); steps 1, 2, 5, 6, 7 need `tig-server` |
+> | 5 — task launch and log plumbing | **done** (`285b3d6`, 6 tests) |
+> | 6 — MCP server and the gate | **done** (`45beeb6`, 5 tests; all 9 tools verified to register) |
+> | 7 — deploy to the droplet | **`listen.py` written** (`4aa0c45`); every other step needs the droplet |
+> | 8 — branch protection and standing instructions | **runbook written** (`4aa0c45`); steps 1 and 2 need the owner |
+> | 9 — end-to-end verification | not started; needs everything above |
+>
+> **Resume at Task 4 Step 1.** From there the plan is deployment and verification
+> only — no more code to write. Bring:
 >
 > - **BotFather** — create the `Hermes Approvals` bot and keep the token (Task 7 Step 1)
 > - **GitHub** — a fine-grained PAT scoped to the allowlisted personal repos, plus branch protection on each (Task 4 Step 6, Task 8 Step 1)
 > - **Claude Code credential** — `claude setup-token`, or the existing `~/.claude/.credentials.json` (Task 4 Step 6)
 > - **Owner's numeric Telegram ID** — the same value as `TELEGRAM_ALLOWED_USERS` in `~/.hermes/.env`
+>
+> **Two deviations from the plan text, both forced and already applied:**
+>
+> 1. **`mcp` is now 2.0** — `FastMCP` was renamed `MCPServer`. Same decorator and
+>    `run()` API, so `server.py` differs from the plan by two lines and
+>    `pyproject.toml` requires `mcp>=2.0.0`. `uv.lock` is committed, so the
+>    droplet's `uv sync` gets exactly what was tested.
+> 2. **Config loads lazily.** The plan's `server.py` called `load_config()` at
+>    module level, which made the module unimportable anywhere `broker.json` is
+>    absent — including the laptop running the gate's own tests. It is now loaded
+>    on first tool call. Task 6's code block in this plan is stale on both counts;
+>    the committed file is correct.
 >
 > **Findings already banked from the planning session,** so they need not be
 > rediscovered: the `gpuq` runner is a live process on `tig-gpu` (laptop
