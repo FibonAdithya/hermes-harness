@@ -382,9 +382,9 @@ The 08-05 §9 list still applies to the broker. Added:
     the droplet.
 12. **Subscription, not API.** The executor's `claude -p` runs without
     `--bare` and without `ANTHROPIC_API_KEY` set.
-13. **The executor cannot merge its own pull request.** `gh pr merge` with the
-    executor's token on a PR it opened is refused. Until this holds, the pull
-    timers stay disabled (see As-built).
+13. **The executor cannot merge its own pull request.** Not met, by the
+    owner's decision (As-built item 1): the executor uses the owner's token
+    and deploys are manual.
 
 ## Out of scope
 
@@ -401,15 +401,20 @@ The 08-05 §9 list still applies to the broker. Added:
 
 ## As-built corrections (2026-09-24)
 
-1. **The executor's token can merge its own PR.** Branch protection with zero
-   required reviews only guarantees a PR and a green check, and the executor's
-   fine-grained PAT is the owner's, so it can merge what it opened. A review
-   requirement does not fix it: GitHub forbids approving one's own PR, so the
-   owner could never approve the executor's PRs either. The fix is a separate
-   GitHub identity for the executor (a machine account with write access, no
-   merge through a one-review rule the owner satisfies). Until that exists,
-   `harness-pull.timer` is disabled on both hosts and deploys are started by
-   hand after reading `master`. §13 item 13 records the check.
+1. **The executor runs on the owner's token, and deploys are manual.** Branch
+   protection with zero required reviews only guarantees a PR and a green
+   check, and the executor's PAT is the owner's, so it can merge what it
+   opens; a review rule cannot help because GitHub forbids approving one's
+   own PR. A separate identity (a GitHub App installed on all repositories,
+   or a machine account) would restore the "owner reads and merges" gate.
+   **Owner's decision, 2026-09-24: keep the owner's token.** Reasoning: a
+   separate identity has to be granted access to every new repository by
+   hand, and everything the executor does is in git and can be reverted.
+   Consequences: `harness-pull.timer` stays disabled on both hosts; a merge
+   is deployed by hand with `systemctl --user start harness-pull.service`
+   after reading `master`; the gate is the owner's approval of the grant, not
+   review of the PR; `master` forbids force-pushes, so a rollback is a revert
+   PR. §13 item 13 is therefore not met and is recorded as accepted.
 2. **herdr is pinned from the GitHub release**, not `herdr.dev/install.sh`,
    which has no version pin. The headless server is the bare `herdr server`.
 3. **The node base image owns uid 1000.** The executor renames that user to
