@@ -1,0 +1,7 @@
+[Unit]
+Description=Deploy hermes-harness master to the box
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/bin/bash -c 'cd %h/TIG/hermes-harness && git fetch -q origin && { [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/master)" ] || { git checkout -q master && git reset -q --hard origin/master && box/install.sh; }; }'

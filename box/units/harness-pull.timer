@@ -1,0 +1,9 @@
+[Unit]
+Description=Deploy hermes-harness every 15 minutes
+
+[Timer]
+OnCalendar=*:2/15
+Persistent=true
+
+[Install]
+WantedBy=timers.target
