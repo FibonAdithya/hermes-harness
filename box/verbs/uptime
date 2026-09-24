@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""How long the box has been up. Ungated."""
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import boxlib  # noqa: E402
+
+boxlib.read_json_stdin(sys.stdin.buffer)
+proc = subprocess.run(["uptime", "-p"], capture_output=True, text=True, check=False)
+print(json.dumps({"uptime": proc.stdout.strip()}))
