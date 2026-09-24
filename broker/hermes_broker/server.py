@@ -15,7 +15,7 @@ from pathlib import Path
 # mcp 2.x renamed FastMCP to MCPServer; the decorator and run() API are the same.
 from mcp.server import MCPServer
 
-from . import gpuq, tasks
+from . import box, gpuq
 from .config import BrokerConfig, load_config
 from .grants import GrantStore
 from .ssh import Unreachable, run_ssh
@@ -79,53 +79,68 @@ def request_access(box: str, minutes: int, reason: str) -> str:
 
 
 @mcp.tool()
+def run_fleet(repo: str, hours: int = 8) -> str:
+    """Start a fleet night on the box against a checked-out repo. Requires a grant.
+
+    The dollar budget comes from that repo's fleet.toml; hours is the hard stop.
+    """
+    require_grant(_store(), "tig-server", now=time.time())
+    r = box.call(_target("tig-server"), "run_fleet", {"repo": repo, "hours": int(hours)})
+    return r.get("error") or f"fleet night {r['id']} started on {repo}. Poll night_status()."
+
+
+@mcp.tool()
+def run_talos(challenge: str, direction: str, iterations: int = 30, backend: str = "local") -> str:
+    """Start a Talos autoresearch run on the box. Requires a grant. backend is local or modal."""
+    require_grant(_store(), "tig-server", now=time.time())
+    r = box.call(_target("tig-server"), "run_talos",
+                 {"challenge": challenge, "direction": direction, "iterations": int(iterations), "backend": backend})
+    return r.get("error") or f"talos night {r['id']} started ({challenge}, {backend}). Poll night_status()."
+
+
+@mcp.tool()
 def run_task(repo: str, prompt: str, minutes: int = 30) -> str:
-    """Run a coding task with Claude Code on tig-server. Requires a grant."""
+    """Run a coding task with Claude Code on the box, PR only. Requires a grant."""
     require_grant(_store(), "tig-server", now=time.time())
     _config().check_repo(repo)
-    task_id = tasks.new_task_id()
-    target = _target("tig-server")
-    try:
-        code, _, err = run_ssh(
-            target, tasks.build_write_prompt_argv(task_id), timeout=30, stdin_text=prompt
-        )
-        if code != 0:
-            return f"failed to stage prompt: {err.strip()[:400]}"
-        # 60s is correct and deliberate: run-task.sh backgrounds the container
-        # and returns immediately. If launches start timing out, the bug is in
-        # the script's backgrounding, not here.
-        code, out, err = run_ssh(
-            target,
-            tasks.build_launch_argv(task_id, repo, tasks.prompt_path(task_id)),
-            timeout=60,
-        )
-    except Unreachable as exc:
-        return f"tig-server unreachable: {exc}"
-    if code != 0:
-        return f"launch failed: {err.strip()[:400]}"
-    return f"task {task_id} started on {repo}. Poll task_status('{task_id}')."
+    r = box.call(_target("tig-server"), "run_task", {"repo": repo, "prompt": prompt, "minutes": int(minutes)})
+    return r.get("error") or f"task {r['id']} started on {repo}. Poll night_status(); read night_log('{r['id']}')."
 
 
 @mcp.tool()
-def task_status(task_id: str) -> str:
-    """Status of a task this broker started: running, done, or failed."""
-    try:
-        _, out, err = run_ssh(_target("tig-server"), tasks.build_status_argv(task_id), timeout=30)
-    except Unreachable as exc:
-        return f"tig-server unreachable: {exc}"
-    return out.strip() or err.strip()[:400] or "unknown"
+def add_repo(name: str) -> str:
+    """Clone one of the owner's own GitHub repositories onto the box. Requires a grant."""
+    require_grant(_store(), "tig-server", now=time.time())
+    r = box.call(_target("tig-server"), "add_repo", {"name": name}, timeout=300)
+    if "error" in r:
+        return r["error"]
+    return f"{r['repo']} is at {r['path']}" + (" (already there)" if r.get("already") else "")
 
 
 @mcp.tool()
-def task_log(task_id: str, lines: int = 80) -> str:
-    """Tail of a task's log."""
-    try:
-        _, out, err = run_ssh(
-            _target("tig-server"), tasks.build_log_argv(task_id, lines), timeout=30
-        )
-    except Unreachable as exc:
-        return f"tig-server unreachable: {exc}"
-    return out or err[:400]
+def night_status() -> str:
+    """Every fleet, talos, and task run on the box: id, status, start time, exit code."""
+    r = box.call(_target("tig-server"), "status", {}, timeout=30)
+    if "error" in r:
+        return r["error"]
+    rows = r.get("nights", [])
+    if not rows:
+        return "no nights recorded"
+    return "\n".join(f"{n['id']}  {n['status']:8} started {n['started']}  exit={n['exit_code']}" for n in rows)
+
+
+@mcp.tool()
+def night_log(night_id: str, lines: int = 80) -> str:
+    """Tail of one night's log."""
+    r = box.call(_target("tig-server"), "log", {"id": night_id, "lines": int(lines)}, timeout=30)
+    return r.get("error") or "\n".join(r.get("lines", []))
+
+
+@mcp.tool()
+def list_repos() -> str:
+    """Repositories checked out on the box."""
+    r = box.call(_target("tig-server"), "list_repos", {}, timeout=30)
+    return r.get("error") or ", ".join(r.get("repos", [])) or "none"
 
 
 @mcp.tool()
