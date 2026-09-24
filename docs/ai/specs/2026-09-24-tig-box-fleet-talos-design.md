@@ -219,10 +219,13 @@ Talos reads and writes its config in the current directory, so two directories:
 - `~/talos-local`: `talos setup` with backend `local`, provider `claude-cli`,
   mode single-shot. Setup pulls the 13 GB knapsack dev image and runs one
   warm-up build. The live local smoke test is run once so the first night does
-  not spend itself on a cold cache. Talos's own docs record about 15 minutes
-  per candidate build on a 16-core x86 machine (their measurement, 2026-09-23,
-  not re-run here). ESTIMATE (unverified) on this ARM box: comparable, giving
-  roughly 30 candidates in an 8-hour night. The plan measures it.
+  not spend itself on a cold cache. MEASURED 2026-09-24 on this box (8 cores,
+  11 GiB container, knapsack, `talos run --budget-iterations 1`, run
+  20260924-120337): baseline ready after 2007 s (build plus 32 training nonces
+  plus held-out), one candidate scored 1490 s later (build 6m24s, the rest
+  scoring: each nonce runs about 60 s on this box), 58 minutes end to end.
+  With the baseline cached, an 8-hour night fits about 18 candidates, so
+  `iterations` in the night config should be sized to that, not 30.
 - `~/talos-modal`: `talos setup` with backend `modal`, same provider. Used only
   when a `run_talos` call names it, to confirm a local winner on x86.
 
