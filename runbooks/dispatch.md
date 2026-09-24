@@ -28,13 +28,14 @@ seconds — `date -d @1754400000` to read one.
 ## A task went wrong
 
 ```bash
-ssh tig-server 'cat /srv/hermes-tasks/<task-id>/status'
-ssh tig-server 'tail -100 /srv/hermes-tasks/<task-id>/log'
-ssh tig-server 'docker ps --filter name=hermes-task'
+ssh tig-adi 'cat ~/nights/<task-id>/status'
+ssh tig-adi 'tail -100 ~/nights/<task-id>/log'
+ssh tig-adi 'docker ps --filter name=hermes-task'
 ```
 
-Kill a stuck one with `docker rm -f hermes-task-<task-id>` on tig-server. The
-container is `--rm`, so there is nothing else to clean up.
+Kill a stuck one with `systemctl --user stop night-<task-id>` on the box; the
+wrapper removes the container. `docker rm -f hermes-task-<task-id>` is the
+fallback. The container is `--rm`, so there is nothing else to clean up.
 
 ## tig-gpu was recreated
 
@@ -53,8 +54,8 @@ ssh tig-gpu /venv/main/bin/gpuq list
 - **GitHub PAT** — regenerate the fine-grained token, then
   `ssh -t tig-server 'nano /etc/hermes-exec/github-token'`. Never pass it as a
   shell argument.
-- **Claude Code credential** — re-run the token step from the plan and rewrite
-  `/etc/hermes-exec/claude-credentials.json` the same way.
+- **Claude Code credential** — the executor mounts the box's own login,
+  `~adi/.claude/.credentials.json`, read-only. Re-login with `ssh -t tig-adi claude`.
 - **Approvals bot token** — BotFather `/revoke`, then edit
   `~/.hermes/broker/broker.json` and `systemctl --user restart hermes-approvals`.
 
@@ -63,7 +64,12 @@ ssh tig-gpu /venv/main/bin/gpuq list
 - Any dispatch tool without a grant → `LOCKED: no active grant for <box>`.
 - A cron job asking for access → it gets a code nobody approves, then `LOCKED`.
 - `curl` from inside the agent's sandbox → no network, by design.
-- A push to `main` from the executor → rejected by branch protection.
+- A push to `master` from the executor → rejected by branch protection.
+- The executor merging its own pull request → **currently possible** (its token
+  is the owner's). Until the executor has its own GitHub identity that cannot
+  merge, `harness-pull.timer` stays disabled on both hosts and a merge is
+  deployed by hand: `systemctl --user start harness-pull.service` on the box
+  and on the droplet, after reading `master`.
 
 If any of those succeed, stop and investigate before using the system again.
 

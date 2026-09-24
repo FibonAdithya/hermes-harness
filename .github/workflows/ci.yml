@@ -23,5 +23,9 @@ jobs:
       - run: |
           for f in box/verbs/*; do
             [ -x "$f" ] || { echo "$f is not executable"; exit 1; }
-            case "$(head -1 "$f")" in "#!/usr/bin/env python3") python -m py_compile "$f";; *) ;; esac
+            case "$(head -1 "$f")" in
+              "#!/usr/bin/env python3") python -m py_compile "$f";;
+              "#!/usr/bin/env bash"|"#!/bin/bash"|"#!/bin/sh") shellcheck -S warning "$f";;
+              *) echo "$f: unknown interpreter"; exit 1;;
+            esac
           done

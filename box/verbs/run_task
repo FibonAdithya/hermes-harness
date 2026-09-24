@@ -24,8 +24,8 @@ try:
     workdir, argv, secs = boxlib.task_command(home, d, a.get("repo", ""), int(a.get("minutes", 30)))
 except (ValueError, TypeError) as exc:
     sys.exit(boxlib.refuse(str(exc)))
-d.mkdir(parents=True)
-(d / "prompt.txt").write_text(prompt)
+(d / "work").mkdir(parents=True)
+(d / "work" / "prompt.txt").write_text(prompt)
 try:
     boxlib.start_night("task", workdir, argv, secs, dict(os.environ),
                        {"repo": a["repo"], "minutes": int(a.get("minutes", 30))}, night_id=night_id)

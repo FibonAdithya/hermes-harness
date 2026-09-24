@@ -170,6 +170,8 @@ def job_status(job_id: str) -> str:
     """Show one gpuq job."""
     try:
         _, out, err = run_ssh(_target("tig-gpu"), gpuq.build_show_argv(job_id), timeout=30)
+    except ValueError as exc:
+        return str(exc)
     except Unreachable as exc:
         return f"tig-gpu unreachable: {exc}"
     return out or err[:400]
@@ -179,14 +181,12 @@ def job_status(job_id: str) -> str:
 def job_logs(job_id: str, lines: int = 80) -> str:
     """Tail a gpuq job's stdout/stderr via the paths gpuq show reports."""
     try:
-        _, out, err = run_ssh(
-            _target("tig-gpu"),
-            ["sh", "-c", f"{gpuq.GPUQ_BIN} show {job_id} | tail -n {int(lines)}"],
-            timeout=30,
-        )
+        _, out, err = run_ssh(_target("tig-gpu"), gpuq.build_logs_argv(job_id, lines), timeout=30)
+    except ValueError as exc:
+        return str(exc)
     except Unreachable as exc:
         return f"tig-gpu unreachable: {exc}"
-    return out or err[:400]
+    return "\n".join((out or err[:400]).splitlines()[-int(lines):])
 
 
 @mcp.tool()
@@ -195,6 +195,8 @@ def job_cancel(job_id: str) -> str:
     require_grant(_store(), "tig-gpu", now=time.time())
     try:
         _, out, err = run_ssh(_target("tig-gpu"), gpuq.build_cancel_argv(job_id), timeout=30)
+    except ValueError as exc:
+        return str(exc)
     except Unreachable as exc:
         return f"tig-gpu unreachable: {exc}"
     return out or err[:400]
