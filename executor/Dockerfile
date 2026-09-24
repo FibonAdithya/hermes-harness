@@ -18,7 +18,7 @@ RUN git config --system user.name "Hermes Agent" \
 
 # The credentials file is bind-mounted here at run time; Docker cannot mount a
 # file into a directory that does not exist.
-RUN useradd -m -u 1001 runner \
+RUN useradd -m -u 1000 runner \
     && mkdir -p /home/runner/.claude \
     && chown -R runner:runner /home/runner
 
