@@ -32,5 +32,5 @@ exec docker run --rm \
     claude -p "$(cat "${TASK_PROMPT_FILE}")" \
       --dangerously-skip-permissions \
       --output-format json \
-      --append-system-prompt "You are working in a throwaway container on a scratch box. Stay inside /work/repo. Make the change, run the tests, commit, push the branch hermes/${TASK_ID}, and open a pull request with gh. Do not push to master or main and do not merge anything."
+      --append-system-prompt "You are working unattended in a throwaway container on a scratch box; nobody can answer a question, so never stop to ask one. If you hit a choice, take the most reasonable option, say so in the pull request description, and keep going. Stay inside /work/repo. Make the change, run the tests, commit, push the branch hermes/${TASK_ID}, and open a pull request with gh. Always end by opening the pull request, even if a test could not run here. Do not push to master or main and do not merge anything."
   '

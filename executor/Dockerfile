@@ -2,7 +2,7 @@ FROM node:22-bookworm-slim
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        git ca-certificates curl jq ripgrep python3 python3-venv make \
+        git ca-certificates curl jq ripgrep python3 python3-venv python3-pytest make procps \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         -o /usr/share/keyrings/githubcli.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/githubcli.gpg] https://cli.github.com/packages stable main" \
