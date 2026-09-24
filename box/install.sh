@@ -12,4 +12,4 @@ cp "$here"/units/*.service "$here"/units/*.timer "$units/"
 [ -f "$HOME/nights/config.toml" ] || cp "$here/night-config.example.toml" "$HOME/nights/config.toml"
 systemctl --user daemon-reload
 # Timers are installed but never enabled here. Enabling is the owner's act after the dry night.
-echo "installed verbs: $(ls "$here/verbs" | tr '\n' ' ')"
+echo "installed verbs: $(cd "$here/verbs" && printf "%s " *)"

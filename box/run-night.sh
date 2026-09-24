@@ -12,5 +12,5 @@ trap term TERM INT
 child=$!
 wait "$child"; rc=$?
 echo "$rc" > "$dir/exit_code"
-if [ "$rc" -eq 0 ]; then echo done > "$dir/status"; else echo failed > "$dir/status"; fi
+if [ "$rc" -eq 0 ]; then echo "done" > "$dir/status"; else echo "failed" > "$dir/status"; fi
 exit "$rc"

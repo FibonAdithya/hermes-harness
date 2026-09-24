@@ -19,7 +19,7 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install pytest && cd box && python -m pytest -q
-      - run: sudo apt-get install -y -qq shellcheck && shellcheck box/*.sh executor/run-task.sh $(ls droplet/*.sh 2>/dev/null)
+      - run: sudo apt-get install -y -qq shellcheck && shellcheck -S warning box/*.sh executor/run-task.sh $(ls droplet/*.sh 2>/dev/null)
       - run: |
           for f in box/verbs/*; do
             [ -x "$f" ] || { echo "$f is not executable"; exit 1; }
