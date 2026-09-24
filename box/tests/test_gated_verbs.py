@@ -36,6 +36,12 @@ def test_talos_command_shape():
     assert wd2 == HOME / "talos-modal"
 
 
+def test_talos_command_accepts_c007_and_c008():
+    for challenge in ("job_scheduling", "energy_arbitrage"):
+        _, argv, _ = boxlib.talos_command(HOME, challenge, "x", 1, "local")
+        assert argv[2:4] == ["--challenge", challenge]
+
+
 def test_talos_command_refuses_bad_inputs():
     with pytest.raises(ValueError):
         boxlib.talos_command(HOME, "knapsack", "x", 1, "c3")
