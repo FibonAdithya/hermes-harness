@@ -6,7 +6,7 @@ repo = "fleet-fixture"
 hours = 8
 
 [talos]
-iterations = 30
+iterations = 18
 backend = "local"
 
 [[talos.queue]]
