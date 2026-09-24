@@ -6,6 +6,7 @@ rented vast.ai instance whose host and port change when it is recreated.
 
 from __future__ import annotations
 
+import shlex
 import subprocess
 
 
@@ -26,7 +27,11 @@ def run_ssh(
         "-o", "StrictHostKeyChecking=accept-new",
         target,
         "--",
-        *argv,
+        # ssh joins its words with spaces and the remote login shell re-splits
+        # them; quoting here is what keeps `["python", "-c", "print(1)"]` intact
+        # and a stray `;` inert. On tig-server the forced command ignores all of
+        # this and reads only the verb name.
+        shlex.join(argv),
     ]
     try:
         proc = subprocess.run(

@@ -59,3 +59,24 @@ def test_read_only_argvs():
     assert build_show_argv("j1") == [GPUQ_BIN, "show", "j1"]
     assert build_list_argv() == [GPUQ_BIN, "list"]
     assert build_cancel_argv("j1") == [GPUQ_BIN, "cancel", "j1"]
+
+
+def test_job_ids_are_validated_before_reaching_a_remote_shell():
+    """tig-gpu has no forced command: argv is joined and run by the remote login
+    shell, so a job id with shell metacharacters is a remote shell."""
+    for bad in ["x; id", "$(id)", "a b", "", "x|sh", "../y", "x" * 65]:
+        with pytest.raises(ValueError):
+            build_show_argv(bad)
+        with pytest.raises(ValueError):
+            build_cancel_argv(bad)
+    assert build_show_argv("job-12.3_x")[-1] == "job-12.3_x"
+
+
+def test_logs_argv_has_no_shell(monkeypatch):
+    from hermes_broker.gpuq import build_logs_argv
+
+    argv = build_logs_argv("job-1", 50)
+    assert "sh" not in argv and not any("|" in a for a in argv)
+    assert argv == [GPUQ_BIN, "show", "job-1"]
+    with pytest.raises(ValueError):
+        build_logs_argv("x; id", 50)

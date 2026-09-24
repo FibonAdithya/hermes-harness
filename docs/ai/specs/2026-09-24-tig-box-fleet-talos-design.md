@@ -162,7 +162,7 @@ Added to the 08-05 §3 table. Gating is the same code path: a live grant for
 | Tool | Gated | Verb | What it does |
 |---|---|---|---|
 | `run_fleet(repo, hours)` | yes | `run_fleet` | `fleet run --new-run` in `~/TIG/<repo>`; budget comes from that repo's `fleet.toml`, the hour limit becomes `RuntimeMaxSec` |
-| `run_talos(challenge, direction, iterations, backend)` | yes | `run_talos` | `talos run --challenge … --direction … --budget-iterations … --backend local\|modal --yes` in the matching Talos directory |
+| `run_talos(challenge, direction, iterations, backend)` | yes | `run_talos` | `talos run --challenge … --direction … --budget-iterations … --yes` in `~/talos-<backend>`, whose `talos.config.json` fixes the backend |
 | `run_task(repo, prompt, minutes)` | yes | `run_task` | the 08-05 executor: Claude Code in a throwaway container, PR only |
 | `add_repo(name)` | yes | `add_repo` | clones `FibonAdithya/<name>` into `~/TIG/<name>` |
 | `night_status()` | no | `status` | every night, running or finished |
@@ -177,7 +177,8 @@ Added to the 08-05 §3 table. Gating is the same code path: a live grant for
 - `run_talos` accepts only challenge names the pinned Talos knows and only the
   two backends that were set up.
 - `add_repo` clones only repositories the owner's GitHub account **owns**,
-  checked on the box with `gh api user/repos?affiliation=owner`. This is the
+  checked on the box with `gh api repos/<owner>/<name>` (owner login must match,
+  and not a fork). This is the
   same rule the droplet's mirrors use: no list to maintain, and nobody else's
   code can arrive this way. Forks and org repositories are out.
 - `run_task` keeps the 08-05 repo list on the broker side.
@@ -381,6 +382,9 @@ The 08-05 §9 list still applies to the broker. Added:
     the droplet.
 12. **Subscription, not API.** The executor's `claude -p` runs without
     `--bare` and without `ANTHROPIC_API_KEY` set.
+13. **The executor cannot merge its own pull request.** `gh pr merge` with the
+    executor's token on a PR it opened is refused. Until this holds, the pull
+    timers stay disabled (see As-built).
 
 ## Out of scope
 
@@ -394,3 +398,31 @@ The 08-05 §9 list still applies to the broker. Added:
 - A push proxy for the executor's in-run credential exposure (still open from
   08-05).
 - x86 comparability of local Talos scores. Modal is the answer when it matters.
+
+## As-built corrections (2026-09-24)
+
+1. **The executor's token can merge its own PR.** Branch protection with zero
+   required reviews only guarantees a PR and a green check, and the executor's
+   fine-grained PAT is the owner's, so it can merge what it opened. A review
+   requirement does not fix it: GitHub forbids approving one's own PR, so the
+   owner could never approve the executor's PRs either. The fix is a separate
+   GitHub identity for the executor (a machine account with write access, no
+   merge through a one-review rule the owner satisfies). Until that exists,
+   `harness-pull.timer` is disabled on both hosts and deploys are started by
+   hand after reading `master`. §13 item 13 records the check.
+2. **herdr is pinned from the GitHub release**, not `herdr.dev/install.sh`,
+   which has no version pin. The headless server is the bare `herdr server`.
+3. **The node base image owns uid 1000.** The executor renames that user to
+   `runner` so the bind-mounted night directory (adi, uid 1000) is writable.
+4. **The container gets `<night>/work`, not the night directory.** `status`,
+   `log`, `exit_code` and `meta.json` are outside the mount and are read with
+   `O_NOFOLLOW`; a task cannot point them at the owner's files.
+5. **A headless run that asks a question ends with no PR.** The executor's
+   system prompt now tells it to decide and say so in the PR.
+6. **Talos on aarch64** needed an architecture-aware artifact path (Talos
+   PR #24) and an 11 GiB container; a candidate takes about 25 minutes and a
+   baseline about 33 on this box (§7).
+7. **`fleet run --once` launched six agents that exited within minutes** and
+   left no Claude transcript. Not diagnosed here; a fleet question.
+8. **Deploys are stamped.** `harness-pull` records the deployed SHA only after
+   the install succeeded, so a failed install is retried on the next tick.

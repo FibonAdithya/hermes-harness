@@ -5,8 +5,13 @@
 set -euo pipefail
 cd "$HOME/hermes-harness"
 git fetch -q origin
-[ "$(git rev-parse HEAD)" = "$(git rev-parse origin/master)" ] && exit 0
+want=$(git rev-parse origin/master)
+stamp="$HOME/.local/share/harness-deployed.sha"
+# The stamp is written only after every deploy step succeeded, so a failed
+# `uv sync` or restart is retried on the next tick instead of being forgotten.
+[ "$(cat "$stamp" 2>/dev/null)" = "$want" ] && exit 0
 git checkout -q master && git reset -q --hard origin/master
 (cd broker && /usr/local/bin/uv sync --no-dev -q)
 systemctl --user restart hermes-approvals
+mkdir -p "$(dirname "$stamp")" && printf %s "$want" > "$stamp"
 echo "deployed $(git rev-parse --short HEAD)"

@@ -19,5 +19,11 @@ d = boxlib.night_dir(boxlib.nights_root(os.environ), night_id)
 if not d.is_dir():
     sys.exit(boxlib.refuse(f"no such night: {night_id}"))
 log = d / "log"
-tail = deque(log.read_text(errors="replace").splitlines(), maxlen=lines) if log.is_file() else deque()
+if log.is_symlink():
+    sys.exit(boxlib.refuse("log is a symlink; refusing to follow it"))
+tail: deque = deque(maxlen=lines)
+if log.is_file():
+    with open(os.open(log, os.O_RDONLY | os.O_NOFOLLOW), "r", errors="replace") as fh:
+        for line in fh:
+            tail.append(line.rstrip("\n"))
 print(json.dumps({"id": night_id, "lines": list(tail)}))

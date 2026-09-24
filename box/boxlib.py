@@ -109,21 +109,70 @@ def write_status(d: Path, status: str, exit_code: int | None = None) -> None:
         (Path(d) / "exit_code").write_text(f"{int(exit_code)}\n")
 
 
+def record_start(d: Path, meta: dict, now: float | None = None) -> None:
+    """meta.json is written once, before the unit starts, and never touched by
+    the task: it is where the start time lives (the directory's mtime moves
+    every time a file is added)."""
+    (Path(d) / "meta.json").write_text(json.dumps({**meta, "started_at": now if now is not None else time.time()}))
+
+
+def read_small(path: Path, limit: int = 4096) -> str | None:
+    """A file the task container may have replaced: never follow a symlink,
+    never read more than a few KiB. None when it is absent or not a plain file."""
+    path = Path(path)
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        return os.read(fd, limit).decode("utf-8", "replace")
+    finally:
+        os.close(fd)
+
+
+def unit_active(night_id: str) -> bool:
+    proc = subprocess.run(["systemctl", "--user", "is-active", f"night-{night_id}"],
+                          capture_output=True, text=True, check=False)
+    return proc.stdout.strip() == "active"
+
+
 def read_status(root: Path) -> list[dict]:
     rows: list[dict] = []
     root = Path(root)
     if not root.is_dir():
         return rows
-    for d in sorted(root.iterdir()):
+    for d in sorted(root.iterdir(), key=lambda p: p.name.split("-", 1)[-1]):
         if not d.is_dir() or not NIGHT_ID_RE.fullmatch(d.name):
             continue
-        status_file = d / "status"
-        exit_file = d / "exit_code"
+        raw = read_small(d / "status")
+        status = "unreadable" if raw is None and (d / "status").exists() else (raw or "unknown").strip()
+        if status not in STATUSES and status not in ("unknown", "unreadable"):
+            status = "unreadable"
+        # A `running` night with no unit behind it (reboot, OOM, kill -9 of the
+        # wrapper) would otherwise read as running forever.
+        if status == "running" and not unit_active(d.name):
+            status = "stale"
+        meta_raw = read_small(d / "meta.json", 65536)
+        started = None
+        if meta_raw:
+            try:
+                started = float(json.loads(meta_raw).get("started_at"))
+            except (ValueError, TypeError, json.JSONDecodeError):
+                started = None
+        if started is None:
+            started = d.stat().st_mtime
+        exit_raw = read_small(d / "exit_code")
+        try:
+            exit_code = int(exit_raw.strip()) if exit_raw else None
+        except ValueError:
+            exit_code = None
         rows.append({
             "id": d.name,
-            "status": status_file.read_text().strip() if status_file.is_file() else "unknown",
-            "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(d.stat().st_mtime)),
-            "exit_code": int(exit_file.read_text()) if exit_file.is_file() else None,
+            "status": status,
+            "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
+            "exit_code": exit_code,
         })
     return rows
 
@@ -215,7 +264,7 @@ def start_night(kind: str, workdir: Path, argv: list[str], runtime_sec: int, env
     night_id = night_id or new_night_id(kind)
     d = night_dir(root, night_id)
     d.mkdir(parents=True, exist_ok=True)
-    (d / "meta.json").write_text(json.dumps({"kind": kind, "argv": argv, "workdir": str(workdir), **(meta or {})}))
+    record_start(d, {"kind": kind, "argv": argv, "workdir": str(workdir), **(meta or {})})
     write_status(d, "running")
     home = env.get("HOME", "/home/adi")
     wrapper = str(Path(home) / ".local" / "bin" / "run-night.sh")
