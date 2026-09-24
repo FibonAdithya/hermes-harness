@@ -18,7 +18,11 @@ RUN git config --system user.name "Hermes Agent" \
 
 # The credentials file is bind-mounted here at run time; Docker cannot mount a
 # file into a directory that does not exist.
-RUN useradd -m -u 1000 runner \
+# The node base image already owns uid 1000 as `node`; rename it rather than
+# add a second uid-1000 user. uid 1000 is adi on the box, the owner of the
+# bind-mounted night directory and the credentials file.
+RUN usermod -l runner -d /home/runner -m node \
+    && groupmod -n runner node \
     && mkdir -p /home/runner/.claude \
     && chown -R runner:runner /home/runner
 
