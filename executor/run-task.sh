@@ -24,6 +24,8 @@ exec docker run --rm \
   hermes-exec:latest \
   bash -lc '
     set -euo pipefail
+    # git over HTTPS needs a credential helper; gh wires one that reads GH_TOKEN.
+    gh auth setup-git
     git clone --depth 50 "https://github.com/${TASK_REPO}.git" /work/repo
     cd /work/repo
     git checkout -b "hermes/${TASK_ID}"
