@@ -1,0 +1,7 @@
+[Unit]
+Description=Refresh the read-only hermes-wiki mirror
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/git -C %h/TIG/hermes-wiki fetch -q origin
+ExecStart=/usr/bin/git -C %h/TIG/hermes-wiki reset -q --hard origin/main
