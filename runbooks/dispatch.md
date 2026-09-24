@@ -65,11 +65,11 @@ ssh tig-gpu /venv/main/bin/gpuq list
 - A cron job asking for access → it gets a code nobody approves, then `LOCKED`.
 - `curl` from inside the agent's sandbox → no network, by design.
 - A push to `master` from the executor → rejected by branch protection.
-- The executor merging its own pull request → **currently possible** (its token
-  is the owner's). Until the executor has its own GitHub identity that cannot
-  merge, `harness-pull.timer` stays disabled on both hosts and a merge is
-  deployed by hand: `systemctl --user start harness-pull.service` on the box
-  and on the droplet, after reading `master`.
+- The executor merging its own pull request → **possible, accepted** (its token
+  is the owner's, by decision). `harness-pull.timer` stays disabled on both
+  hosts; deploy by hand with `systemctl --user start harness-pull.service` on
+  the box and on the droplet, after reading `master`. A bad merge is undone
+  with a revert PR (force-push to `master` is blocked).
 
 If any of those succeed, stop and investigate before using the system again.
 
