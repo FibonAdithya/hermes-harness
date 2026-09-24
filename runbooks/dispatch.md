@@ -66,3 +66,31 @@ ssh tig-gpu /venv/main/bin/gpuq list
 - A push to `main` from the executor → rejected by branch protection.
 
 If any of those succeed, stop and investigate before using the system again.
+
+## The TIG box
+
+The box is `tig-adi` from the laptop (user `adi`). Hermes reaches it only as
+the dispatch key, which can run `~/.local/bin/dispatch` and nothing else.
+
+```bash
+ssh tig-adi 'echo "{}" | SSH_ORIGINAL_COMMAND=status ~/.local/bin/dispatch'   # what the broker sees
+ssh tig-adi 'ls ~/nights; cat ~/nights/<id>/status; tail -50 ~/nights/<id>/log'
+ssh tig-adi 'systemctl --user list-timers --no-pager'                          # nights, wiki mirror, harness pull
+ssh tig-adi 'systemctl --user stop night-<id>.service'                         # kill a night; status becomes killed
+```
+
+- **A verb is missing.** It is a file in `box/verbs` on `master`; `harness-pull`
+  installs `master` every 15 minutes. `journalctl --user -u harness-pull -n 20`.
+- **Nothing ran last night.** `systemctl --user list-timers` shows whether the
+  timers are enabled; they ship disabled. `~/nights/config.toml` holds the
+  inputs; an empty Talos queue is a `skipped` night, not an error.
+- **The dispatcher says "Failed to connect to bus".** `XDG_RUNTIME_DIR` for
+  `adi` is not `/run/user/<uid>`; read `loginctl show-user adi -p RuntimePath`.
+- **herdr version.** The box runs 0.7.5, pinned in `box/provision.sh` from the
+  GitHub release because `herdr.dev/install.sh` always installs the latest.
+  Upgrade the laptop and the box together: set `HERDR_VERSION` and re-run
+  `provision.sh`, then `herdr update` on the laptop.
+- **Rotating the dispatch key.** New keypair on the laptop; replace the
+  `command=...` line in `~adi/.ssh/authorized_keys` and the key in
+  `~/.ssh/tig_server_dispatch` on the droplet.
+- **Rotating the executor's GitHub token.** `ssh -t tig-server 'nano /etc/hermes-exec/github-token'`.
