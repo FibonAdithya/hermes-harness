@@ -194,7 +194,8 @@ def systemd_run_argv(unit: str, runtime_sec: int, workdir: Path, env: dict, argv
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 # The challenges the pinned Talos knows. Extend by PR when Talos does.
-TALOS_CHALLENGES = ("knapsack", "vehicle_routing", "satisfiability", "vector_search", "hypergraph", "neuralnet_optimizer")
+TALOS_CHALLENGES = ("knapsack", "vehicle_routing", "satisfiability", "vector_search", "hypergraph", "neuralnet_optimizer",
+                    "job_scheduling", "energy_arbitrage")
 TALOS_BACKENDS = ("local", "modal")
 MAX_FLEET_HOURS = 24
 MAX_TALOS_ITER = 500
