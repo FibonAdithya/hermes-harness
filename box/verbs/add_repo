@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""Clone one of the owner's own repositories into ~/TIG. Gated on the broker side.
+
+The allowlist is "repositories the box's gh login owns outright": no forks,
+no org repositories, nothing to maintain.
+"""
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import boxlib  # noqa: E402
+
+a = boxlib.read_json_stdin(sys.stdin.buffer) or {}
+name = a.get("name", "")
+home = Path(os.environ.get("HOME", "/home/adi"))
+
+
+def gh(*args):
+    return subprocess.run(["gh", *args], capture_output=True, text=True, check=False)
+
+
+me = gh("api", "user", "-q", ".login")
+if me.returncode != 0:
+    sys.exit(boxlib.refuse("gh is not logged in on the box"))
+owner = me.stdout.strip()
+try:
+    boxlib._name(name)
+except ValueError as exc:
+    sys.exit(boxlib.refuse(str(exc)))
+info = gh("api", f"repos/{owner}/{name}")
+if info.returncode != 0:
+    sys.exit(boxlib.refuse(f"no repository {owner}/{name} visible to this login"))
+reason = boxlib.add_repo_check(owner, json.loads(info.stdout), name)
+if reason:
+    sys.exit(boxlib.refuse(reason))
+dest = home / "TIG" / name
+if dest.exists():
+    print(json.dumps({"repo": name, "path": str(dest), "already": True}))
+    sys.exit(0)
+clone = gh("repo", "clone", f"{owner}/{name}", str(dest))
+if clone.returncode != 0:
+    sys.exit(boxlib.refuse(f"clone failed: {clone.stderr.strip()[:300]}"))
+print(json.dumps({"repo": name, "path": str(dest), "already": False}))
