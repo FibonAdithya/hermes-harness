@@ -1,0 +1,14 @@
+# ~/nights/config.toml — the only input the night timers read.
+# Edited over SSH by the owner; no verb writes it except to pop the Talos queue.
+
+[fleet]
+repo = "fleet-fixture"
+hours = 8
+
+[talos]
+iterations = 30
+backend = "local"
+
+[[talos.queue]]
+challenge = "knapsack"
+direction = "try a randomized greedy warm start before local search"

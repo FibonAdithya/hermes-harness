@@ -1,0 +1,9 @@
+[Unit]
+Description=fleet night at 23:00 UTC
+
+[Timer]
+OnCalendar=*-*-* 23:00:00 UTC
+Persistent=false
+
+[Install]
+WantedBy=timers.target

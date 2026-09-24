@@ -1,0 +1,7 @@
+[Unit]
+Description=Deploy hermes-harness to the droplet
+
+[Service]
+Type=oneshot
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/hermes-harness/droplet/harness-pull.sh

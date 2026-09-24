@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+"""Start a Talos run in ~/talos-<backend>. Gated on the broker side."""
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import boxlib  # noqa: E402
+
+a = boxlib.read_json_stdin(sys.stdin.buffer) or {}
+home = Path(os.environ.get("HOME", "/home/adi"))
+try:
+    workdir, argv, secs = boxlib.talos_command(
+        home, a.get("challenge", ""), a.get("direction", ""), int(a.get("iterations", 10)), a.get("backend", "local"))
+except (ValueError, TypeError) as exc:
+    sys.exit(boxlib.refuse(str(exc)))
+if not (workdir / "talos.config.json").is_file():
+    sys.exit(boxlib.refuse(f"{workdir.name} is not set up: run talos setup there first"))
+try:
+    night_id = boxlib.start_night(
+        "talos", workdir, argv, secs, dict(os.environ),
+        {"challenge": a["challenge"], "direction": a["direction"], "backend": a.get("backend", "local")})
+except RuntimeError as exc:
+    sys.exit(boxlib.refuse(str(exc)))
+print(json.dumps({"id": night_id}))

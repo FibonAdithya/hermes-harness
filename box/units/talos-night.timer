@@ -1,0 +1,9 @@
+[Unit]
+Description=Talos night at 23:05 UTC
+
+[Timer]
+OnCalendar=*-*-* 23:05:00 UTC
+Persistent=false
+
+[Install]
+WantedBy=timers.target

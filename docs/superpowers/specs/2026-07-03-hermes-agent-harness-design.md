@@ -1,22 +1,48 @@
 # Hermes Agent Harness — Design
 
+> **Superseded (2026-07-28)** by `2026-07-28-hermes-assistant-vm-design.md`,
+> which moves the harness to a cloud VM and repositions the agent as a
+> personal assistant. The "As-built corrections" below still apply and are
+> carried forward into the new spec.
+
 Date: 2026-07-03
+Revised: 2026-07-12 — keep Linux Mint instead of reflashing; add agent disk
+hygiene and a self-managed memory wiki.
+Revised: 2026-07-19 — corrected after implementation. Several mechanisms in
+the original design turned out not to work as written; see the **As-built
+corrections** section at the end for what actually holds.
 
 ## Purpose
 
-Turn the current laptop (being reflashed anyway) into a dedicated, always-on
-machine running [Hermes Agent](https://github.com/NousResearch/hermes-agent).
-The goal: message the agent from Telegram to kick off an experiment (mostly
-ML/data science work), have it write and execute the code locally, then push
-results to GitHub as a branch + PR for review and pull on another machine.
+Turn the current laptop into a dedicated, always-on machine running
+[Hermes Agent](https://github.com/NousResearch/hermes-agent). The goal:
+message the agent from Telegram to kick off an experiment (mostly ML/data
+science work), have it write and execute the code locally, then push results
+to GitHub as a branch + PR for review and pull on another machine.
 
 ## 1. OS & lifecycle
 
-- Reflash to **Ubuntu Server 24.04 LTS**, headless (no desktop environment).
-  Chosen over keeping Linux Mint because this machine will only ever be
-  reached via Telegram or SSH — a desktop environment is unnecessary
-  overhead on a single-purpose box, and Ubuntu Server has the widest
-  tooling compatibility (apt, Docker, uv, Node) for Hermes' install script.
+- **Keep the existing Linux Mint install — do not reflash.** Mint is
+  Ubuntu-based (same apt, Docker, systemd, uv, Node), so Hermes' installer
+  and toolchain have identical compatibility to Ubuntu Server; the desktop
+  environment's idle cost (a few hundred MB RAM, ~0% CPU) is negligible next
+  to Docker-based ML work; and keeping Mint avoids an entire
+  backup/wipe/restore cycle while staying reversible. (This reverses the
+  earlier reflash-to-Ubuntu-Server plan — the compatibility argument for it
+  doesn't hold, since Mint already provides the same toolchain.)
+- **Disable sleep/suspend for always-on operation.** A laptop desktop
+  session will otherwise suspend on lid-close or idle and take the bot down:
+  - set `HandleLidSwitch=ignore` and `HandleLidSwitchExternalPower=ignore`
+    in `/etc/systemd/logind.conf`
+  - `sudo systemctl mask sleep.target suspend.target hibernate.target
+    hybrid-sleep.target`
+  - disable Cinnamon's screen-blank / automatic-suspend power settings
+- **One-time host strip-down (owner, at setup — not the agent).** Remove
+  now-unneeded GUI software (Cursor, kdenlive, etc.) and stale personal
+  files, paring Mint down to a lean, server-like single-purpose box. This is
+  the manual equivalent of the wipe we are no longer doing. Ongoing disk
+  hygiene is handled separately (see §5); the agent is never given host-level
+  delete/uninstall power.
 - Install Hermes via the official installer script.
 - Run `hermes gateway` as a **systemd service** under the user account:
   - `Restart=on-failure` with backoff, so a crash doesn't take the bot down
@@ -60,39 +86,75 @@ results to GitHub as a branch + PR for review and pull on another machine.
   the Docker sandbox (`docker_volumes`) at `/root/.ssh/`, and the commit
   identity is injected via `docker_env` (`GIT_AUTHOR_NAME`/`_EMAIL`,
   `GIT_COMMITTER_NAME`/`_EMAIL`) so the container needs no separate
-  `.gitconfig` of its own.
+  `.gitconfig` of its own. Because the key also lives on the host, host-side
+  maintenance timers (§5) can commit and push as "Hermes Agent" without
+  entering the container.
+- **Persistent memory (two layers).** The agent both reads and manages its
+  own memory, entirely outside the Docker sandbox:
+  - *Layer 1 — built-in memory (auto-injected, hard-capped).* Hermes'
+    native `~/.hermes/memories/MEMORY.md` (~2,200 char) and `USER.md`
+    (~1,375 char) are loaded into the system prompt as a frozen snapshot at
+    session start, and the agent edits them with the gateway-level `memory`
+    tool (`add`/`replace`/`remove`). This is a host-side tool independent of
+    the execution sandbox — no container hole is needed. Because it is
+    hard-capped, this layer cannot bloat. `MEMORY.md` is seeded with a
+    durable **pointer to the wiki**: where it lives (`/root/hermes-wiki`),
+    its entry point (`index.md`), and the tending rules below.
+  - *Layer 2 — self-managed LLM wiki (unbounded, on-demand).* A dedicated
+    `hermes-wiki` git repo cloned into the sandbox at `/root/hermes-wiki`,
+    holding cross-linked markdown pages the agent reads/writes via its
+    normal file tools. It is far too large to inject into the prompt, so
+    Layer 1 is what makes the agent reliably remember it exists on a cold
+    session. Retrieval is `index.md` + `ripgrep` over the pages — no vector
+    store or external memory provider, and negligible disk footprint.
+    **Tending rules** (taught as a standing skill): one topic per page, add
+    an `index.md` line for each page, cross-link related pages with
+    `[[…]]`, check for an existing page before creating a new one, and
+    delete pages that turn out to be wrong.
 - **Workflow convention** — taught to the agent once, as a standing
   instruction/skill, not repeated per message: when asked to run an
   experiment in repo X,
-  1. clone/pull X (using the `github.com-hermes` remote alias)
-  2. create branch `experiment/<slug>`
-  3. write and execute the code, iterating as needed
-  4. commit as "Hermes Agent" with a results summary in the message
-  5. push the branch
-  6. `gh pr create` with a description of what ran and the results
-  7. reply in Telegram with the PR link and a short summary
+  1. `ripgrep` the wiki `index.md`/pages for related prior work and read
+     any relevant pages
+  2. clone/pull X (using the `github.com-hermes` remote alias)
+  3. create branch `experiment/<slug>`
+  4. write and execute the code, iterating as needed
+  5. commit as "Hermes Agent" with a results summary in the message
+  6. push the branch
+  7. `gh pr create` with a description of what ran and the results
+  8. record durable lessons/results as `hermes-wiki` pages (the host-side
+     timer in §5 commits and pushes the wiki; the agent only edits files)
+  9. reply in Telegram with the PR link and a short summary
+
+There is no default/dedicated experiments repo — each message names which
+existing repo/directory to work in.
 
 ## 3. Data flow
 
 ```
 Telegram message
-  -> Hermes gateway process
-  -> agent turn (plans + runs the experiment)
+  -> Hermes gateway process (MEMORY.md/USER.md injected at session start)
+  -> agent turn (consults wiki, plans + runs the experiment)
   -> shell/git tool calls, executed inside the Docker sandbox container
   -> code runs (train/benchmark/etc.) inside the container
   -> commit as "Hermes Agent" via github.com-hermes remote
   -> push branch, gh pr create with results summary
+  -> agent writes lessons/results into /root/hermes-wiki pages
   -> Telegram reply with PR link
   -> owner reviews PR on GitHub, pulls locally
-```
 
-There is no default/dedicated experiments repo — each message names which
-existing repo/directory to work in.
+(async, host-side timers — §5)
+  hermes-wiki dir  -> auto-commit + push as "Hermes Agent"
+  host             -> docker system prune + journald cap
+```
 
 ## 4. Guardrails & error handling
 
-- The agent **never pushes directly to `main`/`master`** — always a fresh
-  `experiment/<slug>` branch, always via PR, never auto-merged.
+- The agent **never pushes directly to `main`/`master`** for experiment
+  repos — always a fresh `experiment/<slug>` branch, always via PR, never
+  auto-merged. (The `hermes-wiki` repo is the deliberate exception: it is the
+  agent's own notebook, not reviewable experiment code, so its host-side
+  timer commits straight to `main`.)
 - If a push or PR creation fails (auth, conflicts, missing repo access),
   the agent replies in Telegram with the actual error rather than failing
   silently.
@@ -108,22 +170,104 @@ existing repo/directory to work in.
   filesystem, host `apt`/systemd, and other containers remain out of
   reach regardless of what the agent does inside its own container.
 
-## 5. Verification
+## 5. Host maintenance & disk hygiene
+
+Disk bloat is addressed without giving the agent any host-level reach. The
+dominant, fast-growing bloat (datasets, checkpoints, caches, cloned repos)
+lives inside the sandbox and the agent prunes it itself; slow host-side
+growth is handled by OS-owned timers.
+
+- **Agent self-pruning (inside the sandbox).** As a standing instruction,
+  the agent reclaims space in its own `/workspace` and `/root` (stale
+  datasets, model checkpoints, pip/uv caches, finished experiment repos).
+  This is inside its existing boundary — no host access. It must **not**
+  delete `/root/hermes-wiki` or `/root/.ssh`.
+- **Host janitor (`systemd` timer, OS-owned, not the agent).** Periodically
+  runs `docker system prune -f` (dangling images/build cache) and caps
+  journald via `SystemMaxUse=` in `/etc/systemd/journald.conf`. Keeps slow
+  host growth bounded automatically.
+- **Wiki auto-commit (`systemd` timer, OS-owned).** On a ~15-minute
+  schedule, snapshots the bind-mounted `hermes-wiki` directory on the host:
+  `git add -A`, commit only if there are changes, then push as "Hermes
+  Agent" via the `github.com-hermes` alias using the host-resident SSH key.
+  Push failures are logged and non-fatal. The agent therefore never has to
+  perform git ceremony for the wiki — it only edits files.
+
+## 6. Verification
 
 - **Smoke test** — message the bot a trivial prompt, confirm a reply.
 - **End-to-end test** — ask it to run a trivial experiment in a scratch
   repo, confirm a PR appears with the expected branch name and commit
   author.
+- **Memory test** — tell the agent a fact worth remembering, confirm it
+  writes to `MEMORY.md`/`USER.md`, start a new session, and confirm it
+  recalls the fact from the injected snapshot.
+- **Wiki test** — ask the agent to record a lesson as a wiki page, confirm
+  the page + `index.md` line appear, confirm the host timer commits and
+  pushes it to the `hermes-wiki` repo on GitHub, and confirm a later session
+  can find it via `ripgrep`.
+- **Disk-hygiene test** — leave a dangling Docker image and confirm the
+  janitor timer removes it; confirm journald respects the configured cap.
 - **Reboot test** — reboot the machine, confirm systemd brings the gateway
-  back up automatically and Telegram responds again without manual
-  intervention.
+  (and the maintenance timers) back up automatically and Telegram responds
+  again without manual intervention; confirm the machine does not suspend on
+  lid-close.
 - **Access control test** — confirm a message from a non-allowlisted
   Telegram account is ignored.
 
 ## Out of scope
 
+- Reflashing the OS — superseded by keeping Mint plus the one-time host
+  strip-down (§1).
 - A dedicated GitHub bot account — declined in favor of a separate SSH key
   + commit identity on the existing account.
-- Restoring the rest of the laptop's personal data (browser profile, email,
-  Zotero, etc.) — covered separately by the pre-wipe backup checklist, not
-  part of this harness setup.
+- External memory providers (Mem0, Supermemory, etc.) — the built-in memory
+  plus the self-managed wiki cover the need without an extra service to run
+  or a store that itself grows.
+- Giving the agent host-level uninstall/delete power — explicitly rejected;
+  host hygiene stays with OS-owned timers so the sandbox boundary holds.
+
+## As-built corrections (2026-07-19)
+
+The design above is accurate in intent, but four mechanisms it names do not
+work the way it describes. These were found during implementation and are
+recorded here so the doc is not quietly misleading.
+
+1. **Backend selection lives in `.env`, not `config.yaml`.**
+   `terminal.backend: docker` in `config.yaml` is *not* honoured at runtime.
+   The authoritative switch is `TERMINAL_ENV=docker` in `~/.hermes/.env`;
+   a stale `TERMINAL_ENV=local` there silently overrides everything else.
+   The failure mode is dangerous: `hermes config show` still reports
+   "Backend: docker" while commands execute directly **on the host**. Verify
+   with `id -u` (expect `0`) and the presence of `/.dockerenv`, never by
+   reading the config. Hermes also drives Docker through the `docker` Python
+   SDK, which must be installed into its venv — without it, Hermes silently
+   falls back to local execution rather than erroring.
+
+2. **`docker_volumes` / `docker_env` in `config.yaml` are inert.**
+   Hermes manages its own mounts and ignores these keys. The container's
+   `/root` is a bind mount of
+   `~/.hermes/sandboxes/docker/default/home` on the host, so the SSH key,
+   `.gitconfig`, and `gh` credentials are placed **directly into that
+   directory** rather than mounted or injected. The image is selected by
+   `TERMINAL_DOCKER_IMAGE` in `.env`.
+
+3. **Only `/root` and `/workspace` persist — durable tools must be baked
+   into the image.** Anything `apt install`ed lands in `/usr` and is lost
+   when the container is recreated. A custom image (`hermes-sandbox:latest`)
+   carries `git`, `gh`, `ripgrep`, and `jq`. §5's "agent self-pruning" still
+   holds, but the agent cannot durably *install* — only the image can.
+
+4. **The wiki auto-commit timer cannot run as the host user.** §5 assumed a
+   host-side `git` invocation using the host-resident key. In practice the
+   agent writes wiki files as container-root, so they are not writable by
+   the host user and `git add` fails. The timer instead runs git inside a
+   throwaway root container over the same bind mount. An early version of
+   this script swallowed that failure and reported "no changes" — the sync
+   must fail loudly, per §4's no-silent-failure rule.
+
+Additionally: `TELEGRAM_ALLOWED_USERS` matches the **numeric** Telegram user
+ID, not the username. A username there matches nothing and locks out the
+owner. Note also that Hermes' primary auth gate fails *closed* on an empty
+allowlist but a secondary fallback gate fails *open* — the allowlist must
+never be blanked.

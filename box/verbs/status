@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""Every night on the box: id, status, start time, exit code. Ungated."""
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import boxlib  # noqa: E402
+
+boxlib.read_json_stdin(sys.stdin.buffer)  # arguments are ignored; consume stdin
+print(json.dumps({"nights": boxlib.read_status(boxlib.nights_root(os.environ))}))

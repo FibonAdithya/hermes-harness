@@ -1,0 +1,27 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [master]
+permissions:
+  contents: read
+jobs:
+  broker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: cd broker && uv sync --extra dev && uv run pytest -q
+  box:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install pytest && cd box && python -m pytest -q
+      - run: sudo apt-get install -y -qq shellcheck && shellcheck -S warning box/*.sh executor/run-task.sh $(ls droplet/*.sh 2>/dev/null)
+      - run: |
+          for f in box/verbs/*; do
+            [ -x "$f" ] || { echo "$f is not executable"; exit 1; }
+            case "$(head -1 "$f")" in "#!/usr/bin/env python3") python -m py_compile "$f";; *) ;; esac
+          done
