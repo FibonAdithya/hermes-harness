@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""Tail of one night's log. Ungated. Refuses any id the box did not mint."""
+import json
+import os
+import sys
+from collections import deque
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import boxlib  # noqa: E402
+
+args = boxlib.read_json_stdin(sys.stdin.buffer) or {}
+try:
+    night_id = boxlib.check_night_id(args.get("id", ""))
+except ValueError as exc:
+    sys.exit(boxlib.refuse(str(exc)))
+lines = max(1, min(int(args.get("lines", 80)), 2000))
+d = boxlib.night_dir(boxlib.nights_root(os.environ), night_id)
+if not d.is_dir():
+    sys.exit(boxlib.refuse(f"no such night: {night_id}"))
+log = d / "log"
+tail = deque(log.read_text(errors="replace").splitlines(), maxlen=lines) if log.is_file() else deque()
+print(json.dumps({"id": night_id, "lines": list(tail)}))
