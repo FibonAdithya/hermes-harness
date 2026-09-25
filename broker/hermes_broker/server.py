@@ -131,22 +131,43 @@ def add_repo(name: str) -> str:
     return f"{r['repo']} is at {r['path']}" + (" (already there)" if r.get("already") else "")
 
 
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+@mcp.tool()
+def request_deploy(sha: str) -> str:
+    """Ask the owner to approve deploying one hermes-harness master commit to the box.
+
+    sha is the full 40-character commit id. The owner approves by typing that
+    commit's prefix in the approvals chat; the approval covers that commit only,
+    for one deploy_harness() call within 10 minutes.
+    """
+    sha = sha.strip().lower()
+    if not _SHA_RE.fullmatch(sha):
+        return "sha must be the full 40-character commit id of hermes-harness master"
+    _store().create_deploy_request(sha, now=time.time())
+    return (
+        f"Requested a deploy of hermes-harness {sha} to tig-server.\n"
+        f"Ask the owner to read that commit and reply `deploy {sha[:12]}` "
+        f"in the approvals chat within 2 minutes."
+    )
+
+
 @mcp.tool()
 def deploy_harness() -> str:
-    """Deploy hermes-harness master to the box and the droplet. Requires a grant.
+    """Deploy the owner-approved hermes-harness commit to the box. Needs request_deploy first.
 
-    Runs the box's harness-pull (git reset + install.sh) via the `deploy` verb,
-    then runs the droplet's harness-pull.sh locally. Broker-side changes take
-    effect at the next gateway restart; box-side verbs go live immediately.
+    Installs exactly that commit, and only while it is still master. The
+    droplet (this broker and the approvals bot) is never deployed from here:
+    the owner deploys it by hand.
     """
-    require_grant(_store(), "tig-server", now=time.time())
-    box_r = box.call(_target("tig-server"), "deploy", {}, timeout=600)
-    box_part = box_r.get("error") or "box: deployed"
-    script = Path.home() / "hermes-harness" / "droplet" / "harness-pull.sh"
-    proc = subprocess.run([str(script)], capture_output=True, text=True, timeout=600)
-    drop_part = ("droplet: deployed" if proc.returncode == 0
-                 else f"droplet deploy failed: {(proc.stderr or proc.stdout or '').strip()[-300:]}")
-    return f"{box_part}\n{drop_part}"
+    sha = _store().take_deploy_grant(now=time.time())
+    if sha is None:
+        raise Locked("LOCKED: no approved deploy. Call request_deploy(sha) first.")
+    r = box.call(_target("tig-server"), "deploy", {"sha": sha}, timeout=900)
+    return r.get("error") or (
+        f"tig-server: deployed {sha[:12]}. The droplet is deployed by hand, not by this tool."
+    )
 
 
 @mcp.tool()

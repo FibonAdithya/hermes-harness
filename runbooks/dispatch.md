@@ -11,6 +11,20 @@ The assistant asks in the main Telegram chat and prints a 4-digit code. Reply in
 the **approvals** chat — a different bot — with `approve 7391`. Codes expire in
 two minutes and are single-use. `revoke` in that chat locks every box at once.
 
+### Deploys
+
+The assistant can ask to deploy a `hermes-harness` commit to the box
+(`request_deploy`). It tells you a commit and the reply to type. Read that
+commit on `master` first, then reply in the approvals chat with
+`deploy <first 7+ characters of the commit>`, typed from what you read rather
+than copied from the assistant's message. The approval covers that commit only,
+for one deploy within 10 minutes. If `master` has moved on by the time it runs,
+the box refuses and the assistant has to ask again. A `tig-server` grant does
+not allow a deploy.
+
+The droplet (the broker and this approvals bot) is never deployed by the
+assistant: `systemctl --user start harness-pull.service` here, by hand.
+
 Forwarded messages are ignored by design. If you forward yourself a code it will
 not work; type it.
 
@@ -22,7 +36,8 @@ journalctl --user -u hermes-approvals -n 50     # what the approvals bot did
 journalctl --user -u hermes-gateway -n 50       # what the assistant did
 ```
 
-A grant is live if `grants.<box>.expires_at` is in the future. Times are epoch
+A grant is live if `grants.<box>.expires_at` is in the future. An approved
+deploy is `grants.deploy` (with its `sha`); a requested one is `pending_deploy`. Times are epoch
 seconds — `date -d @1754400000` to read one.
 
 ## A task went wrong
@@ -62,14 +77,18 @@ ssh tig-gpu /venv/main/bin/gpuq list
 ## Things that are supposed to fail
 
 - Any dispatch tool without a grant → `LOCKED: no active grant for <box>`.
+- `deploy_harness` without an approved deploy, or a second time on one
+  approval → `LOCKED: no approved deploy`.
 - A cron job asking for access → it gets a code nobody approves, then `LOCKED`.
 - `curl` from inside the agent's sandbox → no network, by design.
 - A push to `master` from the executor → rejected by branch protection.
 - The executor merging its own pull request → **possible, accepted** (its token
   is the owner's, by decision). `harness-pull.timer` stays disabled on both
-  hosts; deploy by hand with `systemctl --user start harness-pull.service` on
-  the box and on the droplet, after reading `master`. A bad merge is undone
-  with a revert PR (force-push to `master` is blocked).
+  hosts, so nothing merged runs until you deploy it: on the box by approving
+  `deploy <commit>` after reading it (or by hand with
+  `systemctl --user start harness-pull.service`), and on the droplet only by
+  hand. A bad merge is undone with a revert PR (force-push to `master` is
+  blocked).
 
 If any of those succeed, stop and investigate before using the system again.
 

@@ -16,6 +16,11 @@ from typing import Any
 BOXES: tuple[str, ...] = ("tig-gpu", "tig-server")
 REQUEST_TTL_SECONDS = 120
 MAX_GRANT_MINUTES = 480
+# A deploy grant is not a box: it names one hermes-harness commit, is approved
+# by the owner typing that commit's prefix, and is consumed by a single deploy.
+DEPLOY = "deploy"
+DEPLOY_GRANT_MINUTES = 10
+MIN_SHA_PREFIX = 7
 
 
 class GrantStore:
@@ -87,6 +92,40 @@ class GrantStore:
         self._write(data)
         return req["box"]
 
+    # ---- deploys -----------------------------------------------------
+
+    def create_deploy_request(self, sha: str, now: float) -> None:
+        data = self._read()
+        data["pending_deploy"] = {"sha": sha, "expires_at": now + REQUEST_TTL_SECONDS}
+        self._write(data)
+
+    def approve_deploy(self, prefix: str, now: float) -> str | None:
+        """Grant the pending deploy if `prefix` starts its commit. A mismatch keeps it pending."""
+        data = self._read()
+        req = data.get("pending_deploy")
+        if req is None:
+            return None
+        if req["expires_at"] <= now:
+            data.pop("pending_deploy")
+            self._write(data)
+            return None
+        prefix = prefix.lower()
+        if len(prefix) < MIN_SHA_PREFIX or not req["sha"].startswith(prefix):
+            return None
+        data.pop("pending_deploy")
+        data["grants"][DEPLOY] = {"sha": req["sha"], "expires_at": now + DEPLOY_GRANT_MINUTES * 60}
+        self._write(data)
+        return req["sha"]
+
+    def take_deploy_grant(self, now: float) -> str | None:
+        """The approved commit, if a deploy grant is live. Consumes the grant either way."""
+        data = self._read()
+        grant = data["grants"].pop(DEPLOY, None)
+        if grant is None:
+            return None
+        self._write(data)
+        return grant["sha"] if grant["expires_at"] > now else None
+
     # ---- grants ------------------------------------------------------
 
     def expires_at(self, box: str) -> float | None:
@@ -102,6 +141,7 @@ class GrantStore:
         if box is None:
             data["grants"] = {}
             data["pending"] = {}
+            data.pop("pending_deploy", None)
         else:
             data["grants"].pop(box, None)
             data["pending"] = {

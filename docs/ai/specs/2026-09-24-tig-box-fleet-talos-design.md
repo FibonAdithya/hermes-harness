@@ -432,3 +432,15 @@ The 08-05 §9 list still applies to the broker. Added:
    left no Claude transcript. Not diagnosed here; a fleet question.
 8. **Deploys are stamped.** `harness-pull` records the deployed SHA only after
    the install succeeded, so a failed install is retried on the next tick.
+9. **The agent can deploy the box, one approved commit at a time
+   (2026-09-25).** This amends item 1: "deployed by hand after reading
+   `master`" becomes "deployed after the owner reads one commit and approves
+   it". `request_deploy(sha)` records a pending deploy; the owner approves by
+   typing `deploy <prefix>` of the commit they read in the approvals chat; the
+   grant names that commit, lasts 10 minutes, and is consumed by one
+   `deploy_harness()`. The box's `deploy` verb installs exactly that commit and
+   refuses if it is no longer `origin/master`, so a merge that lands after the
+   approval is never deployed under it. A `tig-server` grant does not allow a
+   deploy. The droplet, which holds the broker's keys and the approvals bot, is
+   out of the agent's reach and stays deployed by hand, so no agent-merged
+   change can alter the gate that issues grants without the owner deploying it.
