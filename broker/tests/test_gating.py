@@ -96,3 +96,24 @@ def test_run_talos_resume_sends_only_the_job_and_backend(store, monkeypatch):
     sent.clear()
     server.run_talos("knapsack", "d", 3, "local")
     assert sent == [("run_talos", {"challenge": "knapsack", "direction": "d", "iterations": 3, "backend": "local"})]
+
+
+def test_run_talos_refuses_new_run_arguments_alongside_resume(store, monkeypatch):
+    """The box refuses these with resume; the broker must not drop them first and
+    report a resume that ignored what the caller asked for."""
+    from hermes_broker import server
+
+    monkeypatch.setattr(server, "_store", lambda: store)
+    monkeypatch.setattr(server, "_target", lambda box: "tig-server")
+    sent = []
+    monkeypatch.setattr(server.box, "call", lambda t, v, a, timeout=60: sent.append((v, a)) or {"id": "talos-x"})
+    store.approve(store.create_request("tig-server", 30, "x", now=time.time()), now=time.time())
+
+    job = "20260924-230101-knapsack"
+    for extra in ({"challenge": "hypergraph"}, {"direction": "d"}, {"iterations": 30}, {"iterations": 0}):
+        out = server.run_talos(resume=job, **extra)
+        assert "resume" in out and next(iter(extra)) in out, (extra, out)
+    assert sent == []
+
+    server.run_talos("knapsack", "d")
+    assert sent == [("run_talos", {"challenge": "knapsack", "direction": "d", "iterations": 30, "backend": "local"})]
