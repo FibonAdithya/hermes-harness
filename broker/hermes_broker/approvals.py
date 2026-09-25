@@ -1,7 +1,7 @@
 """Approval channel: a Telegram bot the broker owns and the agent cannot see.
 
 Grants are issued only from a message that is (a) from the owner's numeric id,
-(b) an exact `approve <4 digits>` or `revoke`, and (c) not forwarded. (c) is the
+(b) an exact `approve <4 digits>`, `deploy <7-40 hex>` or `revoke`, and (c) not forwarded. (c) is the
 defence against As-built #20: text someone else wrote, forwarded in, arrives
 through a channel already vetted as the owner.
 """
@@ -14,12 +14,13 @@ import time
 
 import httpx
 
-from .grants import GrantStore
+from .grants import DEPLOY_GRANT_MINUTES, GrantStore
 
 logger = logging.getLogger(__name__)
 
 _APPROVE = re.compile(r"^approve\s+(\d{4})$", re.IGNORECASE)
 _REVOKE = re.compile(r"^revoke$", re.IGNORECASE)
+_DEPLOY = re.compile(r"^deploy\s+([0-9a-f]{7,40})$", re.IGNORECASE)
 
 # Any of these on a message means it originated elsewhere.
 _FORWARD_MARKERS = (
@@ -48,9 +49,35 @@ def parse_command(update: dict, owner_id: int) -> tuple[str, str] | None:
     approve = _APPROVE.match(text)
     if approve:
         return ("approve", approve.group(1))
+    deploy = _DEPLOY.match(text)
+    if deploy:
+        return ("deploy", deploy.group(1).lower())
     if _REVOKE.match(text):
         return ("revoke", "")
     return None
+
+
+def handle(store: GrantStore, verb: str, arg: str, now: float) -> str:
+    """Apply one parsed owner command; return the reply to send."""
+    if verb == "revoke":
+        store.revoke(None)
+        logger.info("all grants revoked by owner")
+        return "Revoked. All boxes locked."
+    if verb == "deploy":
+        sha = store.approve_deploy(arg, now)
+        if sha is None:
+            logger.info("rejected deploy prefix")
+            return f"No pending deploy of a commit starting {arg}."
+        logger.info("deploy of %s approved", sha)
+        return f"Deploy of {sha} to tig-server approved for {DEPLOY_GRANT_MINUTES} min."
+    reason = store.pending_reason(arg)
+    box = store.approve(arg, now)
+    if box is None:
+        logger.info("rejected approval code")
+        return "No pending request with that code."
+    minutes = int((store.expires_at(box) - now) / 60)
+    logger.info("granted %s for %s minutes", box, minutes)
+    return f"Granted {box} for {minutes} min.\nFor: {reason}"
 
 
 def _send(client: httpx.Client, token: str, chat_id: int, text: str) -> None:
@@ -91,25 +118,5 @@ def run_listener(
                 parsed = parse_command(update, owner_id)
                 if parsed is None:
                     continue
-                verb, code = parsed
-                now = time.time()
-                if verb == "revoke":
-                    store.revoke(None)
-                    _send(client, token, owner_id, "Revoked. All boxes locked.")
-                    logger.info("all grants revoked by owner")
-                    continue
-
-                reason = store.pending_reason(code)
-                box = store.approve(code, now)
-                if box is None:
-                    _send(client, token, owner_id, "No pending request with that code.")
-                    logger.info("rejected approval code")
-                else:
-                    minutes = int((store.expires_at(box) - now) / 60)
-                    _send(
-                        client,
-                        token,
-                        owner_id,
-                        f"Granted {box} for {minutes} min.\nFor: {reason}",
-                    )
-                    logger.info("granted %s for %s minutes", box, minutes)
+                verb, arg = parsed
+                _send(client, token, owner_id, handle(store, verb, arg, time.time()))

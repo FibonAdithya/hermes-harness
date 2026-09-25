@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Deploy hermes-harness master onto the box. Gated on the broker side.
+"""Install one owner-approved hermes-harness commit on the box. Gated on the broker side.
 
-harness-pull.service is a oneshot (git reset to origin/master, then install.sh),
-so `systemctl --user start` blocks until it finishes and fails if it did.
+The broker passes the commit the owner approved. It is installed only if it is
+still origin/master, and it is that commit that gets checked out, so a merge
+landing after the approval is never deployed under it.
 """
 import json
+import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -12,9 +15,33 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import boxlib  # noqa: E402
 
-boxlib.read_json_stdin(sys.stdin.buffer)
-r = subprocess.run(["systemctl", "--user", "start", "harness-pull.service"],
-                   capture_output=True, text=True, check=False)
+a = boxlib.read_json_stdin(sys.stdin.buffer) or {}
+sha = a.get("sha")
+if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+    sys.exit(boxlib.refuse("deploy needs the approved 40-character commit sha"))
+home = Path(os.environ.get("HOME", "/home/adi"))
+repo = home / "TIG" / "hermes-harness"
+
+
+def git(*args):
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=False)
+
+
+r = git("fetch", "-q", "origin")
 if r.returncode != 0:
-    sys.exit(boxlib.refuse(f"deploy failed: {(r.stderr or '').strip()[:300]}"))
-print(json.dumps({"deployed": True}))
+    sys.exit(boxlib.refuse(f"git fetch failed: {r.stderr.strip()[:300]}"))
+master = git("rev-parse", "origin/master").stdout.strip()
+if master != sha:
+    sys.exit(boxlib.refuse(f"master is at {master[:12]}, not the approved {sha[:12]}; request a new deploy"))
+for args in (("checkout", "-q", "master"), ("reset", "-q", "--hard", sha)):
+    r = git(*args)
+    if r.returncode != 0:
+        sys.exit(boxlib.refuse(f"git {args[0]} failed: {r.stderr.strip()[:300]}"))
+r = subprocess.run([str(repo / "box" / "install.sh")], capture_output=True, text=True, check=False)
+if r.returncode != 0:
+    sys.exit(boxlib.refuse(f"install.sh failed at {sha[:12]}: {(r.stderr or r.stdout).strip()[-300:]}"))
+# The same stamp harness-pull.service writes, so a later pull sees this commit as deployed.
+stamp = home / ".local" / "share" / "harness-deployed.sha"
+stamp.parent.mkdir(parents=True, exist_ok=True)
+stamp.write_text(sha)
+print(json.dumps({"deployed": sha}))
