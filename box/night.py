@@ -103,10 +103,11 @@ def _start(kind: str, env: dict, root: Path) -> int:
             _skip(root, "talos", "talos queue is empty")
             return 0
         t = cfg.get("talos", {})
+        backend = t.get("backend", "local")
         workdir, cmd, secs = boxlib.talos_command(home, entry["challenge"], entry["direction"],
-                                                  int(t.get("iterations", 30)), t.get("backend", "local"))
+                                                  int(t.get("iterations", 30)), backend)
         _write_atomic(path, dump_toml(rest))
-        night_id = boxlib.start_night("talos", workdir, cmd, secs, env, {**entry, "timer": True})
+        night_id = boxlib.start_night("talos", workdir, cmd, secs, env, {**entry, "backend": backend, "timer": True})
     print(json.dumps({"id": night_id}))
     return 0
 

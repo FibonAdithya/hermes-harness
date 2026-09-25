@@ -90,11 +90,25 @@ def run_fleet(repo: str, hours: int = 8) -> str:
 
 
 @mcp.tool()
-def run_talos(challenge: str, direction: str, iterations: int = 30, backend: str = "local") -> str:
-    """Start a Talos autoresearch run on the box. Requires a grant. backend is local or modal."""
+def run_talos(challenge: str = "", direction: str = "", iterations: int | None = None, backend: str = "local",
+              resume: str = "") -> str:
+    """Start a Talos autoresearch run on the box. Requires a grant. backend is local or modal.
+
+    To continue a Talos job that stopped (paused, cancelled, failed, or cut off by
+    the night's time limit), pass resume=<job id> and the backend it ran on, and
+    nothing else: the job keeps its own challenge, direction and budget. The job
+    id is on the `Job <id>:` line near the top of the original night's night_log.
+    """
     require_grant(_store(), "tig-server", now=time.time())
+    if resume:
+        extra = [k for k, v in (("challenge", challenge), ("direction", direction), ("iterations", iterations))
+                 if v not in ("", None)]
+        if extra:
+            return f"resume takes only backend; drop {', '.join(extra)}"
+        r = box.call(_target("tig-server"), "run_talos", {"resume": resume, "backend": backend})
+        return r.get("error") or f"talos night {r['id']} resuming {resume} ({backend}). Poll night_status()."
     r = box.call(_target("tig-server"), "run_talos",
-                 {"challenge": challenge, "direction": direction, "iterations": int(iterations), "backend": backend})
+                 {"challenge": challenge, "direction": direction, "iterations": int(30 if iterations is None else iterations), "backend": backend})
     return r.get("error") or f"talos night {r['id']} started ({challenge}, {backend}). Poll night_status()."
 
 
