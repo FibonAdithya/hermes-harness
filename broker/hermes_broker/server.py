@@ -132,6 +132,24 @@ def add_repo(name: str) -> str:
 
 
 @mcp.tool()
+def deploy_harness() -> str:
+    """Deploy hermes-harness master to the box and the droplet. Requires a grant.
+
+    Runs the box's harness-pull (git reset + install.sh) via the `deploy` verb,
+    then runs the droplet's harness-pull.sh locally. Broker-side changes take
+    effect at the next gateway restart; box-side verbs go live immediately.
+    """
+    require_grant(_store(), "tig-server", now=time.time())
+    box_r = box.call(_target("tig-server"), "deploy", {}, timeout=600)
+    box_part = box_r.get("error") or "box: deployed"
+    script = Path.home() / "hermes-harness" / "droplet" / "harness-pull.sh"
+    proc = subprocess.run([str(script)], capture_output=True, text=True, timeout=600)
+    drop_part = ("droplet: deployed" if proc.returncode == 0
+                 else f"droplet deploy failed: {(proc.stderr or proc.stdout or '').strip()[-300:]}")
+    return f"{box_part}\n{drop_part}"
+
+
+@mcp.tool()
 def night_status() -> str:
     """Every fleet, talos, and task run on the box: id, status, start time, exit code."""
     r = box.call(_target("tig-server"), "status", {}, timeout=30)
