@@ -163,6 +163,7 @@ Added to the 08-05 §3 table. Gating is the same code path: a live grant for
 |---|---|---|---|
 | `run_fleet(repo, hours)` | yes | `run_fleet` | `fleet run --new-run` in `~/TIG/<repo>`; budget comes from that repo's `fleet.toml`, the hour limit becomes `RuntimeMaxSec` |
 | `run_talos(challenge, direction, iterations, backend)` | yes | `run_talos` | `talos run --challenge … --direction … --budget-iterations … --yes` in `~/talos-<backend>`, whose `talos.config.json` fixes the backend |
+| `run_talos(resume=<job id>, backend)` | yes | `run_talos` | `talos run --resume <job id> --yes` in `~/talos-<backend>`; the job keeps its own challenge, direction and budget, so passing those with `resume` is refused, as is a resume while any Talos night on that backend is live (Talos keeps no per-job lock) |
 | `run_task(repo, prompt, minutes)` | yes | `run_task` | the 08-05 executor: Claude Code in a throwaway container, PR only |
 | `add_repo(name)` | yes | `add_repo` | clones `FibonAdithya/<name>` into `~/TIG/<name>` |
 | `night_status()` | no | `status` | every night, running or finished |

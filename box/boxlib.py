@@ -233,6 +233,38 @@ def talos_command(home: Path, challenge: str, direction: str, iterations: int, b
     return workdir, argv, 12 * 3600
 
 
+# Talos names a job `<YYYYmmdd-HHMMSS>-<challenge>[-n]` and joins it onto runs/
+# unchecked, so this pattern is also what keeps a resume inside that directory.
+TALOS_JOB_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-(" + "|".join(TALOS_CHALLENGES) + r")(-[0-9]{1,4})?$")
+
+
+def talos_resume_command(home: Path, job_id: str, backend: str) -> tuple[Path, list[str], int]:
+    """Continue a stopped Talos job. Challenge, direction and budget come from its job.json."""
+    if not isinstance(job_id, str) or not TALOS_JOB_RE.fullmatch(job_id):
+        raise ValueError(f"invalid talos job id: {job_id!r}")
+    if backend not in TALOS_BACKENDS:
+        raise ValueError(f"unknown backend: {backend!r}")
+    workdir = Path(home) / f"talos-{backend}"
+    argv = [str(workdir / ".venv" / "bin" / "talos"), "run", "--resume", job_id, "--yes"]
+    return workdir, argv, 12 * 3600
+
+
+def running_talos(root: Path, backend: str) -> list[str]:
+    """Ids of the Talos nights on this backend whose unit is still alive."""
+    out = []
+    for row in read_status(root):
+        if row["status"] != "running" or not row["id"].startswith("talos-"):
+            continue
+        try:
+            meta = json.loads(read_small(Path(root) / row["id"] / "meta.json", 65536) or "{}")
+        except json.JSONDecodeError:
+            meta = {}
+        # A night whose meta names no backend (unreadable, or older than this field) may be on either.
+        if meta.get("backend", backend) == backend:
+            out.append(row["id"])
+    return out
+
+
 def add_repo_check(owner_login: str, repo_json: dict, name: str) -> str | None:
     try:
         _name(name)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Start a Talos run in ~/talos-<backend>. Gated on the broker side."""
+"""Start a Talos run in ~/talos-<backend>, or resume one with `resume`. Gated on the broker side."""
 import json
 import os
 import sys
@@ -10,17 +10,39 @@ import boxlib  # noqa: E402
 
 a = boxlib.read_json_stdin(sys.stdin.buffer) or {}
 home = Path(os.environ.get("HOME", "/home/adi"))
+backend = a.get("backend", "local")
+resume = a.get("resume")
 try:
-    workdir, argv, secs = boxlib.talos_command(
-        home, a.get("challenge", ""), a.get("direction", ""), int(a.get("iterations", 10)), a.get("backend", "local"))
+    if resume is not None:
+        # Talos reads these from the job's job.json and ignores them on a resume.
+        extra = sorted(k for k in ("challenge", "direction", "iterations") if k in a)
+        if extra:
+            raise ValueError(f"resume takes only backend; drop {', '.join(extra)}")
+        workdir, argv, secs = boxlib.talos_resume_command(home, resume, backend)
+    else:
+        workdir, argv, secs = boxlib.talos_command(
+            home, a.get("challenge", ""), a.get("direction", ""), int(a.get("iterations", 10)), backend)
 except (ValueError, TypeError) as exc:
     sys.exit(boxlib.refuse(str(exc)))
 if not (workdir / "talos.config.json").is_file():
     sys.exit(boxlib.refuse(f"{workdir.name} is not set up: run talos setup there first"))
+if resume is not None:
+    run_dir = workdir / "runs" / resume
+    if not run_dir.is_dir():
+        sys.exit(boxlib.refuse(f"no talos job {resume} in {workdir.name}"))
+    missing = [f for f in ("job.json", "state.json") if not (run_dir / f).is_file()]
+    if missing:
+        sys.exit(boxlib.refuse(f"talos job {resume} cannot be resumed: missing {', '.join(missing)}"))
+    # Talos keeps no lock on a job, and the night that started it cannot know the
+    # id Talos minted, so any live Talos night on this backend blocks a resume.
+    busy = boxlib.running_talos(boxlib.nights_root(os.environ), backend)
+    if busy:
+        sys.exit(boxlib.refuse(f"a talos night is running on {backend}: {', '.join(busy)}; resume after it ends"))
+    meta = {"resume": resume, "backend": backend}
+else:
+    meta = {"challenge": a["challenge"], "direction": a["direction"], "backend": backend}
 try:
-    night_id = boxlib.start_night(
-        "talos", workdir, argv, secs, dict(os.environ),
-        {"challenge": a["challenge"], "direction": a["direction"], "backend": a.get("backend", "local")})
+    night_id = boxlib.start_night("talos", workdir, argv, secs, dict(os.environ), meta)
 except RuntimeError as exc:
     sys.exit(boxlib.refuse(str(exc)))
 print(json.dumps({"id": night_id}))

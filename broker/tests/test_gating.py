@@ -1,3 +1,5 @@
+import time
+
 import pytest
 from hermes_broker.grants import GrantStore
 from hermes_broker.server import Locked, require_grant
@@ -70,3 +72,27 @@ def test_box_tools_are_gated_and_reads_are_not(store, monkeypatch):
     server.night_log("fleet-20260924-2300-abcd", 10)
     server.list_repos()
     assert calls == ["status", "log", "list_repos"]
+
+
+def test_run_talos_resume_sends_only_the_job_and_backend(store, monkeypatch):
+    """A resume carries no challenge, direction or budget: Talos reads those from
+    the job, and the box refuses them alongside resume."""
+    from hermes_broker import server
+
+    monkeypatch.setattr(server, "_store", lambda: store)
+    monkeypatch.setattr(server, "_target", lambda box: "tig-server")
+    sent = []
+    monkeypatch.setattr(server.box, "call", lambda t, v, a, timeout=60: sent.append((v, a)) or {"id": "talos-x"})
+
+    with pytest.raises(Locked):
+        server.run_talos(resume="20260924-230101-knapsack")
+    assert sent == []
+
+    store.approve(store.create_request("tig-server", 30, "x", now=time.time()), now=time.time())
+    out = server.run_talos(resume="20260924-230101-knapsack", backend="modal")
+    assert sent == [("run_talos", {"resume": "20260924-230101-knapsack", "backend": "modal"})]
+    assert "talos-x" in out and "20260924-230101-knapsack" in out
+
+    sent.clear()
+    server.run_talos("knapsack", "d", 3, "local")
+    assert sent == [("run_talos", {"challenge": "knapsack", "direction": "d", "iterations": 3, "backend": "local"})]
