@@ -98,3 +98,23 @@ def test_approve_and_revoke_replies_unchanged(tmp_path):
     assert handle(store, "approve", code, now=1001.0) == "Granted tig-server for 30 min.\nFor: fix parser"
     assert handle(store, "revoke", "", now=1002.0) == "Revoked. All boxes locked."
     assert not store.is_active("tig-server", now=1003.0)
+
+
+import pytest
+
+
+@pytest.mark.parametrize("verb", ["task", "solo", "drop"])
+def test_task_replies_are_parsed(verb):
+    assert parse_command(msg(f" {verb.upper()} 7310 "), OWNER) == (verb, "7310")
+
+
+@pytest.mark.parametrize("text", ["task", "task 731", "task 73100", "solo abcd", "drop 7310 now", "tasks 7310"])
+def test_malformed_task_replies_ignored(text):
+    assert parse_command(msg(text), OWNER) is None
+
+
+def test_task_reply_forwarded_or_from_someone_else_ignored():
+    assert parse_command(msg("task 7310", forward_origin={"type": "user"}), OWNER) is None
+    update = msg("task 7310")
+    update["message"]["from"]["id"] = 999
+    assert parse_command(update, OWNER) is None
