@@ -15,13 +15,14 @@ resume = a.get("resume")
 try:
     if resume is not None:
         # Talos reads these from the job's job.json and ignores them on a resume.
-        extra = sorted(k for k in ("challenge", "direction", "iterations") if k in a)
+        extra = sorted(k for k in ("challenge", "direction", "iterations", "compute_usd", "mode") if k in a)
         if extra:
             raise ValueError(f"resume takes only backend; drop {', '.join(extra)}")
         workdir, argv, secs = boxlib.talos_resume_command(home, resume, backend)
     else:
         workdir, argv, secs = boxlib.talos_command(
-            home, a.get("challenge", ""), a.get("direction", ""), int(a.get("iterations", 10)), backend)
+            home, a.get("challenge", ""), a.get("direction", ""), int(a.get("iterations", 10)), backend,
+            a.get("compute_usd", boxlib.DEFAULT_TALOS_COMPUTE_USD), a.get("mode", "single-shot"))
 except (ValueError, TypeError) as exc:
     sys.exit(boxlib.refuse(str(exc)))
 if not (workdir / "talos.config.json").is_file():
@@ -40,9 +41,14 @@ if resume is not None:
         sys.exit(boxlib.refuse(f"a talos night is running on {backend}: {', '.join(busy)}; resume after it ends"))
     meta = {"resume": resume, "backend": backend}
 else:
-    meta = {"challenge": a["challenge"], "direction": a["direction"], "backend": backend}
+    meta = {"challenge": a["challenge"], "direction": a["direction"], "backend": backend,
+            "compute_usd": a.get("compute_usd", boxlib.DEFAULT_TALOS_COMPUTE_USD),
+            "mode": a.get("mode", "single-shot")}
 try:
-    night_id = boxlib.start_night("talos", workdir, argv, secs, dict(os.environ), meta)
+    # A resumed job keeps the mode it started in; its night cannot see which, so it
+    # gets the longer stop timeout in case it is agentic.
+    stop = boxlib.talos_stop_sec("agentic" if resume is not None else meta["mode"])
+    night_id = boxlib.start_night("talos", workdir, argv, secs, dict(os.environ), meta, stop_sec=stop)
 except RuntimeError as exc:
     sys.exit(boxlib.refuse(str(exc)))
 print(json.dumps({"id": night_id}))

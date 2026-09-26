@@ -34,7 +34,7 @@ def test_talos_resume_command_refuses_bad_inputs():
         with pytest.raises(ValueError):
             boxlib.talos_resume_command(HOME, bad, "local")
     with pytest.raises(ValueError):
-        boxlib.talos_resume_command(HOME, JOB, "c3")
+        boxlib.talos_resume_command(HOME, JOB, "gpu")
 
 
 # --- the verb, end to end, with systemd faked on PATH -------------------------
@@ -137,8 +137,8 @@ def test_verb_new_run_is_unchanged(tmp_path):
     rc, out = _run(tmp_path, {"challenge": "knapsack", "direction": "greedy", "iterations": 3})
     assert rc == 0, out
     sd = (tmp_path / "systemd-run.argv").read_text().splitlines()
-    assert sd[-8:] == ["run", "--challenge", "knapsack", "--direction", "greedy",
-                       "--budget-iterations", "3", "--yes"]
+    assert sd[-10:] == ["run", "--challenge", "knapsack", "--direction", "greedy",
+                        "--budget-iterations", "3", "--budget-compute-usd", "5.0", "--yes"]
     assert "resume" not in json.loads((_nights(tmp_path)[0] / "meta.json").read_text())
 
 

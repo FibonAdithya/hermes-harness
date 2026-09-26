@@ -30,7 +30,7 @@ def test_talos_command_shape():
     assert wd == HOME / "talos-local"
     assert argv[0] == str(HOME / "talos-local" / ".venv" / "bin" / "talos")
     assert argv[1:] == ["run", "--challenge", "knapsack", "--direction", "try a greedy warm start",
-                        "--budget-iterations", "20", "--yes"]
+                        "--budget-iterations", "20", "--budget-compute-usd", "5.0", "--yes"]
     assert secs == 12 * 3600
     wd2, _, _ = boxlib.talos_command(HOME, "knapsack", "x", 1, "modal")
     assert wd2 == HOME / "talos-modal"
@@ -44,7 +44,7 @@ def test_talos_command_accepts_c007_and_c008():
 
 def test_talos_command_refuses_bad_inputs():
     with pytest.raises(ValueError):
-        boxlib.talos_command(HOME, "knapsack", "x", 1, "c3")
+        boxlib.talos_command(HOME, "knapsack", "x", 1, "gpu")
     with pytest.raises(ValueError):
         boxlib.talos_command(HOME, "not a challenge", "x", 1, "local")
     with pytest.raises(ValueError):

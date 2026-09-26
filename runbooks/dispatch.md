@@ -118,4 +118,17 @@ ssh tig-adi 'systemctl --user stop night-<id>.service'                         #
 - **Rotating the dispatch key.** New keypair on the laptop; replace the
   `command=...` line in `~adi/.ssh/authorized_keys` and the key in
   `~/.ssh/tig_server_dispatch` on the droplet.
+- **Pausing a Talos night.** Hermes calls `pause_talos(<night id>)`; by hand,
+  `ssh tig-adi 'systemctl --user kill --kill-whom=main --signal=SIGINT night-<id>.service'`.
+  Do not use `systemctl stop` on a Talos night unless it is stuck: that also
+  ends it cleanly (TERM becomes SIGINT for Talos), but reads `killed`. A night
+  still reads `running` until Talos has cancelled its job, then `paused`.
+  Continue with `run_talos(resume=<job id>, backend=…)`.
+- **Setting up the c3 backend.** Once, on the box as `adi`: a checkout of the
+  pinned Talos at `~/talos-c3` with its venv (as `~/talos-modal`), then
+  `cd ~/talos-c3 && .venv/bin/talos setup` with backend `c3`, provider
+  `claude-cli`, and a key from `c3 apikey create` on the laptop. Until
+  `~/talos-c3/talos.config.json` exists, `run_talos(backend="c3")` refuses with
+  "talos-c3 is not set up". Top up credit with `c3 topup`; each run is capped
+  by its `compute_usd` (default $5, at most $90).
 - **Rotating the executor's GitHub token.** `ssh -t tig-server 'nano /etc/hermes-exec/github-token'`.
