@@ -1,0 +1,7 @@
+[Unit]
+Description=fleet-doctor: file faults from finished fleet nights
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.npm-global/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/bin/sh -c 'echo {} | %h/TIG/hermes-harness/box/verbs/doctor'

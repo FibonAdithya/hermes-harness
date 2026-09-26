@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Install one owner-approved hermes-harness commit on the box. Gated on the broker side.
+"""Install one owner-approved commit on the box. Gated on the broker side.
 
-The broker passes the commit the owner approved. It is installed only if it is
-still origin/master, and it is that commit that gets checked out, so a merge
-landing after the approval is never deployed under it.
+target is "harness" (hermes-harness master, deployed to ~/TIG/hermes-harness) or
+"fleet" (fleet main, deployed to ~/TIG/fleet). The broker passes the commit the
+owner approved; it is installed only if it is still the target's tracked branch
+tip, so a merge landing after the approval is never deployed under it.
 """
 import json
 import os
@@ -20,28 +21,83 @@ sha = a.get("sha")
 if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
     sys.exit(boxlib.refuse("deploy needs the approved 40-character commit sha"))
 home = Path(os.environ.get("HOME", "/home/adi"))
-repo = home / "TIG" / "hermes-harness"
+
+TARGETS = ("harness", "fleet")
+target = a.get("target", "harness")
+if target not in TARGETS:
+    sys.exit(boxlib.refuse("deploy target must be harness or fleet"))
 
 
-def git(*args):
-    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=False)
+def deploy_harness(home: Path, sha: str) -> None:
+    repo = home / "TIG" / "hermes-harness"
 
+    def git(*args):
+        return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=False)
 
-r = git("fetch", "-q", "origin")
-if r.returncode != 0:
-    sys.exit(boxlib.refuse(f"git fetch failed: {r.stderr.strip()[:300]}"))
-master = git("rev-parse", "origin/master").stdout.strip()
-if master != sha:
-    sys.exit(boxlib.refuse(f"master is at {master[:12]}, not the approved {sha[:12]}; request a new deploy"))
-for args in (("checkout", "-q", "master"), ("reset", "-q", "--hard", sha)):
-    r = git(*args)
+    r = git("fetch", "-q", "origin")
     if r.returncode != 0:
-        sys.exit(boxlib.refuse(f"git {args[0]} failed: {r.stderr.strip()[:300]}"))
-r = subprocess.run([str(repo / "box" / "install.sh")], capture_output=True, text=True, check=False)
-if r.returncode != 0:
-    sys.exit(boxlib.refuse(f"install.sh failed at {sha[:12]}: {(r.stderr or r.stdout).strip()[-300:]}"))
-# The same stamp harness-pull.service writes, so a later pull sees this commit as deployed.
-stamp = home / ".local" / "share" / "harness-deployed.sha"
-stamp.parent.mkdir(parents=True, exist_ok=True)
-stamp.write_text(sha)
-print(json.dumps({"deployed": sha}))
+        sys.exit(boxlib.refuse(f"git fetch failed: {r.stderr.strip()[:300]}"))
+    master = git("rev-parse", "origin/master").stdout.strip()
+    if master != sha:
+        sys.exit(boxlib.refuse(f"master is at {master[:12]}, not the approved {sha[:12]}; request a new deploy"))
+    for args in (("checkout", "-q", "master"), ("reset", "-q", "--hard", sha)):
+        r = git(*args)
+        if r.returncode != 0:
+            sys.exit(boxlib.refuse(f"git {args[0]} failed: {r.stderr.strip()[:300]}"))
+    r = subprocess.run([str(repo / "box" / "install.sh")], capture_output=True, text=True, check=False)
+    if r.returncode != 0:
+        sys.exit(boxlib.refuse(f"install.sh failed at {sha[:12]}: {(r.stderr or r.stdout).strip()[-300:]}"))
+    # The same stamp harness-pull.service writes, so a later pull sees this commit as deployed.
+    stamp = home / ".local" / "share" / "harness-deployed.sha"
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.write_text(sha)
+    print(json.dumps({"deployed": sha}))
+
+
+def deploy_fleet(home: Path, sha: str) -> None:
+    repo = home / "TIG" / "fleet"
+    stamp = home / ".local" / "share" / "fleet-deployed.sha"
+
+    def g(*args):
+        return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=False)
+
+    root = boxlib.nights_root({"HOME": str(home)})
+    for row in boxlib.read_status(root):
+        if row["id"].startswith("fleet-") and row["status"] == "running":
+            sys.exit(boxlib.refuse(f"{row['id']} is running; deploy fleet after it ends"))
+    r = g("fetch", "-q", "origin")
+    if r.returncode != 0:
+        sys.exit(boxlib.refuse(f"git fetch failed: {r.stderr.strip()[:300]}"))
+    main = g("rev-parse", "origin/main").stdout.strip()
+    if main != sha:
+        sys.exit(boxlib.refuse(f"main is at {main[:12]}, not the approved {sha[:12]}; request a new deploy"))
+    previous = stamp.read_text().strip() if stamp.is_file() else g("rev-parse", "HEAD").stdout.strip()
+
+    def install(at: str) -> tuple[str, subprocess.CompletedProcess]:
+        for args in (("checkout", "-q", "main"), ("reset", "-q", "--hard", at)):
+            r = g(*args)
+            if r.returncode != 0:
+                return f"git {args[0]}", r
+        r = subprocess.run(["uv", "sync", "--locked", "--dev"], cwd=repo, capture_output=True, text=True, check=False)
+        if r.returncode != 0:
+            return "uv sync", r
+        return "make check", subprocess.run(["make", "check"], cwd=repo, capture_output=True, text=True, check=False)
+
+    step, r = install(sha)
+    if r.returncode != 0:
+        why = (r.stdout + r.stderr).strip()[-300:]
+        label = f"make check failed at {sha[:12]}" if step == "make check" else f"{step} failed"
+        _, rb = install(previous)
+        if rb.returncode != 0:
+            rb_why = (rb.stdout + rb.stderr).strip()[-300:]
+            sys.exit(boxlib.refuse(f"{label}; rollback to {previous[:12]} FAILED: {rb_why}"))
+        sys.exit(boxlib.refuse(f"{label}; back on {previous[:12]}: {why}"))
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.write_text(sha)
+    print(json.dumps({"deployed": sha, "target": "fleet"}))
+
+
+if target == "fleet":
+    deploy_fleet(home, sha)
+else:
+    deploy_harness(home, sha)

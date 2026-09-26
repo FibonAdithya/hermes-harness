@@ -19,6 +19,7 @@ from . import box, gpuq
 from .config import BrokerConfig, load_config
 from .grants import GrantStore
 from .ssh import Unreachable, run_ssh
+from .tasks import TaskStore
 
 CONFIG_PATH = Path(
     os.environ.get("HERMES_BROKER_CONFIG", "/home/hermes/.hermes/broker/broker.json")
@@ -70,7 +71,9 @@ def request_access(box: str, minutes: int, reason: str) -> str:
     Returns a 4-digit code. Tell the owner the box, the minutes, the reason, and
     the code. They approve in the approvals chat. This grants nothing by itself.
     """
-    code = _store().create_request(box, minutes, reason, now=time.time())
+    now = time.time()
+    avoid = TaskStore(_config().state_dir / "tasks.json").live_codes(now)
+    code = _store().create_request(box, minutes, reason, now=now, avoid=avoid)
     return (
         f"Requested {box} for {minutes} minutes.\n"
         f"Ask the owner to reply `approve {code}` in the approvals chat "
@@ -144,24 +147,48 @@ def add_repo(name: str) -> str:
     return f"{r['repo']} is at {r['path']}" + (" (already there)" if r.get("already") else "")
 
 
+@mcp.tool()
+def file_task(repo: str, title: str, body: str, area: str, cls: str = "patch") -> str:
+    """File a task for fleet in repo's backlog. No grant needed: it lands in triage and
+    nothing runs until the owner replies to its announcement in the approvals chat.
+
+    area must be one of the repo's areas (its docs/agent/ownership.md); cls is one of
+    patch, spec, investigation, integration. Write the body as the brief an agent
+    will work from: what is wrong, where (file:line), and how to tell it is fixed.
+    """
+    r = box.call(_target("tig-server"), "file_task",
+                 {"repo": repo, "title": title, "body": body, "area": area, "cls": cls}, timeout=120)
+    if "error" in r:
+        return r["error"]
+    return (f"Filed {r['repo']}#{r['number']} in triage: {r['url']}\n"
+            f"The owner is sent it within 5 minutes and replies task, solo or drop.")
+
+
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 @mcp.tool()
-def request_deploy(sha: str) -> str:
-    """Ask the owner to approve deploying one hermes-harness master commit to the box.
+def request_deploy(sha: str, target: str = "harness") -> str:
+    """Ask the owner to approve deploying one commit to the box.
 
-    sha is the full 40-character commit id. The owner approves by typing that
-    commit's prefix in the approvals chat; the approval covers that commit only,
-    for one deploy_harness() call within 10 minutes.
+    target is "harness" (hermes-harness master) or "fleet" (fleet main). sha is the
+    full 40-character commit id. The owner approves by typing that commit's prefix
+    in the approvals chat -- `deploy fleet <prefix>` for a fleet deploy, since a bare
+    `deploy <prefix>` is read as harness and never approves a fleet request. The
+    approval covers that commit and target only, for one deploy_harness() or
+    deploy_fleet() call within 10 minutes.
     """
+    if target not in ("harness", "fleet"):
+        return "target must be harness or fleet"
     sha = sha.strip().lower()
     if not _SHA_RE.fullmatch(sha):
-        return "sha must be the full 40-character commit id of hermes-harness master"
-    _store().create_deploy_request(sha, now=time.time())
+        return "sha must be the full 40-character commit id"
+    _store().create_deploy_request(sha, now=time.time(), target=target)
+    what = "hermes-harness" if target == "harness" else "fleet"
+    reply_as = f"deploy {sha[:12]}" if target == "harness" else f"deploy fleet {sha[:12]}"
     return (
-        f"Requested a deploy of hermes-harness {sha} to tig-server.\n"
-        f"Ask the owner to read that commit and reply `deploy {sha[:12]}` "
+        f"Requested a deploy of {what} {sha} to tig-server.\n"
+        f"Ask the owner to read that commit and reply `{reply_as}` "
         f"in the approvals chat within 2 minutes."
     )
 
@@ -184,15 +211,43 @@ def deploy_harness() -> str:
 
 
 @mcp.tool()
+def deploy_fleet() -> str:
+    """Deploy the owner-approved fleet main commit to the box. Needs request_deploy(sha, "fleet") first.
+
+    Refused while any fleet night runs. The box runs make check on the new commit
+    and stays on the previous one if it fails.
+    """
+    sha = _store().take_deploy_grant(now=time.time(), target="fleet")
+    if sha is None:
+        raise Locked('LOCKED: no approved fleet deploy. Call request_deploy(sha, "fleet") first.')
+    r = box.call(_target("tig-server"), "deploy", {"sha": sha, "target": "fleet"}, timeout=1800)
+    return r.get("error") or f"tig-server: fleet deployed {sha[:12]}."
+
+
+@mcp.tool()
 def night_status() -> str:
-    """Every fleet, talos, and task run on the box: id, status, start time, exit code."""
+    """Every fleet, talos, and task run on the box: id, status, start time, exit code, and what fleet-doctor filed."""
     r = box.call(_target("tig-server"), "status", {}, timeout=30)
     if "error" in r:
         return r["error"]
     rows = r.get("nights", [])
+    doctor_failed = r.get("doctor_unit") == "failed"
+    failed_line = "fleet-doctor: last run FAILED; check `journalctl --user -u fleet-doctor` on the box"
     if not rows:
-        return "no nights recorded"
-    return "\n".join(f"{n['id']}  {n['status']:8} started {n['started']}  exit={n['exit_code']}" for n in rows)
+        return "no nights recorded" + (f"\n{failed_line}" if doctor_failed else "")
+    lines = []
+    for n in rows:
+        line = f"{n['id']}  {n['status']:8} started {n['started']}  exit={n['exit_code']}"
+        doc = n.get("doctor")
+        if doc and (doc.get("filed") or doc.get("commented") or doc.get("skipped")):
+            line += (f"  doctor: filed {doc.get('filed', [])} commented {doc.get('commented', [])}"
+                     f" skipped {doc.get('skipped', 0)}")
+        if doc and doc.get("error"):
+            line += f"  doctor: error {doc['error']}"
+        lines.append(line)
+    if doctor_failed:
+        lines.append(failed_line)
+    return "\n".join(lines)
 
 
 @mcp.tool()

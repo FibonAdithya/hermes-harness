@@ -147,3 +147,77 @@ def test_revoke_all_clears_deploys(store):
     store.revoke(None)
     assert store.take_deploy_grant(now=1002.0) is None
     assert store.approve_deploy(OTHER, now=1002.0) is None
+
+
+def test_request_codes_avoid_live_task_codes(store, monkeypatch):
+    import hermes_broker.grants as grants
+    draws = iter([4321, 1111])
+    monkeypatch.setattr(grants.secrets, "randbelow", lambda n: next(draws))
+    assert store.create_request("tig-server", 30, "r", now=1.0, avoid={"4321"}) == "1111"
+
+
+def test_pending_codes_lists_unexpired_requests(store):
+    code = store.create_request("tig-server", 30, "r", now=1.0)
+    assert store.pending_codes(now=2.0) == {code}
+    assert store.pending_codes(now=1.0 + 121) == set()
+
+
+SHA_F = "f" * 40
+
+
+def test_a_fleet_deploy_grant_is_not_a_harness_grant_and_is_not_spent_by_asking(store):
+    store.create_deploy_request(SHA_F, now=1.0, target="fleet")
+    # amended 2026-09-26 in review: a bare approval (target defaults to harness) must not
+    # grant a fleet request -- this is the exact vulnerability the review round fixed.
+    assert store.approve_deploy(SHA_F[:7], now=2.0) is None
+    assert store.approve_deploy(SHA_F[:7], now=2.0, target="fleet") == SHA_F
+    assert store.deploy_target() == "fleet"
+    assert store.take_deploy_grant(now=3.0) is None            # harness asks: refused, not consumed
+    assert store.take_deploy_grant(now=3.0, target="fleet") == SHA_F
+    assert store.take_deploy_grant(now=3.0, target="fleet") is None
+
+
+def test_unknown_deploy_target_rejected(store):
+    with pytest.raises(ValueError):
+        store.create_deploy_request(SHA_F, now=1.0, target="droplet")
+
+
+def test_approve_deploy_with_wrong_target_keeps_request_pending(store):
+    """Fix round 1, item 1 mutation target: drop the target comparison in approve_deploy."""
+    store.create_deploy_request(SHA_F, now=1000.0, target="fleet")
+    assert store.approve_deploy(SHA_F[:7], now=1001.0, target="harness") is None
+    assert store.approve_deploy(SHA_F[:7], now=1002.0, target="fleet") == SHA_F
+
+
+def test_expired_fleet_grant_is_consumed_and_gone(store):
+    """Fix round 1, item 4b."""
+    store.create_deploy_request(SHA_F, now=1000.0, target="fleet")
+    assert store.approve_deploy(SHA_F[:7], now=1000.0, target="fleet") == SHA_F
+    assert store.take_deploy_grant(now=1000.0 + 601, target="fleet") is None
+    # the grant is gone, not merely read as expired-in-place: a second ask also finds nothing
+    assert store.take_deploy_grant(now=1000.0 + 602, target="fleet") is None
+
+
+def test_a_reply_sent_before_the_request_existed_is_refused_and_the_request_stays(store):
+    """`now` is the reply's message date: a reply older than the request cannot be approving it."""
+    code = store.create_request("tig-gpu", 60, "run eval", now=1000.0)
+    assert store.approve(code, now=999.0) is None
+    assert store.is_active("tig-gpu", now=1000.0) is False
+    assert store.approve(code, now=1001.0) == "tig-gpu"
+
+
+def test_a_legacy_request_without_created_at_uses_expires_at_minus_ttl(store):
+    import json
+    from hermes_broker.grants import REQUEST_TTL_SECONDS
+    store.path.write_text(json.dumps({"pending": {"4321": {"box": "tig-gpu", "minutes": 60, "reason": "r",
+                                                           "expires_at": 1000.0 + REQUEST_TTL_SECONDS}},
+                                      "grants": {}}))
+    assert store.approve("4321", now=999.0) is None
+    assert store.approve("4321", now=1000.0) == "tig-gpu"
+
+
+def test_a_deploy_reply_sent_before_the_request_existed_is_refused_and_the_request_stays(store):
+    sha = "a" * 40
+    store.create_deploy_request(sha, now=1000.0, target="fleet")
+    assert store.approve_deploy(sha[:7], now=999.0, target="fleet") is None
+    assert store.approve_deploy(sha[:7], now=1001.0, target="fleet") == sha

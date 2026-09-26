@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+"""The owner's `drop` reply: close the issue, labelled fleet:dropped. Called only by the approvals listener."""
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import boxlib  # noqa: E402
+import tasklib  # noqa: E402
+
+a = boxlib.read_json_stdin(sys.stdin.buffer) or {}
+home = Path(os.environ.get("HOME", "/home/adi"))
+try:
+    repo = tasklib.repo_dir(home, a.get("repo", ""))
+    number = int(a.get("number", 0))
+    tasklib.close(tasklib.real_gh, tasklib.slug(repo), number)
+except (ValueError, TypeError) as exc:
+    sys.exit(boxlib.refuse(str(exc)))
+print(json.dumps({"repo": repo.name, "number": number, "closed": True}))
