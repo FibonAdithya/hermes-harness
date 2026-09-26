@@ -197,3 +197,94 @@ def test_status_rows_carry_the_doctor_summary(tmp_path):
     (d / "doctor.json").write_text(json.dumps({"filed": [4], "commented": [], "skipped": 1}))
     [row] = boxlib.read_status(tmp_path / "nights")
     assert row["doctor"] == {"filed": [4], "commented": [], "skipped": 1}
+
+
+BIG = "fleet run: run_id=r1 (new run) spent=$0.00 socket=/x\n" + "".join("x" * 500 + "\n" for _ in range(60))
+NIGHT_A = "fleet-20260925-2300-aa11"   # sorts before NIGHT, so it is examined first
+
+
+def test_an_oversized_log_is_filed_with_clipped_evidence_and_does_not_stop_the_next_night(tmp_path):
+    """Catches unclipped evidence: 60 lines of 500 characters exceed tasklib.MAX_BODY,
+    file_issue refuses, and (without the per-night guard) every later night is skipped."""
+    import tasklib
+    fleet_repo(tmp_path)
+    make_night(tmp_path, log=BIG + CRASH.split("\n", 1)[1], runlog=[], night=NIGHT_A)
+    make_night(tmp_path, log=CRASH.replace("LedgerError", "OtherError"), runlog=[])
+    gh = gh_for_fleet()
+    out = doctor.run(tmp_path, gh)
+    assert out["filed"] == [1, 2] and out["errors"] == []
+    assert len(gh.issues[1]["body"]) <= tasklib.MAX_BODY and "x" * 300 + "…" in gh.issues[1]["body"]
+    assert "x" * 301 not in gh.issues[1]["body"]
+    for night in (NIGHT_A, NIGHT):
+        assert (tmp_path / "nights" / night / "doctored").exists()
+
+
+class FailingGh(FakeGh):
+    """A gh whose issue create fails for titles containing `PoisonError`, as a 502 would."""
+
+    def __call__(self, args, stdin=None):
+        if args[:2] == ["issue", "create"] and "PoisonError" in args[args.index("--title") + 1]:
+            self.calls.append((tuple(args), stdin))
+            return 1, "", "HTTP 502: Bad Gateway"
+        return super().__call__(args, stdin)
+
+
+def test_a_gh_failure_leaves_that_night_for_retry_and_goes_on_to_the_next(tmp_path):
+    """Catches marking `doctored` on error (the night is never retried) and a
+    missing per-night guard (night B is never examined)."""
+    fleet_repo(tmp_path)
+    make_night(tmp_path, log=CRASH.replace("LedgerError", "PoisonError"), runlog=[], night=NIGHT_A)
+    make_night(tmp_path, log=CRASH, runlog=[])
+    gh = FailingGh()
+    gh.labels |= {"area:daemon", "area:cost", "area:executor", "class:investigation"}
+    out = doctor.run(tmp_path, gh)
+    assert out["errors"] == [NIGHT_A] and out["filed"] == [1]
+    a = tmp_path / "nights" / NIGHT_A
+    assert not (a / "doctored").exists()
+    assert "502" in json.loads((a / "doctor.json").read_text())["error"]
+    assert (tmp_path / "nights" / NIGHT / "doctored").exists()
+    healed = gh_for_fleet()
+    assert doctor.run(tmp_path, healed)["filed"] == [1] and (a / "doctored").exists()
+
+
+def test_malformed_runlog_entries_are_skipped(tmp_path):
+    rel = [entry("r1", "Release", task=n, reason="no_agent", attempt=1) for n in (1, 2, 3)]
+    d = make_night(tmp_path, status="done", log="fleet run: run_id=r1 (new run)\n",
+                   runlog=[{"run_id": "r1"}, {"run_id": "r1", "intent": "Release"}, [1, 2], "r1", *rel])
+    [f] = doctor.examine({"id": NIGHT, "status": "done"}, d, tmp_path / "TIG" / "fleet-fixture")
+    assert f.key == "Release:no_agent"
+
+
+def test_a_meta_json_that_is_not_an_object_is_treated_as_no_repo(tmp_path):
+    fleet_repo(tmp_path)
+    d = make_night(tmp_path, log=CRASH, runlog=[])
+    (d / "meta.json").write_text("[1, 2]")
+    out = doctor.run(tmp_path, gh_for_fleet())
+    assert out["errors"] == [] and out["filed"] == [1] and (d / "doctored").exists()
+
+
+def test_a_backtick_in_the_key_does_not_break_the_inline_code(tmp_path):
+    fleet_repo(tmp_path)
+    make_night(tmp_path, status="done", log="fleet run: run_id=r1 (new run)\n",
+               runlog=[entry("r1", "Drain", reason="UnpricedModel: `claude-opus-9` has no row")])
+    gh = gh_for_fleet()
+    doctor.run(tmp_path, gh)
+    [key_line] = [x for x in gh.issues[1]["body"].splitlines() if x.startswith("Key: ")]
+    assert key_line == "Key: `UnpricedModel: 'claude-opus-N' has no row`"
+    assert "`" not in gh.issues[1]["title"]
+
+
+def test_s4_reasons_that_differ_only_in_digits_count_together(tmp_path):
+    rel = [entry("r1", "Release", task=n, reason=f"stalled {n}", attempt=1) for n in (12, 13, 14)]
+    d = make_night(tmp_path, status="done", log="fleet run: run_id=r1 (new run)\n", runlog=rel)
+    [f] = doctor.examine({"id": NIGHT, "status": "done"}, d, tmp_path / "TIG" / "fleet-fixture")
+    assert (f.kind, f.key) == ("S4", "Release:stalled N")
+
+
+def test_an_ops_message_on_a_killed_night_is_still_filed(tmp_path):
+    """Intended: an ops fault (a lapsed login) is worth filing even on a night that
+    ended normally at its hour limit."""
+    log = "fleet run: run_id=r1 (new run)\n" + (OPS / "claude-not-logged-in.txt").read_text()
+    d = make_night(tmp_path, status="killed", log=log, runlog=[])
+    [f] = doctor.examine({"id": NIGHT, "status": "killed"}, d, tmp_path / "TIG" / "fleet-fixture")
+    assert (f.kind, f.key, f.ops) == ("ops", "claude-not-logged-in", True)

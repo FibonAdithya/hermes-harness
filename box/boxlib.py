@@ -161,7 +161,7 @@ def read_status(root: Path) -> list[dict]:
         if meta_raw:
             try:
                 started = float(json.loads(meta_raw).get("started_at"))
-            except (ValueError, TypeError, json.JSONDecodeError):
+            except (ValueError, TypeError, AttributeError, json.JSONDecodeError):  # AttributeError: not an object
                 started = None
         if started is None:
             started = d.stat().st_mtime

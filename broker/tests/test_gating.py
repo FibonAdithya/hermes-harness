@@ -206,3 +206,15 @@ def test_night_status_shows_doctor_results_and_a_failed_doctor(monkeypatch):
         "doctor_unit": "failed"})
     out = server.night_status()
     assert "doctor: filed [4]" in out and "fleet-doctor: last run FAILED" in out
+
+
+def test_night_status_shows_a_doctor_error(monkeypatch):
+    from hermes_broker import server
+    monkeypatch.setattr(server, "_target", lambda box: "tig-server")
+    monkeypatch.setattr(server.box, "call", lambda t, v, a, timeout=60: {
+        "nights": [{"id": "fleet-20260926-2300-ab12", "status": "failed", "started": "2026-09-26T23:00:00Z",
+                    "exit_code": 1, "doctor": {"filed": [], "commented": [], "skipped": 0,
+                                               "error": "gh issue create failed: HTTP 502"}}],
+        "doctor_unit": "ok"})
+    out = server.night_status()
+    assert "doctor: error gh issue create failed: HTTP 502" in out and "FAILED" not in out

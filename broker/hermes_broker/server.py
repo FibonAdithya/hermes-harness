@@ -221,6 +221,8 @@ def night_status() -> str:
         if doc and (doc.get("filed") or doc.get("commented") or doc.get("skipped")):
             line += (f"  doctor: filed {doc.get('filed', [])} commented {doc.get('commented', [])}"
                      f" skipped {doc.get('skipped', 0)}")
+        if doc and doc.get("error"):
+            line += f"  doctor: error {doc['error']}"
         lines.append(line)
     if doctor_failed:
         lines.append(failed_line)
