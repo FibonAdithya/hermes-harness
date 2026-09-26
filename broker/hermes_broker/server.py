@@ -147,6 +147,23 @@ def add_repo(name: str) -> str:
     return f"{r['repo']} is at {r['path']}" + (" (already there)" if r.get("already") else "")
 
 
+@mcp.tool()
+def file_task(repo: str, title: str, body: str, area: str, cls: str = "patch") -> str:
+    """File a task for fleet in repo's backlog. No grant needed: it lands in triage and
+    nothing runs until the owner replies to its announcement in the approvals chat.
+
+    area must be one of the repo's areas (its docs/agent/ownership.md); cls is one of
+    patch, spec, investigation, integration. Write the body as the brief an agent
+    will work from: what is wrong, where (file:line), and how to tell it is fixed.
+    """
+    r = box.call(_target("tig-server"), "file_task",
+                 {"repo": repo, "title": title, "body": body, "area": area, "cls": cls}, timeout=120)
+    if "error" in r:
+        return r["error"]
+    return (f"Filed {r['repo']}#{r['number']} in triage: {r['url']}\n"
+            f"The owner is sent it within 5 minutes and replies task, solo or drop.")
+
+
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
