@@ -153,8 +153,14 @@ fleet working as designed.
 
 | # | Signal | Read from | Suggested reply |
 |---|---|---|---|
-| S1 | night `failed` or `killed`, or no `status` file | `status`, `exit_code`, log tail | `solo` |
-| S2 | the daemon never completed a tick: no run-log entry for the night's run id | log tail, `<repo>/.fleet/run.jsonl` | `solo` |
+| S1 | night `failed`, `stale`, or with no readable `status` file, after the daemon had logged intents | `status`, `exit_code`, log tail | `solo` |
+| S2 | a night broken as in S1 whose daemon never started (no `fleet run: run_id=` line) or never logged an intent for its run id; or a night with no log | log tail, `<repo>/.fleet/run.jsonl` | `solo` |
+
+`killed` is not a fault: `fleet run` loops until `RuntimeMaxSec`'s SIGTERM, so
+every fleet night ends `killed`. An empty run log is not a fault on its own
+either: fleet writes one entry per intent, not per tick, so an idle backlog
+leaves it empty. (Amended 2026-09-26 during the plan audit; the first draft
+listed both as faults, which would have filed on every normal night.)
 | S3 | a drain was armed (`drain_reason` non-empty) | run log | `task`, class `investigation` |
 | S4 | ≥3 releases or NEEDS_HUMAN moves with the same reason in one night | run log | `task` |
 

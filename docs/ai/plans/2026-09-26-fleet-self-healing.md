@@ -12,10 +12,10 @@
 
 ## Global Constraints
 
-- Box code is stdlib only. CI runs `cd box && python -m pytest -q` on Python 3.12 with only pytest installed.
+- Box code is stdlib only. CI runs `cd box && python -m pytest -q` on Python 3.12 with only pytest installed. The laptop's system `python3` is 3.10 with no pytest (and no `tomllib`), so every box test command below uses `uv run --no-project --python 3.12 --with pytest`, which is the same interpreter and dependency set as CI (MEASURED 2026-09-26: 78 passed at `f66ad58`).
 - Every file in `box/verbs/` is executable and starts with `#!/usr/bin/env python3`; CI `py_compile`s it.
 - Box verbs read one JSON object on stdin (`boxlib.read_json_stdin`) and print one JSON object; a refusal is `sys.exit(boxlib.refuse(msg))` (exit 2, `{"error": msg}`).
-- Broker tests: `cd broker && uv run --extra dev pytest -q`. Box tests: `cd box && python -m pytest -q`. fleet: `make check` in `~/TIG/fleet`.
+- Broker tests: `cd broker && uv run --extra dev pytest -q`. Box tests: `cd box && uv run --no-project --python 3.12 --with pytest python -m pytest -q`. fleet: `make check` in `~/TIG/fleet`.
 - Hermes (MCP tools) must never be able to reach `approve_task`, `close_task`, or any reply verb. Only the approvals listener calls them.
 - Approval messages are honoured only from the owner's numeric id, not forwarded, exact match — the existing `parse_command` rules.
 - `approve NNNN` stays grant approval. Task codes and grant codes are never live in both stores at once.
@@ -39,7 +39,7 @@
 
 ## Part A — `FibonAdithya/fleet`
 
-Work in `~/TIG/fleet` on branch `feat/areas-from-policy` (Task 1) and `feat/self-policy` (Task 2), each off `origin/main`, each its own PR. fleet's `AGENTS.md` says a label-vocabulary change needs a human; each PR body states that the owner approved it in `hermes-harness/docs/ai/specs/2026-09-26-fleet-self-healing-design.md` §4.
+Work in `~/TIG/fleet` on branch `feat/areas-from-policy` (Task 1, off `origin/main`) and `feat/self-policy` (Task 2), each its own PR. Task 2 needs Task 1's `area_names` and non-fixture areas, so until Task 1's PR is merged, `feat/self-policy` is cut from `feat/areas-from-policy` and its PR to `main` says it is stacked on Task 1's PR; once Task 1 merges, rebase it onto `origin/main`. Neither PR is merged by an agent. fleet's `AGENTS.md` says a label-vocabulary change needs a human; each PR body states that the owner approved it in `hermes-harness/docs/ai/specs/2026-09-26-fleet-self-healing-design.md` §4.
 
 ### Task 1: Areas come from the target repo's `ownership.md`
 
@@ -280,7 +280,7 @@ Then wait for `gh pr checks <n> --watch` to report, and stop for the owner to me
 
 - [ ] **Step 1: Baseline, and check the parent-walk concern**
 
-Run: `cd ~/TIG/fleet && git fetch -q && git switch -c feat/self-policy origin/main && make check 2>&1 | tail -3`
+Run: `cd ~/TIG/fleet && git fetch -q && git switch -c feat/self-policy feat/areas-from-policy && make check 2>&1 | tail -3` (use `origin/main` as the start point instead if Task 1's PR is already merged)
 Expected: green; record the count.
 
 - [ ] **Step 2: Write the failing test**
@@ -357,12 +357,18 @@ max_fix_passes = 1
 model_flag = "--model"
 args = ["--permission-mode", "acceptEdits"]
 
-[prices."claude-opus-5"]
-input = 5.0
-output = 25.0
-cache_read = 0.5
-cache_write = 10.0
+# First-party API rates, USD per million tokens, read from
+# platform.claude.com/docs/en/about-claude/pricing on 2026-09-24.
+# cache_write is the 5-minute rate. Agents bill the subscription, not these
+# rates; fleet still needs them to enforce fleet_usd.
+[prices."claude-sonnet-5"]
+input = 2.0
+output = 10.0
+cache_read = 0.2
+cache_write = 2.5
 ```
+
+The model and prices are the live `fleet-fixture`'s (its PR 15, the configuration proven on the box), not the vendored copy's `claude-opus-5`: fleet-on-fleet runs on the box with the same CLIs, and a role-table model with no `[prices]` row is a `PolicyError` (`policy.py:220`).
 
 `docs/agent/ownership.md`:
 
@@ -433,7 +439,7 @@ owner does, when reading the announcement.
 | `AGENTS.md`, `docs/agent/**`, `.agents/**`, `fleet.toml` | this layer governs the fleet; editing it widens its own authority |
 ```
 
-`docs/agent/task-classes.md`: copy `fixtures/policy/fleet-fixture/docs/agent/task-classes.md` and replace its "Where work may run" section with:
+`docs/agent/task-classes.md`: copy `fixtures/policy/fleet-fixture/docs/agent/task-classes.md`, change every `claude-opus-5` in its Role | Agent | Model table to `claude-sonnet-5` (matching `git -C ~/TIG/fleet-fixture show origin/main:docs/agent/task-classes.md`), and replace its "Where work may run" section with:
 
 ```markdown
 ## Where work may run
@@ -442,7 +448,7 @@ fleet's gate is `make check`: ruff and pytest, CPU only, under a minute. Every
 class may run unattended on `tig-server`.
 ```
 
-Roles and schemas: `mkdir -p .agents && cp -r ~/TIG/fleet-fixture/.agents/roles .agents/ && cp -r fixtures/policy/fleet-fixture/.agents/schemas .agents/` — schemas from the vendored copy (AGENTS.md source of truth #2), roles from the fixture repo (the vendored copy has none). Before copying, run `git -C ~/TIG/fleet-fixture fetch -q && git -C ~/TIG/fleet-fixture status -sb | head -1` and pull if behind. Then `diff -r fixtures/policy/fleet-fixture/.agents/schemas ~/TIG/fleet-fixture/.agents/schemas` and stop to report if they differ.
+Roles and schemas: `mkdir -p .agents && cp -r fixtures/policy/fleet-fixture/.agents/roles fixtures/policy/fleet-fixture/.agents/schemas .agents/` — both from the vendored copy (AGENTS.md source of truth #2; it has all six roles and both schemas). Then compare against the live fixture: `git -C ~/TIG/fleet-fixture fetch -q && for f in $(cd fixtures/policy/fleet-fixture && find .agents -type f); do git -C ~/TIG/fleet-fixture show origin/main:$f | diff -q - fixtures/policy/fleet-fixture/$f >/dev/null || echo "DIFFERS: $f"; done`. Schemas were identical on 2026-09-26 (MEASURED: `diff` of both schema files, rc 0). Any `DIFFERS` line is reported in the task report, not resolved.
 
 `.gitignore`: append `.fleet/`.
 
@@ -740,7 +746,7 @@ def test_fleet_repos_are_discovered_not_listed(tmp_path):
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cd box && python -m pytest tests/test_tasklib.py -q 2>&1 | tail -3`
+Run: `cd box && uv run --no-project --python 3.12 --with pytest python -m pytest tests/test_tasklib.py -q 2>&1 | tail -3`
 Expected: `ModuleNotFoundError: No module named 'tasklib'`.
 
 - [ ] **Step 3: Implement `box/tasklib.py`**
@@ -911,7 +917,7 @@ def comment(gh: Gh, repo_slug: str, number: int, body: str) -> None:
 
 - [ ] **Step 4: Run the library tests**
 
-Run: `cd box && python -m pytest tests/test_tasklib.py -q`
+Run: `cd box && uv run --no-project --python 3.12 --with pytest python -m pytest tests/test_tasklib.py -q`
 Expected: all pass.
 
 - [ ] **Step 5: Write the failing verb tests**
@@ -1023,7 +1029,7 @@ def test_list_triage_reports_a_failing_repo_without_dropping_the_others(tmp_path
 
 - [ ] **Step 6: Run to verify failure**
 
-Run: `cd box && python -m pytest tests/test_task_verbs.py -q 2>&1 | tail -3`
+Run: `cd box && uv run --no-project --python 3.12 --with pytest python -m pytest tests/test_task_verbs.py -q 2>&1 | tail -3`
 Expected: FAIL, the verb files do not exist.
 
 - [ ] **Step 7: Implement the four verbs**
@@ -1137,7 +1143,7 @@ print(json.dumps({"repo": repo.name, "number": number, "closed": True}))
 
 - [ ] **Step 8: Run all box tests**
 
-Run: `cd box && python -m pytest -q 2>&1 | tail -3`
+Run: `cd box && uv run --no-project --python 3.12 --with pytest python -m pytest -q 2>&1 | tail -3`
 Expected: all pass.
 
 - [ ] **Step 9: Mutation-check**
@@ -1891,13 +1897,15 @@ The patterns must match what the tools actually print. On the laptop, capture ea
 
 ```bash
 mkdir -p box/tests/fixtures/ops
-HOME=$(mktemp -d) claude -p hi > box/tests/fixtures/ops/claude-not-logged-in.txt 2>&1
-HOME=$(mktemp -d) codex exec hi > box/tests/fixtures/ops/codex-not-logged-in.txt 2>&1 </dev/null
+env -u ANTHROPIC_API_KEY -u CLAUDE_CODE_OAUTH_TOKEN HOME=$(mktemp -d) claude -p hi > box/tests/fixtures/ops/claude-not-logged-in.txt 2>&1
+env -u OPENAI_API_KEY -u CODEX_API_KEY HOME=$(mktemp -d) codex exec hi > box/tests/fixtures/ops/codex-not-logged-in.txt 2>&1 </dev/null
 GH_CONFIG_DIR=$(mktemp -d) GH_TOKEN= gh api user > box/tests/fixtures/ops/gh-not-logged-in.txt 2>&1
 dd if=/dev/zero of=/dev/full bs=1 count=1 2> box/tests/fixtures/ops/disk-full.txt
 herdr --remote nonexistent-host-for-capture status > box/tests/fixtures/ops/herdr-unreachable.txt 2>&1
 wc -c box/tests/fixtures/ops/*.txt
 ```
+
+The `env -u` strips any API key from the environment: with one set, `claude -p` or `codex exec` would make a real call and capture a reply instead of the not-logged-in message. Read every captured file before committing it and remove anything that is not the tool's own error text (a local path or username is fine; a token is not).
 
 Expected: five non-empty files. If any command is absent on the laptop, run it on the box over `ssh adi@tig-server` instead and copy the output by hand (files are tiny). If a message cannot be captured anywhere, leave that file out and remove its pattern from `OPS_PATTERNS` below: an uncaptured pattern is a guess, and the spec's Review Focus #1 is exactly this. Record in the commit message which were captured where.
 
@@ -1981,6 +1989,26 @@ def test_a_night_with_no_log_and_no_runlog_is_s2_not_a_crash(tmp_path):
     assert f.kind == "S2" and "no-log" in f.key
 
 
+def test_an_idle_night_killed_at_its_hour_limit_is_healthy(tmp_path):
+    """`fleet run` loops until RuntimeMaxSec's SIGTERM, so every fleet night ends
+    `killed`, and an idle backlog writes no run-log entries (the run log records
+    intents, not ticks). Catches treating either as a fault: the doctor would file
+    on every normal night."""
+    d = make_night(tmp_path, status="killed", log="fleet run: run_id=r1 (new run) spent=$0.00 socket=/x\n", runlog=[])
+    assert doctor.examine({"id": NIGHT, "status": "killed"}, d, tmp_path / "TIG" / "fleet-fixture") == []
+
+
+def test_a_night_that_died_before_starting_is_s2(tmp_path):
+    """A broken fleet.toml fails in load_config, before `fleet run:` is printed.
+    Catches keying S2 only on an empty run log: with no run id there is no run log to read."""
+    log = ('Traceback (most recent call last):\n'
+           '  File "/home/adi/TIG/fleet/src/fleet/config.py", line 160, in load_config\n'
+           'fleet.config.ConfigError: slots must be an integer\n')
+    d = make_night(tmp_path, status="failed", log=log, runlog=None)
+    [f] = doctor.examine({"id": NIGHT, "status": "failed"}, d, tmp_path / "TIG" / "fleet-fixture")
+    assert (f.kind, f.key) == ("S2", "no-start|ConfigError|config.py:load_config")
+
+
 def test_a_drain_is_s3_for_the_owner(tmp_path):
     log = [entry("r1", "Drain", reason="UnpricedModel: claude-opus-9 has no [prices] row")]
     d = make_night(tmp_path, status="done", log="fleet run: run_id=r1 (new run)\n", runlog=log)
@@ -2010,6 +2038,13 @@ def test_a_clean_night_has_no_findings(tmp_path):
     d = make_night(tmp_path, status="done", log="fleet run: run_id=r1 (new run)\n",
                    runlog=[entry("r1", "Dispatch", task=1, role="implementer", base="x")])
     assert doctor.examine({"id": NIGHT, "status": "done"}, d, tmp_path / "TIG" / "fleet-fixture") == []
+
+
+def test_every_ops_pattern_has_a_captured_message_and_every_capture_a_pattern():
+    """Catches a pattern written from memory (no capture), and an empty fixtures
+    directory, which would make the parametrized test below collect nothing and pass."""
+    assert sorted(p.stem for p in OPS.glob("*.txt")) == sorted(name for name, _ in doctor.OPS_PATTERNS)
+    assert doctor.OPS_PATTERNS
 
 
 @pytest.mark.parametrize("path", sorted(OPS.glob("*.txt")), ids=lambda p: p.stem)
@@ -2076,7 +2111,7 @@ def test_running_and_non_fleet_nights_are_left_alone(tmp_path, monkeypatch):
 
 - [ ] **Step 3: Run to verify failure**
 
-Run: `cd box && python -m pytest tests/test_doctor.py -q 2>&1 | tail -3`
+Run: `cd box && uv run --no-project --python 3.12 --with pytest python -m pytest tests/test_doctor.py -q 2>&1 | tail -3`
 Expected: `ModuleNotFoundError: No module named 'doctor'`.
 
 - [ ] **Step 4: Implement `box/doctor.py`**
@@ -2106,7 +2141,9 @@ EVIDENCE_LINES = 60
 S4_THRESHOLD = 3
 LOG_TAIL_BYTES = 256 * 1024
 TERMINAL = ("done", "failed", "killed", "skipped", "paused", "stale", "unknown", "unreadable")
-BROKEN = ("failed", "killed", "stale", "unknown", "unreadable")
+# Not `killed`: `fleet run` loops until RuntimeMaxSec's SIGTERM, so that is how
+# every fleet night ends. A daemon that crashes exits non-zero first and reads `failed`.
+BROKEN = ("failed", "stale", "unknown", "unreadable")
 
 # One per captured file in tests/fixtures/ops/, named by its stem. Write each
 # regex from the captured text (plan Task 7 Step 1), never from memory.
@@ -2187,9 +2224,13 @@ def examine(night: dict, night_dir: Path, repo_dir: Path) -> list[Finding]:
     entries = _runlog(repo_dir, ids[-1] if ids else None)
     if lines is None:
         return [Finding("S2", "no-log", "daemon", "solo", False, ())]
-    if not entries:
-        return [Finding("S2", f"no-tick|{_crash_key(lines)}", "daemon", "solo", False, evidence)]
     if night["status"] in BROKEN:
+        # The run log records intents, not ticks, so an empty one on a healthy
+        # night only means an idle backlog. It is evidence only once the night broke.
+        if not ids:
+            return [Finding("S2", f"no-start|{_crash_key(lines)}", "daemon", "solo", False, evidence)]
+        if not entries:
+            return [Finding("S2", f"no-tick|{_crash_key(lines)}", "daemon", "solo", False, evidence)]
         return [Finding("S1", f"{night['status']}|{_crash_key(lines)}", "daemon", "solo", False, evidence)]
     found = []
     drains = sorted({DIGITS.sub("N", e["intent"].get("reason", "")) for e in entries if e["intent"].get("kind") == "Drain"})
@@ -2379,7 +2420,7 @@ def test_night_status_shows_doctor_results_and_a_failed_doctor(monkeypatch):
 
 - [ ] **Step 6: Run both suites**
 
-Run: `cd box && python -m pytest -q 2>&1 | tail -3 && cd ../broker && uv run --extra dev pytest -q 2>&1 | tail -3`
+Run: `cd box && uv run --no-project --python 3.12 --with pytest python -m pytest -q 2>&1 | tail -3 && cd ../broker && uv run --extra dev pytest -q 2>&1 | tail -3`
 Expected: all pass. The existing `test_status_verb_lists_nights` in `box/tests/test_nights.py` may assert the exact row dict or the exact top-level keys; update it to include `"doctor": None` and `"doctor_unit"`, and say so in the commit.
 
 - [ ] **Step 7: Mutation-check**
@@ -2391,6 +2432,10 @@ Expected: all pass. The existing `test_status_verb_lists_nights` in `box/tests/t
 - `signature`: drop `fleet_sha` from the hash → `test_a_new_deployed_sha_files_a_new_issue` and `test_signature_depends_on_the_deployed_sha` fail.
 - `_crash_key`: keep the line number → `test_a_failed_night_that_ticked_is_s1` fails.
 - `examine`: check `entries` before `lines is None` → `test_a_night_with_no_log_and_no_runlog_is_s2_not_a_crash` fails on the key.
+- `BROKEN`: add `killed` back → `test_an_idle_night_killed_at_its_hour_limit_is_healthy` fails.
+- `examine`: move the `not entries` S2 check above the `BROKEN` check → `test_an_idle_night_killed_at_its_hour_limit_is_healthy` fails.
+- `examine`: delete the `not ids` branch → `test_a_night_that_died_before_starting_is_s2` fails on the key (`no-tick|…`).
+- Delete one file from `tests/fixtures/ops/` → `test_every_ops_pattern_has_a_captured_message_and_every_capture_a_pattern` fails.
 
 - [ ] **Step 8: Commit**
 
@@ -2578,7 +2623,7 @@ def test_unknown_target_refused(tmp_path):
 
 - [ ] **Step 3: Run to verify failure**
 
-Run: `cd box && python -m pytest tests/test_deploy_fleet.py tests/test_deploy.py -q 2>&1 | tail -3; cd ../broker && uv run --extra dev pytest tests/test_deploy.py tests/test_grants.py tests/test_approvals.py -q 2>&1 | tail -3`
+Run: `cd box && uv run --no-project --python 3.12 --with pytest python -m pytest tests/test_deploy_fleet.py tests/test_deploy.py -q 2>&1 | tail -3; cd ../broker && uv run --extra dev pytest tests/test_deploy.py tests/test_grants.py tests/test_approvals.py -q 2>&1 | tail -3`
 Expected: new tests fail; existing deploy tests pass.
 
 - [ ] **Step 4: Implement the box verb**
@@ -2733,7 +2778,7 @@ def deploy_fleet() -> str:
 
 - [ ] **Step 6: Run both suites**
 
-Run: `cd box && python -m pytest -q 2>&1 | tail -3 && cd ../broker && uv run --extra dev pytest -q 2>&1 | tail -3`
+Run: `cd box && uv run --no-project --python 3.12 --with pytest python -m pytest -q 2>&1 | tail -3 && cd ../broker && uv run --extra dev pytest -q 2>&1 | tail -3`
 Expected: all pass, including every pre-existing deploy test unchanged.
 
 - [ ] **Step 7: Mutation-check**
@@ -2785,7 +2830,7 @@ Add to `runbooks/dispatch.md`:
 
 - [ ] **Step 2: Whole-branch review and PR**
 
-Run: `cd box && python -m pytest -q && cd ../broker && uv run --extra dev pytest -q`, then push `feat/fleet-self-healing` and open a PR to `master`. Probe the transport first per the owner's standing instructions (`timeout 10 ssh -o BatchMode=yes -o ConnectTimeout=8 -T git@github.com`). Wait for CI with `gh pr checks <n> --watch`; the owner merges.
+Run: `cd box && uv run --no-project --python 3.12 --with pytest python -m pytest -q && cd ../broker && uv run --extra dev pytest -q`, then push `feat/fleet-self-healing` and open a PR to `master`. Probe the transport first per the owner's standing instructions (`timeout 10 ssh -o BatchMode=yes -o ConnectTimeout=8 -T git@github.com`). Wait for CI with `gh pr checks <n> --watch`; the owner merges.
 
 - [ ] **Step 3: Deploy the box** (after merge)
 
