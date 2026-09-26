@@ -135,12 +135,15 @@ ssh tig-adi 'systemctl --user stop night-<id>.service'                         #
 
 ## fleet tasks and the doctor
 
-- Hermes files with `file_task(repo, title, body, area, cls)`. The doctor files hourly on its own.
+- Hermes files with `file_task(repo, title, body, area, cls)`; the body is at most 3500 characters.
+  The doctor files on its own, hourly at :30.
 - Every triage issue is sent to the approvals chat within 5 minutes with a 4-digit code.
   - `task NNNN` — fleet runs it (next night, or `run_fleet(repo)`).
   - `solo NNNN` — `run_task` fixes it in a container and opens a PR. Use it when fleet itself is broken.
   - `drop NNNN` — close it.
-  - `[doctor] ops ...` issues offer only `drop`: log in on the box, then drop. The reply is not enforced, so do not answer an ops issue with `task`.
+  - `[doctor] ops ...` issues offer only `drop`: log in on the box, then drop. `task`/`solo` on one is refused.
+  - An issue longer than the announcement shows (body over 3500 or title over 200 characters, e.g. filed by hand
+    or by `fleet discover`) also offers only `drop`. To run it, shorten it on GitHub; the next announcement is approvable.
 - A refused `task`/`solo` means the issue changed after it was sent; a new code follows. A failed send is retried on the next announcer run.
 - Before `task` on a `fleet` issue, check it touches no path in fleet's
   `docs/agent/ownership.md` "Non-dispatchable" table. fleet does not enforce that table.
@@ -151,3 +154,12 @@ ssh tig-adi 'systemctl --user stop night-<id>.service'                         #
 - Doctor state: `night_status()` shows per-night `doctor:` results, a per-night `doctor: error`, and a failed doctor unit.
 - The doctor treats `killed` as a normal end (every fleet night ends at its hour limit) and an idle night as healthy.
   It files S1/S2 only for `failed`, `stale`, `unknown` or `unreadable` nights.
+
+### One-time setup
+
+- Enable the doctor: `systemctl --user enable --now fleet-doctor.timer`.
+- Seed fleet's labels on `FibonAdithya/fleet` from its policy (plan Task 2 Step 10 in
+  `docs/ai/plans/2026-09-26-fleet-self-healing.md`).
+- Add `FibonAdithya/fleet` to broker.json `repos`, so `solo` can run on fleet issues.
+- Do not deploy fleet near 23:00 UTC. `deploy_fleet` refuses only while a night is running;
+  nothing locks against a night that is starting.
