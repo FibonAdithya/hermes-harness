@@ -1,8 +1,10 @@
 import time
+from types import SimpleNamespace
 
 import pytest
 from hermes_broker.grants import GrantStore
 from hermes_broker.server import Locked, require_grant
+from hermes_broker.tasks import TaskStore
 
 
 @pytest.fixture
@@ -171,3 +173,25 @@ def test_run_talos_forwards_agentic_mode(store, monkeypatch):
     out = server.run_talos("knapsack", "d", 3, "c3", mode="agentic")
     assert sent[0][1]["mode"] == "agentic"
     assert "agentic" in out
+
+
+def test_request_access_avoids_live_task_codes(store, tmp_path, monkeypatch):
+    """A code already live in TaskStore (shown to the owner as a task code) must
+    never be handed out for a grant request: the two code spaces must not collide."""
+    from hermes_broker import server
+    import hermes_broker.grants as grants
+
+    now = time.time()
+    task_code = TaskStore(tmp_path / "tasks.json").announce(
+        "fleet", "FibonAdithya/fleet", 1, "a" * 64, now=now, avoid=set()
+    )
+
+    monkeypatch.setattr(server, "_config", lambda: SimpleNamespace(state_dir=tmp_path))
+    monkeypatch.setattr(server, "_store", lambda: store)
+
+    draws = iter([int(task_code), 1111])
+    monkeypatch.setattr(grants.secrets, "randbelow", lambda n: next(draws))
+
+    out = server.request_access("tig-server", 30, "r")
+    assert "approve 1111" in out
+    assert task_code not in out
