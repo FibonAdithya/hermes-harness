@@ -94,6 +94,9 @@ SOLO_MINUTES = 60
 Call = Callable[..., dict]
 
 
+_TAIL_SEPARATOR = "—— reply below ——"
+
+
 def format_announcement(issue: dict, code: str) -> str:
     source = next((x.split(":", 1)[1] for x in issue.get("labels", []) if x.startswith("source:")), "manual")
     head = f"{issue['repo']}#{issue['number']} [{source}] {issue['title'][:200]}"
@@ -103,7 +106,9 @@ def format_announcement(issue: dict, code: str) -> str:
         tail = f"code {code} — needs you on the box, not an agent.\ndrop {code}"
     else:
         tail = f"code {code}\ntask {code} | solo {code} | drop {code}"
-    return f"{head}\n\n{shown}\n\n{tail}"
+    # A fixed marker precedes the tail so an issue body cannot pass itself off as the
+    # reply instructions (e.g. a body containing the literal text "drop 9999").
+    return f"{head}\n\n{shown}\n\n{_TAIL_SEPARATOR}\n{tail}"
 
 
 def _solo_prompt(slug: str, number: int, title: str, body: str) -> str:
@@ -129,18 +134,24 @@ def handle_task(tasks: TaskStore, verb: str, code: str, now: float, call: Call, 
         return f"{ref}: {r['error']}"
     if mode == "fleet":
         return f"{ref} is ready for fleet. It runs on the next fleet night, or run_fleet('{entry['repo']}')."
-    t = call("run_task", {"repo": entry["slug"], "prompt": _solo_prompt(entry["slug"], entry["number"], r["title"], r["body"]),
+    title, body = r.get("title"), r.get("body")
+    if title is None or body is None:
+        return f"{ref}: box returned no title/body for approve_task"
+    t = call("run_task", {"repo": entry["slug"], "prompt": _solo_prompt(entry["slug"], entry["number"], title, body),
                           "minutes": SOLO_MINUTES}, 60)
     if "error" in t:
         return f"{ref} moved to fleet:human, but run_task failed: {t['error']}"
-    return f"{ref}: run_task {t['id']} started; it opens a PR that closes #{entry['number']}."
+    task_id = t.get("id")
+    if task_id is None:
+        return f"{ref}: box returned no id for run_task"
+    return f"{ref}: run_task {task_id} started; it opens a PR that closes #{entry['number']}."
 
 
 class Announcer:
     """Posts each fleet:triage issue once, with a code. Lives in the listener
     because getUpdates is single-consumer and this bot is the owner's only channel."""
 
-    def __init__(self, tasks: TaskStore, grants: GrantStore, call: Call, send: Callable[[str], None]) -> None:
+    def __init__(self, tasks: TaskStore, grants: GrantStore, call: Call, send: Callable[[str], bool]) -> None:
         self.tasks, self.grants, self.call, self.send = tasks, grants, call, send
         self.box_down = False
 
@@ -161,19 +172,69 @@ class Announcer:
         for issue in issues:
             code = self.tasks.announce(issue["repo"], issue["slug"], issue["number"], issue["hash"], now,
                                        avoid=self.grants.pending_codes(now))
-            if code:
-                self.send(format_announcement(issue, code))
+            if code and not self.send(format_announcement(issue, code)):
+                # The send failed: give the code back so the next tick re-announces
+                # instead of the issue silently sitting unannounced for 7 days.
+                self.tasks.take(code, now)
 
 
-def _send(client: httpx.Client, token: str, chat_id: int, text: str) -> None:
+def _send(client: httpx.Client, token: str, chat_id: int, text: str) -> bool:
+    """True only once Telegram has actually accepted the message."""
     try:
-        client.post(
+        response = client.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={"chat_id": chat_id, "text": text},
             timeout=15,
         )
     except httpx.HTTPError:
         logger.exception("failed to send approval reply")
+        return False
+    if response.status_code // 100 != 2:
+        logger.warning("sendMessage failed: HTTP %s: %s", response.status_code, response.text[:300])
+        return False
+    try:
+        ok = bool(response.json().get("ok"))
+    except ValueError:
+        logger.warning("sendMessage returned a non-JSON body")
+        return False
+    if not ok:
+        logger.warning("sendMessage returned ok=false")
+    return ok
+
+
+def _dispatch(
+    update: dict,
+    owner_id: int,
+    store: GrantStore,
+    tasks: TaskStore | None,
+    call: Call | None,
+    repos: tuple[str, ...],
+    now_fn: Callable[[], float],
+) -> str | None:
+    """Route one parsed update to its handler; None means nothing to send.
+
+    Grant and deploy replies are judged by when the owner sent them (the message's
+    `date`), not by when this loop gets around to processing it: the announcer tick
+    can hold the loop for up to 120s (list_triage's own timeout), and
+    REQUEST_TTL_SECONDS is also 120s, so processing-time expiry would spuriously
+    reject a reply the owner sent in time. Task replies use 7-day codes, so
+    processing time is fine there, and a broken handler must not take the listener
+    down with it.
+    """
+    parsed = parse_command(update, owner_id)
+    if parsed is None:
+        return None
+    verb, arg = parsed
+    if verb in TASK_VERBS:
+        if tasks is None or call is None:
+            return None
+        try:
+            return handle_task(tasks, verb, arg, now_fn(), call, repos)
+        except Exception as exc:
+            logger.exception("handle_task failed")
+            return f"task reply failed: {exc}"
+    sent_at = float((update.get("message") or {}).get("date") or now_fn())
+    return handle(store, verb, arg, sent_at)
 
 
 def run_listener(
@@ -207,17 +268,9 @@ def run_listener(
 
             for update in updates:
                 offset = max(offset, update.get("update_id", 0) + 1)
-                parsed = parse_command(update, owner_id)
-                if parsed is None:
-                    continue
-                verb, arg = parsed
-                if verb in TASK_VERBS:
-                    if tasks is None or call is None:
-                        continue
-                    reply = handle_task(tasks, verb, arg, time.time(), call, repos)
-                else:
-                    reply = handle(store, verb, arg, time.time())
-                _send(client, token, owner_id, reply)
+                reply = _dispatch(update, owner_id, store, tasks, call, repos, time.time)
+                if reply is not None:
+                    _send(client, token, owner_id, reply)
             now = time.time()
             if announcer is not None and now - last_announce >= ANNOUNCE_EVERY:
                 last_announce = now

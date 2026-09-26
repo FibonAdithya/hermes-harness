@@ -118,3 +118,52 @@ def test_task_reply_forwarded_or_from_someone_else_ignored():
     update = msg("task 7310")
     update["message"]["from"]["id"] = 999
     assert parse_command(update, OWNER) is None
+
+
+def test_grant_approval_is_judged_by_when_the_owner_sent_it_not_processing_time(tmp_path):
+    """REQUEST_TTL_SECONDS is 120s, same as the announcer's list_triage timeout: a
+    tick that hangs must not make a timely reply look late."""
+    from hermes_broker.approvals import _dispatch
+    from hermes_broker.grants import GrantStore
+    store = GrantStore(tmp_path / "grants.json")
+    code = store.create_request("tig-server", 30, "fix parser", now=1000.0)
+    update = msg(f"approve {code}", date=1060)
+    # Processing happens at 1200 -- 200s after the request was made, well past its
+    # 120s TTL -- but the owner's message was sent at 1060, only 60s in.
+    out = _dispatch(update, OWNER, store, None, None, (), now_fn=lambda: 1200.0)
+    assert out == "Granted tig-server for 30 min.\nFor: fix parser"
+
+
+def test_task_reply_exception_is_caught_and_reported(tmp_path, monkeypatch):
+    """A broken handle_task (box returns something unexpected) must not kill the loop."""
+    import hermes_broker.approvals as a
+    from hermes_broker.grants import GrantStore
+    from hermes_broker.tasks import TaskStore
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(a, "handle_task", boom)
+    store = GrantStore(tmp_path / "grants.json")
+    tasks = TaskStore(tmp_path / "tasks.json")
+    update = msg("task 7310")
+    out = a._dispatch(update, OWNER, store, tasks, lambda *args, **kwargs: {}, (), now_fn=lambda: 2.0)
+    assert out == "task reply failed: boom"
+
+
+def test_dispatch_routes_task_verbs_to_handle_task_and_others_to_handle(tmp_path, monkeypatch):
+    import hermes_broker.approvals as a
+    from hermes_broker.grants import GrantStore
+    from hermes_broker.tasks import TaskStore
+
+    calls = []
+    monkeypatch.setattr(a, "handle_task", lambda *args, **kwargs: calls.append("handle_task") or "ok-task")
+    monkeypatch.setattr(a, "handle", lambda *args, **kwargs: calls.append("handle") or "ok-approve")
+    store = GrantStore(tmp_path / "grants.json")
+    tasks = TaskStore(tmp_path / "tasks.json")
+
+    out_task = a._dispatch(msg("task 1234"), OWNER, store, tasks, lambda *args, **kwargs: {}, (), now_fn=lambda: 1.0)
+    out_approve = a._dispatch(msg("approve 1234"), OWNER, store, tasks, lambda *args, **kwargs: {}, (), now_fn=lambda: 1.0)
+
+    assert calls == ["handle_task", "handle"]
+    assert out_task == "ok-task" and out_approve == "ok-approve"
