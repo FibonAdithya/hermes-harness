@@ -72,11 +72,16 @@ def slug(repo: Path) -> str:
 
 
 def fleet_areas(repo: Path, home: Path) -> frozenset[str]:
-    """The target's areas, read by fleet's own parser (fleet.policy.area_names)."""
+    """The target's areas, read by fleet's own parser (fleet.policy.area_names).
+
+    --no-sync: file_task reaches this from Hermes, and must not sync (rewrite) the
+    deployed fleet checkout's environment; deploy_fleet owns that. -P: cwd is the
+    target repo, which must not shadow fleet's imports."""
     code = ("import json; from fleet.config import load_config; from fleet.policy import area_names; "
             "print(json.dumps(sorted(area_names(load_config()))))")
     try:
-        p = subprocess.run(["uv", "run", "--project", str(Path(home) / "TIG" / "fleet"), "python", "-c", code],
+        p = subprocess.run(["uv", "run", "--no-sync", "--project", str(Path(home) / "TIG" / "fleet"),
+                            "python", "-P", "-c", code],
                            cwd=repo, capture_output=True, text=True, check=False)
     except OSError as exc:
         raise TaskError(f"cannot run uv: {exc}") from exc

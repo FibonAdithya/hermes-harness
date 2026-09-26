@@ -359,3 +359,12 @@ def test_a_young_failed_night_is_examined_at_once(tmp_path):
 def test_doctor_timer_is_off_the_hour():
     timer = (Path(__file__).parent.parent / "units" / "fleet-doctor.timer").read_text()
     assert "OnCalendar=*:30" in timer and "hourly" not in timer.replace("fleet-doctor hourly", "")
+
+
+@pytest.mark.parametrize("raw", ["[1, 2]", "\"filed\"", "3"])
+def test_a_doctor_json_that_is_not_an_object_reads_as_no_doctor(tmp_path, raw):
+    import boxlib
+    d = make_night(tmp_path, status="done", log="")
+    (d / "doctor.json").write_text(raw)
+    [row] = boxlib.read_status(tmp_path / "nights")
+    assert row["doctor"] is None

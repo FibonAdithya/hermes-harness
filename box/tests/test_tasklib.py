@@ -148,3 +148,25 @@ def test_file_issue_accepts_a_body_at_the_announcement_limit():
     assert tasklib.MAX_BODY == 3500
     out = tasklib.file_issue(FakeGh(), SLUG, "t", "x" * 3500, "docs", "patch", frozenset({"docs"}), "source:hermes")
     assert out["number"] == 1
+
+
+def test_fleet_areas_runs_fleet_without_syncing_and_without_the_target_on_sys_path(tmp_path, monkeypatch):
+    """file_task is Hermes-reachable: it must not `uv sync` the deployed fleet checkout,
+    and the target repo (the cwd) must not shadow fleet's imports."""
+    import json
+    import os
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    log = tmp_path / "uv.json"
+    (bin_ / "uv").write_text("#!/usr/bin/env python3\nimport json, os, sys\n"
+                             f"json.dump({{'argv': sys.argv[1:], 'cwd': os.getcwd()}}, open({str(log)!r}, 'w'))\n"
+                             "print('[\"daemon\", \"docs\"]')\n")
+    (bin_ / "uv").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_}:{os.environ['PATH']}")
+    target = tmp_path / "home" / "TIG" / "fleet-fixture"
+    target.mkdir(parents=True)
+    assert tasklib.fleet_areas(target, tmp_path / "home") == frozenset({"daemon", "docs"})
+    rec = json.loads(log.read_text())
+    assert rec["argv"][:5] == ["run", "--no-sync", "--project", str(tmp_path / "home" / "TIG" / "fleet"), "python"]
+    assert rec["argv"][5:7] == ["-P", "-c"] and "area_names" in rec["argv"][7]
+    assert rec["cwd"] == str(target)

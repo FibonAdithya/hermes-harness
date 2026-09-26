@@ -175,6 +175,8 @@ def read_status(root: Path) -> list[dict]:
             doctor_summary = json.loads(doc_raw) if doc_raw else None
         except json.JSONDecodeError:
             doctor_summary = None
+        if not isinstance(doctor_summary, dict):  # valid JSON, but not the summary object
+            doctor_summary = None
         rows.append({
             "id": d.name,
             "status": status,
