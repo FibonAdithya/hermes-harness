@@ -147,3 +147,16 @@ def test_revoke_all_clears_deploys(store):
     store.revoke(None)
     assert store.take_deploy_grant(now=1002.0) is None
     assert store.approve_deploy(OTHER, now=1002.0) is None
+
+
+def test_request_codes_avoid_live_task_codes(store, monkeypatch):
+    import hermes_broker.grants as grants
+    draws = iter([4321, 1111])
+    monkeypatch.setattr(grants.secrets, "randbelow", lambda n: next(draws))
+    assert store.create_request("tig-server", 30, "r", now=1.0, avoid={"4321"}) == "1111"
+
+
+def test_pending_codes_lists_unexpired_requests(store):
+    code = store.create_request("tig-server", 30, "r", now=1.0)
+    assert store.pending_codes(now=2.0) == {code}
+    assert store.pending_codes(now=1.0 + 121) == set()

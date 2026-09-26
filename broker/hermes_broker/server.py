@@ -19,6 +19,7 @@ from . import box, gpuq
 from .config import BrokerConfig, load_config
 from .grants import GrantStore
 from .ssh import Unreachable, run_ssh
+from .tasks import TaskStore
 
 CONFIG_PATH = Path(
     os.environ.get("HERMES_BROKER_CONFIG", "/home/hermes/.hermes/broker/broker.json")
@@ -70,7 +71,9 @@ def request_access(box: str, minutes: int, reason: str) -> str:
     Returns a 4-digit code. Tell the owner the box, the minutes, the reason, and
     the code. They approve in the approvals chat. This grants nothing by itself.
     """
-    code = _store().create_request(box, minutes, reason, now=time.time())
+    now = time.time()
+    avoid = TaskStore(_config().state_dir / "tasks.json").live_codes(now)
+    code = _store().create_request(box, minutes, reason, now=now, avoid=avoid)
     return (
         f"Requested {box} for {minutes} minutes.\n"
         f"Ask the owner to reply `approve {code}` in the approvals chat "

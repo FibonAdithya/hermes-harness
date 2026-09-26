@@ -53,7 +53,8 @@ class GrantStore:
 
     # ---- requests ----------------------------------------------------
 
-    def create_request(self, box: str, minutes: int, reason: str, now: float) -> str:
+    def create_request(self, box: str, minutes: int, reason: str, now: float,
+                        avoid: set[str] | frozenset[str] = frozenset()) -> str:
         if box not in BOXES:
             raise ValueError(f"unknown box: {box}")
         if not 1 <= int(minutes) <= MAX_GRANT_MINUTES:
@@ -65,7 +66,10 @@ class GrantStore:
             for code, req in data["pending"].items()
             if req["box"] != box and req["expires_at"] > now
         }
-        code = f"{secrets.randbelow(10000):04d}"
+        while True:
+            code = f"{secrets.randbelow(10000):04d}"
+            if code not in data["pending"] and code not in avoid:
+                break
         data["pending"][code] = {
             "box": box,
             "minutes": int(minutes),
@@ -78,6 +82,9 @@ class GrantStore:
     def pending_reason(self, code: str) -> str | None:
         req = self._read()["pending"].get(code)
         return req["reason"] if req else None
+
+    def pending_codes(self, now: float) -> set[str]:
+        return {c for c, r in self._read()["pending"].items() if r["expires_at"] > now}
 
     def approve(self, code: str, now: float) -> str | None:
         data = self._read()
