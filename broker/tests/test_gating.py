@@ -195,3 +195,14 @@ def test_request_access_avoids_live_task_codes(store, tmp_path, monkeypatch):
     out = server.request_access("tig-server", 30, "r")
     assert "approve 1111" in out
     assert task_code not in out
+
+
+def test_night_status_shows_doctor_results_and_a_failed_doctor(monkeypatch):
+    from hermes_broker import server
+    monkeypatch.setattr(server, "_target", lambda box: "tig-server")
+    monkeypatch.setattr(server.box, "call", lambda t, v, a, timeout=60: {
+        "nights": [{"id": "fleet-20260926-2300-ab12", "status": "failed", "started": "2026-09-26T23:00:00Z",
+                    "exit_code": 1, "doctor": {"filed": [4], "commented": [], "skipped": 0}}],
+        "doctor_unit": "failed"})
+    out = server.night_status()
+    assert "doctor: filed [4]" in out and "fleet-doctor: last run FAILED" in out

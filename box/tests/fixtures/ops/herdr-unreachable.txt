@@ -1,0 +1,1 @@
+error: remote platform detection failed: ssh: Could not resolve hostname nonexistent-host-for-capture: Name or service not known

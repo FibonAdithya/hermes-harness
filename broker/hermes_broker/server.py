@@ -205,14 +205,26 @@ def deploy_harness() -> str:
 
 @mcp.tool()
 def night_status() -> str:
-    """Every fleet, talos, and task run on the box: id, status, start time, exit code."""
+    """Every fleet, talos, and task run on the box: id, status, start time, exit code, and what fleet-doctor filed."""
     r = box.call(_target("tig-server"), "status", {}, timeout=30)
     if "error" in r:
         return r["error"]
     rows = r.get("nights", [])
+    doctor_failed = r.get("doctor_unit") == "failed"
+    failed_line = "fleet-doctor: last run FAILED; check `journalctl --user -u fleet-doctor` on the box"
     if not rows:
-        return "no nights recorded"
-    return "\n".join(f"{n['id']}  {n['status']:8} started {n['started']}  exit={n['exit_code']}" for n in rows)
+        return "no nights recorded" + (f"\n{failed_line}" if doctor_failed else "")
+    lines = []
+    for n in rows:
+        line = f"{n['id']}  {n['status']:8} started {n['started']}  exit={n['exit_code']}"
+        doc = n.get("doctor")
+        if doc and (doc.get("filed") or doc.get("commented") or doc.get("skipped")):
+            line += (f"  doctor: filed {doc.get('filed', [])} commented {doc.get('commented', [])}"
+                     f" skipped {doc.get('skipped', 0)}")
+        lines.append(line)
+    if doctor_failed:
+        lines.append(failed_line)
+    return "\n".join(lines)
 
 
 @mcp.tool()

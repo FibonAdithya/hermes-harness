@@ -170,11 +170,17 @@ def read_status(root: Path) -> list[dict]:
             exit_code = int(exit_raw.strip()) if exit_raw else None
         except ValueError:
             exit_code = None
+        doc_raw = read_small(d / "doctor.json")
+        try:
+            doctor_summary = json.loads(doc_raw) if doc_raw else None
+        except json.JSONDecodeError:
+            doctor_summary = None
         rows.append({
             "id": d.name,
             "status": status,
             "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
             "exit_code": exit_code,
+            "doctor": doctor_summary,
         })
     return rows
 
