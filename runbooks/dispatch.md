@@ -132,3 +132,22 @@ ssh tig-adi 'systemctl --user stop night-<id>.service'                         #
   "talos-c3 is not set up". Top up credit with `c3 topup`; each run is capped
   by its `compute_usd` (default $5, at most $90).
 - **Rotating the executor's GitHub token.** `ssh -t tig-server 'nano /etc/hermes-exec/github-token'`.
+
+## fleet tasks and the doctor
+
+- Hermes files with `file_task(repo, title, body, area, cls)`. The doctor files hourly on its own.
+- Every triage issue is sent to the approvals chat within 5 minutes with a 4-digit code.
+  - `task NNNN` — fleet runs it (next night, or `run_fleet(repo)`).
+  - `solo NNNN` — `run_task` fixes it in a container and opens a PR. Use it when fleet itself is broken.
+  - `drop NNNN` — close it.
+  - `[doctor] ops ...` issues offer only `drop`: log in on the box, then drop. The reply is not enforced, so do not answer an ops issue with `task`.
+- A refused `task`/`solo` means the issue changed after it was sent; a new code follows. A failed send is retried on the next announcer run.
+- Before `task` on a `fleet` issue, check it touches no path in fleet's
+  `docs/agent/ownership.md` "Non-dispatchable" table. fleet does not enforce that table.
+- fleet deploys: merge `integration` → `main`, then Hermes calls `request_deploy(sha, "fleet")`,
+  you reply `deploy fleet <prefix>` (a bare `deploy <prefix>` approves only a hermes-harness deploy),
+  Hermes calls `deploy_fleet()`. Refused while a fleet night runs; a red `make check` rolls back and says whether the rollback worked.
+- Rollback: revert on `main`, deploy that commit.
+- Doctor state: `night_status()` shows per-night `doctor:` results, a per-night `doctor: error`, and a failed doctor unit.
+- The doctor treats `killed` as a normal end (every fleet night ends at its hour limit) and an idle night as healthy.
+  It files S1/S2 only for `failed`, `stale`, `unknown` or `unreadable` nights.
