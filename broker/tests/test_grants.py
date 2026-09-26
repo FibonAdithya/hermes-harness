@@ -196,3 +196,28 @@ def test_expired_fleet_grant_is_consumed_and_gone(store):
     assert store.take_deploy_grant(now=1000.0 + 601, target="fleet") is None
     # the grant is gone, not merely read as expired-in-place: a second ask also finds nothing
     assert store.take_deploy_grant(now=1000.0 + 602, target="fleet") is None
+
+
+def test_a_reply_sent_before_the_request_existed_is_refused_and_the_request_stays(store):
+    """`now` is the reply's message date: a reply older than the request cannot be approving it."""
+    code = store.create_request("tig-gpu", 60, "run eval", now=1000.0)
+    assert store.approve(code, now=999.0) is None
+    assert store.is_active("tig-gpu", now=1000.0) is False
+    assert store.approve(code, now=1001.0) == "tig-gpu"
+
+
+def test_a_legacy_request_without_created_at_uses_expires_at_minus_ttl(store):
+    import json
+    from hermes_broker.grants import REQUEST_TTL_SECONDS
+    store.path.write_text(json.dumps({"pending": {"4321": {"box": "tig-gpu", "minutes": 60, "reason": "r",
+                                                           "expires_at": 1000.0 + REQUEST_TTL_SECONDS}},
+                                      "grants": {}}))
+    assert store.approve("4321", now=999.0) is None
+    assert store.approve("4321", now=1000.0) == "tig-gpu"
+
+
+def test_a_deploy_reply_sent_before_the_request_existed_is_refused_and_the_request_stays(store):
+    sha = "a" * 40
+    store.create_deploy_request(sha, now=1000.0, target="fleet")
+    assert store.approve_deploy(sha[:7], now=999.0, target="fleet") is None
+    assert store.approve_deploy(sha[:7], now=1001.0, target="fleet") == sha

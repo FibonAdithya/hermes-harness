@@ -122,10 +122,13 @@ def is_drop_only(issue: dict) -> bool:
 
 def format_announcement(issue: dict, code: str) -> str:
     source = next((x.split(":", 1)[1] for x in issue.get("labels", []) if x.startswith("source:")), "manual")
-    head = f"{issue['repo']}#{issue['number']} [{source}] {issue['title'][:TITLE_CHARS]}"
+    title = issue["title"][:TITLE_CHARS].replace(_TAIL_SEPARATOR, "")
+    head = f"{issue['repo']}#{issue['number']} [{source}] {title}"
     body = issue.get("body", "")
     trimmed = len(body) > BODY_CHARS or len(issue["title"]) > TITLE_CHARS
-    shown = body[:BODY_CHARS] + ("\n[… trimmed]" if len(body) > BODY_CHARS else "")
+    # The separator appears exactly once, in front of the real tail, so an issue
+    # cannot put a fake separator and fake reply lines above it.
+    shown = body[:BODY_CHARS].replace(_TAIL_SEPARATOR, "") + ("\n[… trimmed]" if len(body) > BODY_CHARS else "")
     if "ops" in issue.get("labels", []):
         tail = f"code {code} — needs you on the box, not an agent.\ndrop {code}"
     elif trimmed:

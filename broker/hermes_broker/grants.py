@@ -24,6 +24,13 @@ MIN_SHA_PREFIX = 7
 DEPLOY_TARGETS = ("harness", "fleet")
 
 
+def _created_at(req: dict[str, Any]) -> float:
+    """When the request was made; requests written before created_at was stored
+    fall back to expires_at - REQUEST_TTL_SECONDS."""
+    created = req.get("created_at")
+    return float(created) if isinstance(created, (int, float)) else req["expires_at"] - REQUEST_TTL_SECONDS
+
+
 class GrantStore:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
@@ -75,6 +82,7 @@ class GrantStore:
             "box": box,
             "minutes": int(minutes),
             "reason": reason,
+            "created_at": now,
             "expires_at": now + REQUEST_TTL_SECONDS,
         }
         self._write(data)
@@ -88,7 +96,13 @@ class GrantStore:
         return {c for c, r in self._read()["pending"].items() if r["expires_at"] > now}
 
     def approve(self, code: str, now: float) -> str | None:
+        """`now` is when the owner sent the reply (the message date). A reply sent
+        before the request existed cannot be approving it, whatever its digits:
+        refuse it and leave the request pending for the real reply."""
         data = self._read()
+        req = data["pending"].get(code)
+        if req is not None and now < _created_at(req):
+            return None
         req = data["pending"].pop(code, None)
         if req is None:
             self._write(data)
@@ -106,7 +120,8 @@ class GrantStore:
         if target not in DEPLOY_TARGETS:
             raise ValueError(f"unknown deploy target: {target}")
         data = self._read()
-        data["pending_deploy"] = {"sha": sha, "target": target, "expires_at": now + REQUEST_TTL_SECONDS}
+        data["pending_deploy"] = {"sha": sha, "target": target, "created_at": now,
+                                  "expires_at": now + REQUEST_TTL_SECONDS}
         self._write(data)
 
     def approve_deploy(self, prefix: str, now: float, target: str = "harness") -> str | None:
@@ -120,6 +135,8 @@ class GrantStore:
         if req["expires_at"] <= now:
             data.pop("pending_deploy")
             self._write(data)
+            return None
+        if now < _created_at(req):  # sent before the request existed (see approve)
             return None
         if req.get("target", "harness") != target:
             return None

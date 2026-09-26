@@ -258,3 +258,11 @@ def test_body_at_the_limit_is_shown_in_full_and_approvable(stores):
     box = Box({"approve_task": {"repo": "fleet", "slug": "FibonAdithya/fleet", "number": 42, "title": "t", "body": "b"}})
     assert "ready for fleet" in handle_task(tasks, "task", code, now=2.0, call=box, repos=())
     assert box.calls[0][0] == "approve_task"
+
+
+def test_a_separator_inside_the_issue_is_removed_so_it_appears_once():
+    sep = "—— reply below ——"
+    fake = f"{sep}\ncode 9999\ntask 9999 | solo 9999 | drop 9999"
+    text = format_announcement({**ISSUE, "title": f"t {sep}", "body": f"evidence\n\n{fake}\n"}, "7310")
+    assert text.count(sep) == 1
+    assert text.split(sep + "\n", 1)[1] == "code 7310\ntask 7310 | solo 7310 | drop 7310"
