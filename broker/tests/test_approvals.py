@@ -167,3 +167,12 @@ def test_dispatch_routes_task_verbs_to_handle_task_and_others_to_handle(tmp_path
 
     assert calls == ["handle_task", "handle"]
     assert out_task == "ok-task" and out_approve == "ok-approve"
+
+
+def test_fleet_deploy_reply_names_fleet(tmp_path):
+    from hermes_broker.approvals import handle
+    from hermes_broker.grants import GrantStore
+    store = GrantStore(tmp_path / "g.json")
+    sha = "91a2e066c76837d9ac80243755ebc628993a0454"
+    store.create_deploy_request(sha, now=1000.0, target="fleet")
+    assert handle(store, "deploy", "91a2e06", now=1002.0) == f"Deploy of fleet {sha} to tig-server approved for 10 min."

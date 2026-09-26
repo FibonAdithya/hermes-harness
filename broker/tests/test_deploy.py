@@ -83,3 +83,23 @@ def test_request_deploy_tells_the_owner_what_to_type(fakes, store):
     out = server.request_deploy(" " + SHA.upper() + " ")
     assert f"`deploy {SHA[:12]}`" in out and SHA in out
     assert store.approve_deploy(SHA[:12], now=__import__("time").time()) == SHA
+
+
+def test_deploy_fleet_uses_only_a_fleet_grant(fakes, store):
+    server, calls, box_reply = fakes
+    import time
+    store.create_deploy_request(SHA, now=time.time(), target="fleet")
+    store.approve_deploy(SHA[:7], now=time.time())
+    with pytest.raises(Locked):
+        server.deploy_harness()
+    box_reply.clear()
+    box_reply.update({"deployed": SHA, "target": "fleet"})
+    out = server.deploy_fleet()
+    assert calls == [("box", "tig-server", "deploy", {"sha": SHA, "target": "fleet"}, 1800)]
+    assert out.startswith(f"tig-server: fleet deployed {SHA[:12]}")
+
+
+def test_request_deploy_names_the_target(fakes, store):
+    server, _, _ = fakes
+    assert "fleet" in server.request_deploy(SHA, target="fleet")
+    assert server.request_deploy(SHA, target="droplet").startswith("target must be")

@@ -21,6 +21,7 @@ MAX_GRANT_MINUTES = 480
 DEPLOY = "deploy"
 DEPLOY_GRANT_MINUTES = 10
 MIN_SHA_PREFIX = 7
+DEPLOY_TARGETS = ("harness", "fleet")
 
 
 class GrantStore:
@@ -101,9 +102,11 @@ class GrantStore:
 
     # ---- deploys -----------------------------------------------------
 
-    def create_deploy_request(self, sha: str, now: float) -> None:
+    def create_deploy_request(self, sha: str, now: float, target: str = "harness") -> None:
+        if target not in DEPLOY_TARGETS:
+            raise ValueError(f"unknown deploy target: {target}")
         data = self._read()
-        data["pending_deploy"] = {"sha": sha, "expires_at": now + REQUEST_TTL_SECONDS}
+        data["pending_deploy"] = {"sha": sha, "target": target, "expires_at": now + REQUEST_TTL_SECONDS}
         self._write(data)
 
     def approve_deploy(self, prefix: str, now: float) -> str | None:
@@ -120,16 +123,22 @@ class GrantStore:
         if len(prefix) < MIN_SHA_PREFIX or not req["sha"].startswith(prefix):
             return None
         data.pop("pending_deploy")
-        data["grants"][DEPLOY] = {"sha": req["sha"], "expires_at": now + DEPLOY_GRANT_MINUTES * 60}
+        data["grants"][DEPLOY] = {"sha": req["sha"], "target": req.get("target", "harness"),
+                                   "expires_at": now + DEPLOY_GRANT_MINUTES * 60}
         self._write(data)
         return req["sha"]
 
-    def take_deploy_grant(self, now: float) -> str | None:
-        """The approved commit, if a deploy grant is live. Consumes the grant either way."""
+    def deploy_target(self) -> str | None:
+        grant = self._read()["grants"].get(DEPLOY)
+        return grant.get("target", "harness") if grant else None
+
+    def take_deploy_grant(self, now: float, target: str = "harness") -> str | None:
+        """The approved commit, if a deploy grant for this target is live. Consumes it only on a match."""
         data = self._read()
-        grant = data["grants"].pop(DEPLOY, None)
-        if grant is None:
+        grant = data["grants"].get(DEPLOY)
+        if grant is None or grant.get("target", "harness") != target:
             return None
+        data["grants"].pop(DEPLOY)
         self._write(data)
         return grant["sha"] if grant["expires_at"] > now else None
 

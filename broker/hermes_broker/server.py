@@ -168,19 +168,23 @@ _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 @mcp.tool()
-def request_deploy(sha: str) -> str:
-    """Ask the owner to approve deploying one hermes-harness master commit to the box.
+def request_deploy(sha: str, target: str = "harness") -> str:
+    """Ask the owner to approve deploying one commit to the box.
 
-    sha is the full 40-character commit id. The owner approves by typing that
-    commit's prefix in the approvals chat; the approval covers that commit only,
-    for one deploy_harness() call within 10 minutes.
+    target is "harness" (hermes-harness master) or "fleet" (fleet main). sha is the
+    full 40-character commit id. The owner approves by typing that commit's prefix
+    in the approvals chat; the approval covers that commit and target only, for one
+    deploy_harness() or deploy_fleet() call within 10 minutes.
     """
+    if target not in ("harness", "fleet"):
+        return "target must be harness or fleet"
     sha = sha.strip().lower()
     if not _SHA_RE.fullmatch(sha):
-        return "sha must be the full 40-character commit id of hermes-harness master"
-    _store().create_deploy_request(sha, now=time.time())
+        return "sha must be the full 40-character commit id"
+    _store().create_deploy_request(sha, now=time.time(), target=target)
+    what = "hermes-harness" if target == "harness" else "fleet"
     return (
-        f"Requested a deploy of hermes-harness {sha} to tig-server.\n"
+        f"Requested a deploy of {what} {sha} to tig-server.\n"
         f"Ask the owner to read that commit and reply `deploy {sha[:12]}` "
         f"in the approvals chat within 2 minutes."
     )
@@ -201,6 +205,20 @@ def deploy_harness() -> str:
     return r.get("error") or (
         f"tig-server: deployed {sha[:12]}. The droplet is deployed by hand, not by this tool."
     )
+
+
+@mcp.tool()
+def deploy_fleet() -> str:
+    """Deploy the owner-approved fleet main commit to the box. Needs request_deploy(sha, "fleet") first.
+
+    Refused while any fleet night runs. The box runs make check on the new commit
+    and stays on the previous one if it fails.
+    """
+    sha = _store().take_deploy_grant(now=time.time(), target="fleet")
+    if sha is None:
+        raise Locked('LOCKED: no approved fleet deploy. Call request_deploy(sha, "fleet") first.')
+    r = box.call(_target("tig-server"), "deploy", {"sha": sha, "target": "fleet"}, timeout=1800)
+    return r.get("error") or f"tig-server: fleet deployed {sha[:12]}."
 
 
 @mcp.tool()

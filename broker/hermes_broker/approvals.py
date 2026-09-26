@@ -76,7 +76,9 @@ def handle(store: GrantStore, verb: str, arg: str, now: float) -> str:
             logger.info("rejected deploy prefix")
             return f"No pending deploy of a commit starting {arg}."
         logger.info("deploy of %s approved", sha)
-        return f"Deploy of {sha} to tig-server approved for {DEPLOY_GRANT_MINUTES} min."
+        target = store.deploy_target()
+        what = sha if target == "harness" else f"{target} {sha}"
+        return f"Deploy of {what} to tig-server approved for {DEPLOY_GRANT_MINUTES} min."
     reason = store.pending_reason(arg)
     box = store.approve(arg, now)
     if box is None:

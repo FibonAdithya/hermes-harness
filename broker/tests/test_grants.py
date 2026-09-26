@@ -160,3 +160,20 @@ def test_pending_codes_lists_unexpired_requests(store):
     code = store.create_request("tig-server", 30, "r", now=1.0)
     assert store.pending_codes(now=2.0) == {code}
     assert store.pending_codes(now=1.0 + 121) == set()
+
+
+SHA_F = "f" * 40
+
+
+def test_a_fleet_deploy_grant_is_not_a_harness_grant_and_is_not_spent_by_asking(store):
+    store.create_deploy_request(SHA_F, now=1.0, target="fleet")
+    assert store.approve_deploy(SHA_F[:7], now=2.0) == SHA_F
+    assert store.deploy_target() == "fleet"
+    assert store.take_deploy_grant(now=3.0) is None            # harness asks: refused, not consumed
+    assert store.take_deploy_grant(now=3.0, target="fleet") == SHA_F
+    assert store.take_deploy_grant(now=3.0, target="fleet") is None
+
+
+def test_unknown_deploy_target_rejected(store):
+    with pytest.raises(ValueError):
+        store.create_deploy_request(SHA_F, now=1.0, target="droplet")
