@@ -96,7 +96,7 @@ def test_ops_issue_offers_drop_only():
 def test_announcement_is_bounded_whatever_the_body():
     text = format_announcement({**ISSUE, "title": "t" * 200, "body": "x" * 50000}, "7310")
     assert len(text) <= 4000
-    assert text.count("x") == 1500
+    assert text.count("x") == 3500
 
 
 def test_separator_precedes_the_tail_so_the_body_cannot_impersonate_it():
@@ -192,3 +192,69 @@ def test_announced_codes_avoid_pending_grant_codes(stores, monkeypatch):
     Announcer(tasks, grants, Box({"list_triage": {"issues": [ISSUE], "repos_ok": ["fleet"], "errors": []}}),
               _recording_sender(sent)).tick(now=2.0)
     assert "code 5678" in sent[0]
+
+
+def _announce_once(stores, issue):
+    tasks, grants = stores
+    sent = []
+    Announcer(tasks, grants, Box({"list_triage": {"issues": [issue], "repos_ok": ["fleet"], "errors": []}}),
+              _recording_sender(sent)).tick(now=1.0)
+    assert len(sent) == 1
+    return sent[0], sent[0].split("code ")[1][:4]
+
+
+def test_worst_case_announcement_fits_telegram():
+    """Longest title, a body at the limit, and a long source label stay under Telegram's 4096."""
+    issue = {**ISSUE, "repo": "fleet-fixture", "number": 99999, "title": "t" * 200, "body": "x" * 3500,
+             "labels": ["fleet:triage", "ops", "source:" + "s" * 43]}
+    for labels in (issue["labels"], ["fleet:triage"]):
+        assert len(format_announcement({**issue, "labels": labels}, "7310")) <= 4000
+    assert len(format_announcement({**issue, "body": "x" * 3501}, "7310")) <= 4000
+
+
+def test_long_body_is_announced_drop_only_and_task_solo_are_refused(stores):
+    tasks, _ = stores
+    text, code = _announce_once(stores, {**ISSUE, "body": "x" * 5000})
+    tail = text.split("—— reply below ——\n", 1)[1]
+    assert f"drop {code}" in tail and f"task {code}" not in tail and f"solo {code}" not in tail
+    assert "too long to show in full" in tail
+    for verb in ("task", "solo"):
+        box = Box({})
+        out = handle_task(tasks, verb, code, now=2.0, call=box, repos=("FibonAdithya/fleet",))
+        assert box.calls == [] and "shorten it on GitHub" in out
+        # the code is spent; the next tick offers a fresh one
+        code = tasks.announce("fleet", "FibonAdithya/fleet", 42, H, now=3.0, avoid=set(), drop_only=True)
+
+
+def test_long_title_is_announced_drop_only(stores):
+    tasks, _ = stores
+    text, code = _announce_once(stores, {**ISSUE, "title": "t" * 201})
+    box = Box({})
+    assert "shorten it on GitHub" in handle_task(tasks, "task", code, now=2.0, call=box, repos=())
+    assert box.calls == []
+
+
+def test_ops_issue_refuses_task(stores):
+    tasks, _ = stores
+    _, code = _announce_once(stores, {**ISSUE, "labels": ["fleet:triage", "source:doctor", "ops"]})
+    box = Box({})
+    out = handle_task(tasks, "task", code, now=2.0, call=box, repos=())
+    assert box.calls == [] and "fix it on the box" in out
+
+
+def test_drop_only_issue_can_still_be_dropped(stores):
+    tasks, _ = stores
+    _, code = _announce_once(stores, {**ISSUE, "body": "x" * 5000})
+    box = Box({"close_task": {"repo": "fleet", "number": 42, "closed": True}})
+    assert handle_task(tasks, "drop", code, now=2.0, call=box, repos=()) == "Dropped fleet#42."
+
+
+def test_body_at_the_limit_is_shown_in_full_and_approvable(stores):
+    tasks, _ = stores
+    body = "y" * 3499 + "Z"
+    text, code = _announce_once(stores, {**ISSUE, "body": body})
+    assert body in text and "trimmed" not in text
+    assert text.endswith(f"task {code} | solo {code} | drop {code}")
+    box = Box({"approve_task": {"repo": "fleet", "slug": "FibonAdithya/fleet", "number": 42, "title": "t", "body": "b"}})
+    assert "ready for fleet" in handle_task(tasks, "task", code, now=2.0, call=box, repos=())
+    assert box.calls[0][0] == "approve_task"

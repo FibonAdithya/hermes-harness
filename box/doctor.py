@@ -18,14 +18,17 @@ import boxlib
 import tasklib
 
 MAX_NEW_ISSUES = 3
-EVIDENCE_LINES = 60
+EVIDENCE_LINES = 20
 S4_THRESHOLD = 3
 LOG_TAIL_BYTES = 256 * 1024
-# 61 evidence lines (60 plus one note) of at most 301 characters stay well under
-# tasklib.MAX_BODY (20000) with the header, so one oversized log cannot make
-# file_issue refuse the body.
-EVIDENCE_LINE_CHARS = 300
-KEY_CHARS = 300
+# 21 evidence lines (20 plus one note) of at most 141 characters, a key of at
+# most 201 and the header come to about 3300, under tasklib.MAX_BODY (3500), so
+# one oversized log cannot make file_issue refuse the body.
+# test_worst_case_body_fits_max_body holds this.
+EVIDENCE_LINE_CHARS = 140
+KEY_CHARS = 200
+DRAIN_NOTE = ("fleet AGENTS.md invariant 5: an unpriced transcript is never fixed by adding a [prices] row. "
+              "This finding is for the owner.")
 TERMINAL = ("done", "failed", "killed", "skipped", "paused", "stale", "unknown", "unreadable")
 # Not `killed`: `fleet run` loops until RuntimeMaxSec's SIGTERM, so that is how
 # every fleet night ends. A daemon that crashes exits non-zero first and reads `failed`.
@@ -137,9 +140,7 @@ def examine(night: dict, night_dir: Path, repo_dir: Path) -> list[Finding]:
     intents = [_intent(e) for e in entries]
     drains = sorted({DIGITS.sub("N", str(i.get("reason", ""))) for i in intents if i.get("kind") == "Drain"})
     for reason in drains:
-        note = ("fleet AGENTS.md invariant 5: an unpriced transcript is never fixed by adding a [prices] row. "
-                "This finding is for the owner.")
-        found.append(Finding("S3", reason, "cost", "task", False, (note, *evidence)))
+        found.append(Finding("S3", reason, "cost", "task", False, (DRAIN_NOTE, *evidence)))
     counts = collections.Counter((i["kind"], DIGITS.sub("N", str(i.get("reason", "")))) for i in intents
                                  if i.get("kind") in ("Release", "Escalate"))
     for (kind, reason), n in sorted(counts.items()):

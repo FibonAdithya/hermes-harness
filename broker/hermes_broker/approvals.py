@@ -99,7 +99,12 @@ def handle(store: GrantStore, verb: str, arg: str, now: float) -> str:
 
 TASK_VERBS = ("task", "solo", "drop")
 ANNOUNCE_EVERY = 300
-BODY_CHARS = 1500
+# The announcement shows the whole issue up to these bounds, and the owner's
+# approval binds the hash of the whole title and body, so anything longer is
+# offered drop-only (it could not have been read in full). tasklib.MAX_BODY on
+# the box is the same 3500, so file_task never files an issue that would be.
+BODY_CHARS = 3500
+TITLE_CHARS = 200
 SOLO_MINUTES = 60
 Call = Callable[..., dict]
 
@@ -107,13 +112,24 @@ Call = Callable[..., dict]
 _TAIL_SEPARATOR = "—— reply below ——"
 
 
+def is_drop_only(issue: dict) -> bool:
+    """True when only `drop` may be offered: the text is longer than an announcement
+    shows (so the owner cannot have read what `task`/`solo` would approve), or it
+    is an ops fault, which no agent can fix."""
+    return (len(issue.get("body", "")) > BODY_CHARS or len(issue.get("title", "")) > TITLE_CHARS
+            or "ops" in issue.get("labels", []))
+
+
 def format_announcement(issue: dict, code: str) -> str:
     source = next((x.split(":", 1)[1] for x in issue.get("labels", []) if x.startswith("source:")), "manual")
-    head = f"{issue['repo']}#{issue['number']} [{source}] {issue['title'][:200]}"
+    head = f"{issue['repo']}#{issue['number']} [{source}] {issue['title'][:TITLE_CHARS]}"
     body = issue.get("body", "")
+    trimmed = len(body) > BODY_CHARS or len(issue["title"]) > TITLE_CHARS
     shown = body[:BODY_CHARS] + ("\n[… trimmed]" if len(body) > BODY_CHARS else "")
     if "ops" in issue.get("labels", []):
         tail = f"code {code} — needs you on the box, not an agent.\ndrop {code}"
+    elif trimmed:
+        tail = f"code {code} — too long to show in full — read it on GitHub; only drop is offered.\ndrop {code}"
     else:
         tail = f"code {code}\ntask {code} | solo {code} | drop {code}"
     # A fixed marker precedes the tail so an issue body cannot pass itself off as the
@@ -133,6 +149,10 @@ def handle_task(tasks: TaskStore, verb: str, code: str, now: float, call: Call, 
     if entry is None:
         return "No announced task with that code."
     ref = f"{entry['repo']}#{entry['number']}"
+    if verb != "drop" and entry.get("drop_only", False):
+        return (f"{ref} was offered drop only: it is too long to show here in full (shorten it on GitHub), "
+                f"or it is an ops fault (fix it on the box). This code is spent; if the issue is still "
+                f"in triage it will be announced again.")
     if verb == "drop":
         r = call("close_task", {"repo": entry["repo"], "number": entry["number"]}, 60)
         return f"{ref}: {r['error']}" if "error" in r else f"Dropped {ref}."
@@ -181,7 +201,7 @@ class Announcer:
         self.tasks.prune(set(r.get("repos_ok", [])), {(i["repo"], i["number"]) for i in issues}, now)
         for issue in issues:
             code = self.tasks.announce(issue["repo"], issue["slug"], issue["number"], issue["hash"], now,
-                                       avoid=self.grants.pending_codes(now))
+                                       avoid=self.grants.pending_codes(now), drop_only=is_drop_only(issue))
             if code and not self.send(format_announcement(issue, code)):
                 # The send failed: give the code back so the next tick re-announces
                 # instead of the issue silently sitting unannounced for 7 days.

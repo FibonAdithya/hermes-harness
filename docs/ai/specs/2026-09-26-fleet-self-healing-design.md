@@ -185,7 +185,7 @@ ran on: S1–S4 are faults in fleet, not in the target. `fleet:triage`, `source:
 sha256 over the signal kind, a normalised key (exception class and top frame
 for S1/S2, `drain_reason` for S3, release reason for S4), and the deployed fleet
 SHA from `~/.local/share/fleet-deployed.sha`. The body carries the night id, the
-fleet SHA, and at most 60 lines of evidence in a fenced block.
+fleet SHA, and at most 20 lines of evidence (each clipped to 140 characters, so the body fits `tasklib.MAX_BODY`, 3500) in a fenced block.
 
 - **Dedup.** If an open issue carries `doctor:<sig>`, the doctor adds a comment
   "seen again in night <id>" rather than filing. Comments are outside the

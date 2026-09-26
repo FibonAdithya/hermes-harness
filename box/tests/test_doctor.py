@@ -213,8 +213,9 @@ def test_an_oversized_log_is_filed_with_clipped_evidence_and_does_not_stop_the_n
     gh = gh_for_fleet()
     out = doctor.run(tmp_path, gh)
     assert out["filed"] == [1, 2] and out["errors"] == []
-    assert len(gh.issues[1]["body"]) <= tasklib.MAX_BODY and "x" * 300 + "…" in gh.issues[1]["body"]
-    assert "x" * 301 not in gh.issues[1]["body"]
+    n = doctor.EVIDENCE_LINE_CHARS
+    assert len(gh.issues[1]["body"]) <= tasklib.MAX_BODY and "x" * n + "…" in gh.issues[1]["body"]
+    assert "x" * (n + 1) not in gh.issues[1]["body"]
     for night in (NIGHT_A, NIGHT):
         assert (tmp_path / "nights" / night / "doctored").exists()
 
@@ -288,3 +289,22 @@ def test_an_ops_message_on_a_killed_night_is_still_filed(tmp_path):
     d = make_night(tmp_path, status="killed", log=log, runlog=[])
     [f] = doctor.examine({"id": NIGHT, "status": "killed"}, d, tmp_path / "TIG" / "fleet-fixture")
     assert (f.kind, f.key, f.ops) == ("ops", "claude-not-logged-in", True)
+
+
+def test_worst_case_body_fits_max_body():
+    """Every Finding carries at most EVIDENCE_LINES log lines plus one note (S3) or
+    count line (S4). Build that worst case at the longest line, key and night id."""
+    import tasklib
+    lines = [doctor._clip("x" * 5000) for _ in range(doctor.EVIDENCE_LINES)]
+    count = doctor._clip("9" * 5000)
+    for extra in (doctor.DRAIN_NOTE, count):
+        f = doctor.Finding("S4", "k" * 5000, "executor", "task", False, (extra, *lines))
+        body = doctor._body("talosxyz-20260926-2300-abcd", "f" * 40, f)
+        assert len(body) <= tasklib.MAX_BODY, len(body)
+
+
+def test_examine_keeps_at_most_evidence_lines_of_the_log(tmp_path):
+    log = "".join(f"line {i}\n" for i in range(500))
+    d = make_night(tmp_path, log=log)
+    [f] = doctor.examine({"id": NIGHT, "status": "failed"}, d, tmp_path / "TIG" / "fleet-fixture")
+    assert len(f.evidence) == doctor.EVIDENCE_LINES and f.evidence[-1] == "line 499"

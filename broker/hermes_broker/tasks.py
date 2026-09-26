@@ -49,12 +49,19 @@ class TaskStore:
     def live_codes(self, now: float) -> set[str]:
         return set(self._live(self._read(), now))
 
-    def announce(self, repo: str, slug: str, number: int, body_hash: str, now: float, avoid: set[str]) -> str | None:
-        """A new code for this issue, or None if it is already announced with this text."""
+    def announce(self, repo: str, slug: str, number: int, body_hash: str, now: float, avoid: set[str],
+                 drop_only: bool = False) -> str | None:
+        """A new code for this issue, or None if it is already announced with this text.
+
+        `drop_only` marks an issue the owner could not read in full, or an ops
+        fault: its code accepts only `drop`. A change in it (e.g. an `ops` label
+        added without editing the text) counts as a new announcement.
+        """
         data = self._read()
         codes = self._live(data, now)
         mine = [c for c, e in codes.items() if e["repo"] == repo and e["number"] == int(number)]
-        if any(codes[c]["hash"] == body_hash for c in mine):
+        if any(codes[c]["hash"] == body_hash and bool(codes[c].get("drop_only", False)) == bool(drop_only)
+               for c in mine):
             return None
         for c in mine:
             codes.pop(c)
@@ -63,7 +70,7 @@ class TaskStore:
             if code not in codes and code not in avoid:
                 break
         codes[code] = {"repo": repo, "slug": slug, "number": int(number), "hash": body_hash,
-                       "expires_at": now + CODE_TTL_SECONDS}
+                       "drop_only": bool(drop_only), "expires_at": now + CODE_TTL_SECONDS}
         data["codes"] = codes
         self._write(data)
         return code
@@ -74,7 +81,9 @@ class TaskStore:
         self._write(data)
         if entry is None or entry["expires_at"] <= now:
             return None
-        return {k: entry[k] for k in ("repo", "slug", "number", "hash")}
+        # Entries written before drop_only existed count as not drop-only.
+        return {**{k: entry[k] for k in ("repo", "slug", "number", "hash")},
+                "drop_only": bool(entry.get("drop_only", False))}
 
     def prune(self, listed_repos: set[str], present: set[tuple[str, int]], now: float) -> None:
         """Forget codes for issues that left triage. Only repos whose listing succeeded are judged."""

@@ -33,7 +33,8 @@ def test_changed_text_gets_a_new_code_and_kills_the_old(store):
 
 def test_take_is_single_use(store):
     code = store.announce("fleet", "FibonAdithya/fleet", 42, H1, now=1000.0, avoid=set())
-    assert store.take(code, now=1001.0) == {"repo": "fleet", "slug": "FibonAdithya/fleet", "number": 42, "hash": H1}
+    assert store.take(code, now=1001.0) == {"repo": "fleet", "slug": "FibonAdithya/fleet", "number": 42, "hash": H1,
+                                            "drop_only": False}
     assert store.take(code, now=1002.0) is None
 
 
@@ -78,3 +79,22 @@ def test_live_codes(store):
     code = store.announce("fleet", "FibonAdithya/fleet", 7, H1, now=1.0, avoid=set())
     assert store.live_codes(now=2.0) == {code}
     assert store.live_codes(now=2.0 + CODE_TTL_SECONDS) == set()
+
+
+def test_drop_only_is_stored_and_returned(store):
+    code = store.announce("fleet", "FibonAdithya/fleet", 7, H1, now=1.0, avoid=set(), drop_only=True)
+    assert store.take(code, now=2.0)["drop_only"] is True
+
+
+def test_entries_written_before_drop_only_count_as_not_drop_only(store):
+    import json
+    store.path.write_text(json.dumps({"codes": {"4321": {"repo": "fleet", "slug": "FibonAdithya/fleet",
+                                                          "number": 7, "hash": H1, "expires_at": 99.0}}}))
+    assert store.take("4321", now=2.0)["drop_only"] is False
+
+
+def test_a_change_in_drop_only_is_a_new_announcement(store):
+    """An `ops` label added later, text unchanged, must replace the approvable code."""
+    old = store.announce("fleet", "FibonAdithya/fleet", 7, H1, now=1.0, avoid=set())
+    new = store.announce("fleet", "FibonAdithya/fleet", 7, H1, now=2.0, avoid=set(), drop_only=True)
+    assert new is not None and store.take(old, now=3.0) is None and store.take(new, now=3.0)["drop_only"] is True

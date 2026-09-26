@@ -37,7 +37,9 @@ def test_file_issue_refuses_an_unknown_class(cls):
         tasklib.file_issue(FakeGh(), SLUG, "t", "b", "docs", cls, frozenset({"docs"}), "source:hermes")
 
 
-@pytest.mark.parametrize("title,body", [("", "b"), ("   ", "b"), ("x" * 201, "b"), ("t", "x" * 20001)])
+@pytest.mark.parametrize("title,body", [("", "b"), ("   ", "b"), ("x" * 201, "b"), ("t", "x" * 20001),
+                                        ("t", "x" * 3501)],
+                         ids=["empty", "blank", "long-title", "body-20001", "body-3501"])
 def test_file_issue_refuses_empty_or_oversized_text(title, body):
     with pytest.raises(TaskError):
         tasklib.file_issue(FakeGh(), SLUG, title, body, "docs", "patch", frozenset({"docs"}), "source:hermes")
@@ -139,3 +141,10 @@ def test_fleet_repos_are_discovered_not_listed(tmp_path):
         if has:
             (tmp_path / "TIG" / name / "fleet.toml").write_text("")
     assert [p.name for p in tasklib.fleet_repos(tmp_path)] == ["a", "c"]
+
+
+def test_file_issue_accepts_a_body_at_the_announcement_limit():
+    """3500 is what the owner's announcement shows in full (broker BODY_CHARS)."""
+    assert tasklib.MAX_BODY == 3500
+    out = tasklib.file_issue(FakeGh(), SLUG, "t", "x" * 3500, "docs", "patch", frozenset({"docs"}), "source:hermes")
+    assert out["number"] == 1

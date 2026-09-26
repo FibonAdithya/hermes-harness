@@ -25,7 +25,10 @@ TRIAGE, READY, AUTO_OK, HUMAN = "fleet:triage", "fleet:ready", "fleet:auto-ok", 
 SOLO, DROPPED = "fleet:solo", "fleet:dropped"
 SOURCES = ("source:hermes", "source:doctor")
 MODES = {"fleet": (READY, AUTO_OK), "solo": (HUMAN, SOLO)}
-MAX_TITLE, MAX_BODY = 200, 20000
+# The owner's Telegram announcement shows at most this much (broker approvals.py
+# BODY_CHARS), and approve() binds the hash of the whole text, so a longer body
+# could be approved unread. The broker offers only `drop` for anything longer.
+MAX_TITLE, MAX_BODY = 200, 3500
 
 
 class TaskError(ValueError):
