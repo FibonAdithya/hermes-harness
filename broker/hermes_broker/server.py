@@ -91,8 +91,17 @@ def run_fleet(repo: str, hours: int = 8) -> str:
 
 @mcp.tool()
 def run_talos(challenge: str = "", direction: str = "", iterations: int | None = None, backend: str = "local",
-              resume: str = "") -> str:
-    """Start a Talos autoresearch run on the box. Requires a grant. backend is local or modal.
+              resume: str = "", compute_usd: float | None = None, mode: str = "") -> str:
+    """Start a Talos autoresearch run on the box. Requires a grant. backend is local, modal or c3.
+
+    local is free. modal and c3 bill real money for compute: compute_usd caps it
+    for the run (default 5, at most 90, which the box enforces). A c3 iteration
+    is one batch job of about 12 minutes.
+
+    mode is single-shot (default) or agentic. Agentic hands each iteration to a
+    claude session on the box: roughly 5-20x the tokens, and on modal or c3 the
+    compiles that session runs are NOT counted in compute_usd. A pause of an
+    agentic night can take up to 30 minutes to land.
 
     To continue a Talos job that stopped (paused, cancelled, failed, or cut off by
     the night's time limit), pass resume=<job id> and the backend it ran on, and
@@ -101,15 +110,19 @@ def run_talos(challenge: str = "", direction: str = "", iterations: int | None =
     """
     require_grant(_store(), "tig-server", now=time.time())
     if resume:
-        extra = [k for k, v in (("challenge", challenge), ("direction", direction), ("iterations", iterations))
+        extra = [k for k, v in (("challenge", challenge), ("direction", direction), ("iterations", iterations),
+                                 ("compute_usd", compute_usd), ("mode", mode))
                  if v not in ("", None)]
         if extra:
             return f"resume takes only backend; drop {', '.join(extra)}"
         r = box.call(_target("tig-server"), "run_talos", {"resume": resume, "backend": backend})
         return r.get("error") or f"talos night {r['id']} resuming {resume} ({backend}). Poll night_status()."
     r = box.call(_target("tig-server"), "run_talos",
-                 {"challenge": challenge, "direction": direction, "iterations": int(30 if iterations is None else iterations), "backend": backend})
-    return r.get("error") or f"talos night {r['id']} started ({challenge}, {backend}). Poll night_status()."
+                 {"challenge": challenge, "direction": direction, "iterations": int(30 if iterations is None else iterations),
+                  "backend": backend, "compute_usd": float(5 if compute_usd is None else compute_usd),
+                  "mode": mode or "single-shot"})
+    return r.get("error") or (f"talos night {r['id']} started ({challenge}, {backend}, {mode or 'single-shot'}, compute capped at "
+                              f"${5 if compute_usd is None else compute_usd:g}). Poll night_status().")
 
 
 @mcp.tool()
@@ -180,6 +193,20 @@ def night_status() -> str:
     if not rows:
         return "no nights recorded"
     return "\n".join(f"{n['id']}  {n['status']:8} started {n['started']}  exit={n['exit_code']}" for n in rows)
+
+
+@mcp.tool()
+def pause_talos(night_id: str) -> str:
+    """Stop a running Talos night cleanly. No grant needed: stopping only lowers spend.
+
+    Talos cancels the C3 job or container in flight and saves its state; the
+    night reads `paused` in night_status() once it has (up to a few minutes).
+    Continue later with run_talos(resume=<job id>, backend=<its backend>), which
+    needs a grant; the job id is on the `Job <id>:` line of night_log().
+    """
+    r = box.call(_target("tig-server"), "pause_talos", {"id": night_id}, timeout=30)
+    return r.get("error") or (f"pause requested for {r['id']}; poll night_status() until it reads paused, "
+                              f"then resume with run_talos(resume=<job id>).")
 
 
 @mcp.tool()

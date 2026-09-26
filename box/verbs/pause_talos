@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""Ask a running Talos night to stop cleanly. Ungated: stopping only lowers spend.
+
+SIGINT goes to the night's wrapper alone, which forwards it to Talos. Talos
+cancels the C3 job or container in flight, saves state.json as `cancelled`, and
+exits; the night then reads `paused`. Continue it with run_talos(resume=<job id>).
+"""
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import boxlib  # noqa: E402
+
+a = boxlib.read_json_stdin(sys.stdin.buffer) or {}
+try:
+    night_id = boxlib.check_night_id(a.get("id", ""))
+except ValueError as exc:
+    sys.exit(boxlib.refuse(str(exc)))
+if not night_id.startswith("talos-"):
+    sys.exit(boxlib.refuse(f"{night_id} is not a talos night"))
+d = boxlib.night_dir(boxlib.nights_root(os.environ), night_id)
+if not d.is_dir():
+    sys.exit(boxlib.refuse(f"no such night: {night_id}"))
+status = (boxlib.read_small(d / "status") or "").strip()
+if status != "running" or not boxlib.unit_active(night_id):
+    sys.exit(boxlib.refuse(f"{night_id} is not running (status {status or 'unknown'})"))
+proc = subprocess.run(["systemctl", "--user", "kill", "--kill-whom=main", "--signal=SIGINT",
+                       f"night-{night_id}.service"], capture_output=True, text=True, check=False)
+if proc.returncode != 0:
+    sys.exit(boxlib.refuse(f"systemctl kill failed: {proc.stderr.strip()[:300]}"))
+print(json.dumps({"id": night_id}))

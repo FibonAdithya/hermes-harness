@@ -104,8 +104,11 @@ def _start(kind: str, env: dict, root: Path) -> int:
             return 0
         t = cfg.get("talos", {})
         backend = t.get("backend", "local")
+        if backend in boxlib.TALOS_PAID_BACKENDS:
+            raise ValueError(f"backend {backend!r} bills per job; start it with an approved run_talos, not a timer")
         workdir, cmd, secs = boxlib.talos_command(home, entry["challenge"], entry["direction"],
-                                                  int(t.get("iterations", 30)), backend)
+                                                  int(t.get("iterations", 30)), backend,
+                                                  t.get("compute_usd", boxlib.DEFAULT_TALOS_COMPUTE_USD))
         _write_atomic(path, dump_toml(rest))
         night_id = boxlib.start_night("talos", workdir, cmd, secs, env, {**entry, "backend": backend, "timer": True})
     print(json.dumps({"id": night_id}))

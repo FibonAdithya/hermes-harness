@@ -21,7 +21,7 @@ from typing import BinaryIO
 VERB_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 MAX_STDIN = 1 << 20  # 1 MiB: a prompt, never a file upload
 NIGHT_ID_RE = re.compile(r"^[a-z]{1,8}-[0-9]{8}-[0-9]{4}-[a-f0-9]{4}$")
-STATUSES = ("running", "done", "failed", "killed", "skipped")
+STATUSES = ("running", "done", "failed", "killed", "skipped", "paused")
 
 
 def refuse(msg: str) -> int:
@@ -135,7 +135,9 @@ def read_small(path: Path, limit: int = 4096) -> str | None:
 def unit_active(night_id: str) -> bool:
     proc = subprocess.run(["systemctl", "--user", "is-active", f"night-{night_id}"],
                           capture_output=True, text=True, check=False)
-    return proc.stdout.strip() == "active"
+    # `deactivating` is a Talos night still cancelling its bench job after the
+    # time limit: its processes are alive and it still owns its state.json.
+    return proc.stdout.strip() in ("active", "activating", "deactivating", "reloading", "refreshing")
 
 
 def read_status(root: Path) -> list[dict]:
@@ -177,11 +179,13 @@ def read_status(root: Path) -> list[dict]:
     return rows
 
 
-def systemd_run_argv(unit: str, runtime_sec: int, workdir: Path, env: dict, argv: list[str]) -> list[str]:
+def systemd_run_argv(unit: str, runtime_sec: int, workdir: Path, env: dict, argv: list[str],
+                     properties: tuple[str, ...] = ()) -> list[str]:
     out = [
         "systemd-run", "--user", f"--unit={unit}", "--collect", "--quiet",
         f"--property=RuntimeMaxSec={int(runtime_sec)}",
         f"--property=WorkingDirectory={workdir}",
+        *(f"--property={p}" for p in properties),
     ]
     for k, v in env.items():
         out.append(f"--setenv={k}={v}")
@@ -196,9 +200,23 @@ SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-
 # The challenges the pinned Talos knows. Extend by PR when Talos does.
 TALOS_CHALLENGES = ("knapsack", "vehicle_routing", "satisfiability", "vector_search", "hypergraph", "neuralnet_optimizer",
                     "job_scheduling", "energy_arbitrage")
-TALOS_BACKENDS = ("local", "modal")
+TALOS_BACKENDS = ("local", "modal", "c3")
+# Backends that bill per job. A timer may not start these: paid compute needs an approved call.
+TALOS_PAID_BACKENDS = ("c3",)
 MAX_FLEET_HOURS = 24
 MAX_TALOS_ITER = 500
+TALOS_MODES = ("single-shot", "agentic")
+TALOS_STOP_SEC = 600
+# An agentic iteration is a claude session of up to 30 minutes; Talos sees a stop
+# only after it ends, then cancels its bench job.
+TALOS_AGENTIC_STOP_SEC = 2400
+
+
+def talos_stop_sec(mode: str) -> int:
+    return TALOS_AGENTIC_STOP_SEC if mode == "agentic" else TALOS_STOP_SEC
+# Talos caps compute in USD. 90 is about GBP 70, the owner's ceiling for one run.
+DEFAULT_TALOS_COMPUTE_USD = 5
+MAX_TALOS_COMPUTE_USD = 90
 MAX_TASK_MINUTES = 240
 
 
@@ -218,7 +236,14 @@ def fleet_command(home: Path, repo: str, hours: int) -> tuple[Path, list[str], i
     return workdir, argv, int(hours) * 3600
 
 
-def talos_command(home: Path, challenge: str, direction: str, iterations: int, backend: str) -> tuple[Path, list[str], int]:
+def _compute_usd(v) -> float:
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 < v <= MAX_TALOS_COMPUTE_USD:
+        raise ValueError(f"compute_usd must be a number in (0, {MAX_TALOS_COMPUTE_USD}]: {v!r}")
+    return float(v)
+
+
+def talos_command(home: Path, challenge: str, direction: str, iterations: int, backend: str,
+                  compute_usd: float = DEFAULT_TALOS_COMPUTE_USD, mode: str = "single-shot") -> tuple[Path, list[str], int]:
     if challenge not in TALOS_CHALLENGES:
         raise ValueError(f"unknown challenge: {challenge!r}")
     if backend not in TALOS_BACKENDS:
@@ -227,9 +252,13 @@ def talos_command(home: Path, challenge: str, direction: str, iterations: int, b
         raise ValueError("direction is required")
     if not 1 <= int(iterations) <= MAX_TALOS_ITER:
         raise ValueError(f"iterations must be 1..{MAX_TALOS_ITER}")
+    usd = _compute_usd(compute_usd)
+    if mode not in TALOS_MODES:
+        raise ValueError(f"mode must be one of {', '.join(TALOS_MODES)}: {mode!r}")
     workdir = Path(home) / f"talos-{backend}"
     argv = [str(workdir / ".venv" / "bin" / "talos"), "run", "--challenge", challenge,
-            "--direction", direction, "--budget-iterations", str(int(iterations)), "--yes"]
+            "--direction", direction, "--budget-iterations", str(int(iterations)),
+            "--budget-compute-usd", str(usd), *(["--mode", "agentic"] if mode == "agentic" else []), "--yes"]
     return workdir, argv, 12 * 3600
 
 
@@ -287,7 +316,7 @@ def task_command(home: Path, night_dir_: Path, repo: str, minutes: int) -> tuple
 
 
 def start_night(kind: str, workdir: Path, argv: list[str], runtime_sec: int, env: dict,
-                meta: dict | None = None, night_id: str | None = None) -> str:
+                meta: dict | None = None, night_id: str | None = None, stop_sec: int = TALOS_STOP_SEC) -> str:
     """Mint an id (unless given), create the directory, hand the command to systemd.
 
     Returns the id. On a systemd-run failure the night is recorded as failed with
@@ -301,7 +330,15 @@ def start_night(kind: str, workdir: Path, argv: list[str], runtime_sec: int, env
     write_status(d, "running")
     home = env.get("HOME", "/home/adi")
     wrapper = str(Path(home) / ".local" / "bin" / "run-night.sh")
-    full = systemd_run_argv(f"night-{night_id}", runtime_sec, workdir, env, [wrapper, str(d), *argv])
+    props: tuple[str, ...] = ()
+    if kind == "talos":
+        # At the time limit systemd sends TERM to the wrapper alone, which asks Talos
+        # to stop with SIGINT: Talos then cancels its C3 job or container and saves
+        # state. Talos checks for a stop every 20 s but an LLM or Modal call runs to
+        # its end first, hence 10 minutes before SIGKILL.
+        props = ("KillMode=mixed", f"TimeoutStopSec={int(stop_sec)}")
+        env = {**env, "NIGHT_STOP_SIGNAL": "INT"}
+    full = systemd_run_argv(f"night-{night_id}", runtime_sec, workdir, env, [wrapper, str(d), *argv], props)
     proc = subprocess.run(full, capture_output=True, text=True, check=False)
     if proc.returncode != 0:
         write_status(d, "failed", exit_code=proc.returncode)

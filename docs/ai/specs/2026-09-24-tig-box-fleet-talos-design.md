@@ -146,7 +146,8 @@ verb that is not a file in that directory does not exist.
 transient unit with `systemd-run --user --unit night-<id> --property
 RuntimeMaxSec=<limit>` and return `{id}` within seconds. The unit logs to
 `~/nights/<id>/log` and writes `~/nights/<id>/status` (`running`, `done`,
-`failed`, `killed`) and `exit_code` on exit, the same contract the 08-05
+`failed`, `killed`, and `paused` for a Talos night stopped by `pause_talos`)
+and `exit_code` on exit, the same contract the 08-05
 `run-task.sh` used. `RuntimeMaxSec` is the hard stop nothing can extend from
 chat.
 
@@ -162,8 +163,9 @@ Added to the 08-05 §3 table. Gating is the same code path: a live grant for
 | Tool | Gated | Verb | What it does |
 |---|---|---|---|
 | `run_fleet(repo, hours)` | yes | `run_fleet` | `fleet run --new-run` in `~/TIG/<repo>`; budget comes from that repo's `fleet.toml`, the hour limit becomes `RuntimeMaxSec` |
-| `run_talos(challenge, direction, iterations, backend)` | yes | `run_talos` | `talos run --challenge … --direction … --budget-iterations … --yes` in `~/talos-<backend>`, whose `talos.config.json` fixes the backend |
+| `run_talos(challenge, direction, iterations, backend, compute_usd)` | yes | `run_talos` | `talos run --challenge … --direction … --budget-iterations … --budget-compute-usd … --yes` in `~/talos-<backend>`, whose `talos.config.json` fixes the backend (`local`, `modal` or `c3`); `compute_usd` defaults to 5 and the box refuses anything above 90 (§7) |
 | `run_talos(resume=<job id>, backend)` | yes | `run_talos` | `talos run --resume <job id> --yes` in `~/talos-<backend>`; the job keeps its own challenge, direction and budget, so passing those with `resume` is refused, as is a resume while any Talos night on that backend is live (Talos keeps no per-job lock) |
+| `pause_talos(night_id)` | no | `pause_talos` | SIGINT to the night's wrapper alone (`systemctl --user kill --kill-whom=main`), which forwards it to Talos; Talos cancels the C3 job or container in flight, saves state, and the night ends `paused`. Refuses anything but a running `talos-` night. Ungated because stopping only lowers spend; resuming stays gated |
 | `run_task(repo, prompt, minutes)` | yes | `run_task` | the 08-05 executor: Claude Code in a throwaway container, PR only |
 | `add_repo(name)` | yes | `add_repo` | clones `FibonAdithya/<name>` into `~/TIG/<name>` |
 | `night_status()` | no | `status` | every night, running or finished |
@@ -176,7 +178,8 @@ Added to the 08-05 §3 table. Gating is the same code path: a live grant for
   one whose `task-classes.md` or `[agents.<kind>]` tables are incomplete, at
   startup, before dispatching anything.
 - `run_talos` accepts only challenge names the pinned Talos knows and only the
-  two backends that were set up.
+  three backends that were set up, and every new run carries a compute cap of
+  at most $90.
 - `add_repo` clones only repositories the owner's GitHub account **owns**,
   checked on the box with `gh api repos/<owner>/<name>` (owner login must match,
   and not a fork). This is the
@@ -230,6 +233,56 @@ Talos reads and writes its config in the current directory, so two directories:
   `iterations` in the night config should be sized to that, not 30.
 - `~/talos-modal`: `talos setup` with backend `modal`, same provider. Used only
   when a `run_talos` call names it, to confirm a local winner on x86.
+- `~/talos-c3`: `talos setup` with backend `c3`, same provider, and a C3 API
+  key, so Talos talks to C3's hosted MCP endpoint and the box needs no `c3`
+  CLI. The key lives only in `~/talos-c3/.talos/secrets.json`; the broker and
+  the droplet never see it. Used only when a `run_talos` call names it
+  (added 2026-09-26). A C3 iteration is one batch job with about 12 minutes of
+  fixed overhead (Talos's measurement, not re-run here).
+
+**Compute cap (2026-09-26).** Every new run passes `--budget-compute-usd`:
+the call's `compute_usd`, default 5, at most `MAX_TALOS_COMPUTE_USD = 90` in
+`box/boxlib.py`. Talos caps in USD; 90 is roughly the owner's £70 ceiling
+(ESTIMATE, unverified exchange rate). A resume keeps the cap in the job's
+`job.json`, so `compute_usd` with `resume` is refused. The timers read
+`compute_usd` from `~/nights/config.toml` and refuse `backend = "c3"`: paid
+compute starts only from an approved call.
+
+**Agentic mode (owner's decision, 2026-09-26).** `run_talos(mode="agentic")`
+passes `--mode agentic` on any backend; the default stays single-shot, the
+timers never use it, and a resume keeps the job's own mode (Talos refuses a
+change, so the verb refuses `mode` with `resume`). Each iteration is a headless
+`claude -p` session on the box host under Talos's `.claude/settings.json`
+permission rules. Two risks were shown to the owner and accepted:
+
+1. **Agent compiles are outside the compute cap.** The session's only command,
+   `talos compile`, builds on the job's backend through a fresh bench with no
+   budget. On `c3` each is a job of about 12 minutes; on `modal`, a compile
+   call. Neither is counted in `compute_usd`. They are bounded only by
+   `iterations` × what one 30-minute session runs, and a compile the session
+   timeout kills leaves its C3 job running to its own walltime.
+2. **The agent runs on the credential host with a permission-only sandbox.**
+   The rules are Claude Code's, not the OS's. The host holds the `claude`,
+   `codex` and `gh` logins, the agent's environment carries `C3_API_KEY`, and
+   the `direction` it reads in `tacit.md` comes from Hermes, which reads email.
+   A `tig-server` grant covers 30 minutes of calls and does not show the
+   direction. `codex-cli` agentic stays refused: nothing sets
+   `TALOS_ALLOW_CODEX_AGENTIC`.
+
+Agentic nights, and every resumed night (whose mode the verb cannot see), get
+`TimeoutStopSec=2400`: Talos sees a stop only after the running session ends.
+
+**Stopping cleanly (2026-09-26).** Talos stops cleanly only on SIGINT: it
+cancels the bench job in flight and saves `state.json`; SIGTERM kills it with
+a C3 job still billing. So Talos nights run with `KillMode=mixed`,
+`TimeoutStopSec=600` and `NIGHT_STOP_SIGNAL=INT`: at `RuntimeMaxSec` systemd
+sends TERM to `run-night.sh` alone, which sends SIGINT to Talos and waits; the
+night ends `killed`. `pause_talos` sends SIGINT to the wrapper directly and the
+night ends `paused`. Either way the job resumes with `run_talos(resume=…)`.
+While the unit is `deactivating`, the night still counts as live, so a resume
+cannot start beside a Talos that is still cancelling. Verified on the laptop's
+systemd 249 with a stand-in Python child: both paths delivered SIGINT to the
+child. The box runs systemd 259, where the flag is `--kill-whom`.
 
 Both directories are a checkout of the pinned Talos at the same commit as the
 laptop's. `runs/` inside each is where Talos writes results; the night's
@@ -325,7 +378,8 @@ and what the broker exposes.
 
 ## 11. Failure modes
 
-- **A verb hangs.** `RuntimeMaxSec` kills the unit; status reads `killed`; the
+- **A verb hangs.** `RuntimeMaxSec` kills the unit (a Talos night gets SIGINT
+  and up to 10 minutes to cancel its bench job first); status reads `killed`; the
   morning page says so.
 - **The box is unreachable.** The broker's SSH wrapper has `ConnectTimeout`
   from the 08-05 spec; tools return `tig-server unreachable`, not a hung turn.
@@ -351,6 +405,8 @@ and what the broker exposes.
   $25) and by subscription quota, since agents are the CLIs.
 - Talos local nights: subscription quota only; no compute cost.
 - Talos Modal runs: container seconds, on demand, never from a timer.
+- Talos C3 runs: per-job billing, on demand, never from a timer; capped per run
+  by `compute_usd` (at most $90).
 - Hermes: rises slightly, as the 08-05 spec predicted, from reading nights back.
 - The box: fixed monthly, already paid.
 
@@ -394,7 +450,6 @@ The 08-05 §9 list still applies to the broker. Added:
 - A gated raw-shell tool. If `run_task` proves too slow for small changes, add
   it later as one verb with a logged transcript.
 - Onboarding a real repository to fleet. `fleet-fixture` only in this round.
-- Talos agentic mode.
 - Work-org repositories and credentials.
 - A push proxy for the executor's in-run credential exposure (still open from
   08-05).

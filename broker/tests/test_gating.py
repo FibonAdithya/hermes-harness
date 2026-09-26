@@ -95,7 +95,8 @@ def test_run_talos_resume_sends_only_the_job_and_backend(store, monkeypatch):
 
     sent.clear()
     server.run_talos("knapsack", "d", 3, "local")
-    assert sent == [("run_talos", {"challenge": "knapsack", "direction": "d", "iterations": 3, "backend": "local"})]
+    assert sent == [("run_talos", {"challenge": "knapsack", "direction": "d", "iterations": 3, "backend": "local",
+                                   "compute_usd": 5.0, "mode": "single-shot"})]
 
 
 def test_run_talos_refuses_new_run_arguments_alongside_resume(store, monkeypatch):
@@ -110,10 +111,63 @@ def test_run_talos_refuses_new_run_arguments_alongside_resume(store, monkeypatch
     store.approve(store.create_request("tig-server", 30, "x", now=time.time()), now=time.time())
 
     job = "20260924-230101-knapsack"
-    for extra in ({"challenge": "hypergraph"}, {"direction": "d"}, {"iterations": 30}, {"iterations": 0}):
+    for extra in ({"challenge": "hypergraph"}, {"direction": "d"}, {"iterations": 30}, {"iterations": 0},
+                  {"compute_usd": 10}, {"mode": "agentic"}):
         out = server.run_talos(resume=job, **extra)
         assert "resume" in out and next(iter(extra)) in out, (extra, out)
     assert sent == []
 
     server.run_talos("knapsack", "d")
-    assert sent == [("run_talos", {"challenge": "knapsack", "direction": "d", "iterations": 30, "backend": "local"})]
+    assert sent == [("run_talos", {"challenge": "knapsack", "direction": "d", "iterations": 30, "backend": "local",
+                                   "compute_usd": 5.0, "mode": "single-shot"})]
+
+
+def test_run_talos_c3_forwards_the_compute_cap(store, monkeypatch):
+    from hermes_broker import server
+
+    monkeypatch.setattr(server, "_store", lambda: store)
+    monkeypatch.setattr(server, "_target", lambda box: "tig-server")
+    sent = []
+    monkeypatch.setattr(server.box, "call", lambda t, v, a, timeout=60: sent.append((v, a)) or {"id": "talos-x"})
+
+    with pytest.raises(Locked):
+        server.run_talos("knapsack", "d", 3, "c3", compute_usd=40)
+    assert sent == []
+
+    store.approve(store.create_request("tig-server", 30, "x", now=time.time()), now=time.time())
+    out = server.run_talos("knapsack", "d", 3, "c3", compute_usd=40)
+    assert sent == [("run_talos", {"challenge": "knapsack", "direction": "d", "iterations": 3, "backend": "c3",
+                                   "compute_usd": 40.0, "mode": "single-shot"})]
+    assert "talos-x" in out and "c3" in out and "40" in out
+
+
+def test_pause_talos_is_ungated_and_forwards_the_night(store, monkeypatch):
+    """Stopping only lowers spend, so it needs no grant; resuming still does."""
+    from hermes_broker import server
+
+    monkeypatch.setattr(server, "_store", lambda: store)
+    monkeypatch.setattr(server, "_target", lambda box: "tig-server")
+    sent = []
+    monkeypatch.setattr(server.box, "call",
+                        lambda t, v, a, timeout=60: sent.append((v, a)) or {"id": a["id"]})
+    out = server.pause_talos("talos-20260926-0100-abcd")
+    assert sent == [("pause_talos", {"id": "talos-20260926-0100-abcd"})]
+    assert "talos-20260926-0100-abcd" in out and "resume" in out
+
+    monkeypatch.setattr(server.box, "call", lambda t, v, a, timeout=60: {"error": "not running"})
+    assert server.pause_talos("talos-20260926-0100-abcd") == "not running"
+
+
+def test_run_talos_forwards_agentic_mode(store, monkeypatch):
+    from hermes_broker import server
+
+    monkeypatch.setattr(server, "_store", lambda: store)
+    monkeypatch.setattr(server, "_target", lambda box: "tig-server")
+    sent = []
+    monkeypatch.setattr(server.box, "call", lambda t, v, a, timeout=60: sent.append((v, a)) or {"id": "talos-x"})
+    with pytest.raises(Locked):
+        server.run_talos("knapsack", "d", 3, "c3", mode="agentic")
+    store.approve(store.create_request("tig-server", 30, "x", now=time.time()), now=time.time())
+    out = server.run_talos("knapsack", "d", 3, "c3", mode="agentic")
+    assert sent[0][1]["mode"] == "agentic"
+    assert "agentic" in out
