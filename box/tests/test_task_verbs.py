@@ -98,3 +98,32 @@ def test_list_triage_reports_a_failing_repo_without_dropping_the_others(tmp_path
     rc, out = run("list_triage", home, shims, {})
     assert rc == 0 and out["repos_ok"] == ["fleet-fixture"] and len(out["issues"]) == 1
     assert len(out["errors"]) == 1 and out["errors"][0].startswith("broken:")
+
+
+def _no_path_env(home, only_dir):
+    """A PATH containing only `only_dir`, with a python3 symlink so the verb's
+    own #!/usr/bin/env python3 shebang still resolves, but nothing else -- no
+    gh, no uv."""
+    only_dir.mkdir()
+    (only_dir / "python3").symlink_to(sys.executable)
+    return {"HOME": str(home), "PATH": str(only_dir)}
+
+
+def run_bare(verb, env, args):
+    p = subprocess.run([str(BOX / "verbs" / verb)], input=json.dumps(args).encode(), env=env,
+                       capture_output=True, check=False)
+    return p.returncode, json.loads(p.stdout)
+
+
+def test_close_task_refuses_cleanly_when_gh_is_missing(tmp_path):
+    home, _ = home_with_repo(tmp_path)
+    env = _no_path_env(home, tmp_path / "no_gh")
+    rc, out = run_bare("close_task", env, {"repo": "fleet-fixture", "number": 1})
+    assert rc == 2 and "cannot run gh" in out["error"]
+
+
+def test_file_task_refuses_cleanly_when_uv_is_missing(tmp_path):
+    home, _ = home_with_repo(tmp_path)
+    env = _no_path_env(home, tmp_path / "no_uv")
+    rc, out = run_bare("file_task", env, {"repo": "fleet-fixture", "title": "t", "body": "b", "area": "docs", "cls": "patch"})
+    assert rc == 2 and "cannot run uv" in out["error"]

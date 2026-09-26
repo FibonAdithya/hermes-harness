@@ -33,7 +33,10 @@ class TaskError(ValueError):
 
 
 def real_gh(args: list[str], stdin: str | None = None) -> tuple[int, str, str]:
-    p = subprocess.run(["gh", *args], input=stdin, capture_output=True, text=True, check=False)
+    try:
+        p = subprocess.run(["gh", *args], input=stdin, capture_output=True, text=True, check=False)
+    except OSError as exc:
+        raise TaskError(f"cannot run gh: {exc}") from exc
     return p.returncode, p.stdout, p.stderr
 
 
@@ -69,8 +72,11 @@ def fleet_areas(repo: Path, home: Path) -> frozenset[str]:
     """The target's areas, read by fleet's own parser (fleet.policy.area_names)."""
     code = ("import json; from fleet.config import load_config; from fleet.policy import area_names; "
             "print(json.dumps(sorted(area_names(load_config()))))")
-    p = subprocess.run(["uv", "run", "--project", str(Path(home) / "TIG" / "fleet"), "python", "-c", code],
-                       cwd=repo, capture_output=True, text=True, check=False)
+    try:
+        p = subprocess.run(["uv", "run", "--project", str(Path(home) / "TIG" / "fleet"), "python", "-c", code],
+                           cwd=repo, capture_output=True, text=True, check=False)
+    except OSError as exc:
+        raise TaskError(f"cannot run uv: {exc}") from exc
     if p.returncode != 0:
         raise TaskError(f"could not read {Path(repo).name}'s areas: {p.stderr.strip()[-300:]}")
     return frozenset(json.loads(p.stdout.strip().splitlines()[-1]))
