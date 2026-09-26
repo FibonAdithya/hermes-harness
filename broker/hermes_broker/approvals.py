@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 _APPROVE = re.compile(r"^approve\s+(\d{4})$", re.IGNORECASE)
 _REVOKE = re.compile(r"^revoke$", re.IGNORECASE)
-_DEPLOY = re.compile(r"^deploy\s+([0-9a-f]{7,40})$", re.IGNORECASE)
+_DEPLOY = re.compile(r"^deploy\s+(?:(harness|fleet)\s+)?([0-9a-f]{7,40})$", re.IGNORECASE)
 _TASK = re.compile(r"^(task|solo|drop)\s+(\d{4})$", re.IGNORECASE)
 
 # Any of these on a message means it originated elsewhere.
@@ -55,7 +55,9 @@ def parse_command(update: dict, owner_id: int) -> tuple[str, str] | None:
         return ("approve", approve.group(1))
     deploy = _DEPLOY.match(text)
     if deploy:
-        return ("deploy", deploy.group(1).lower())
+        target = (deploy.group(1) or "harness").lower()
+        prefix = deploy.group(2).lower()
+        return ("deploy", f"{target}:{prefix}")
     task = _TASK.match(text)
     if task:
         return (task.group(1).lower(), task.group(2))
@@ -71,12 +73,18 @@ def handle(store: GrantStore, verb: str, arg: str, now: float) -> str:
         logger.info("all grants revoked by owner")
         return "Revoked. All boxes locked."
     if verb == "deploy":
-        sha = store.approve_deploy(arg, now)
+        # arg is "target:prefix" from parse_command; a bare prefix (no colon), as a
+        # caller invoking handle() directly may still pass, means target=harness.
+        target, sep, prefix = arg.partition(":")
+        if not sep:
+            target, prefix = "harness", target
+        sha = store.approve_deploy(prefix, now, target=target)
         if sha is None:
             logger.info("rejected deploy prefix")
-            return f"No pending deploy of a commit starting {arg}."
+            return f"No pending {target} deploy of a commit starting {prefix}."
         logger.info("deploy of %s approved", sha)
-        target = store.deploy_target()
+        # sha was granted for `target`: approve_deploy only grants on a target match,
+        # so there is no need to re-read the grant to learn its target.
         what = sha if target == "harness" else f"{target} {sha}"
         return f"Deploy of {what} to tig-server approved for {DEPLOY_GRANT_MINUTES} min."
     reason = store.pending_reason(arg)

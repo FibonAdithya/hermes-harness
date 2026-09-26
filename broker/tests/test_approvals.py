@@ -60,8 +60,9 @@ def test_missing_text_ignored():
 
 
 def test_deploy_is_parsed_lowercased():
-    assert parse_command(msg("deploy 91a2e06"), OWNER) == ("deploy", "91a2e06")
-    assert parse_command(msg(" Deploy 91A2E066C768 "), OWNER) == ("deploy", "91a2e066c768")
+    # amended 2026-09-26 in review: arg is now "target:prefix"; a bare deploy defaults to harness
+    assert parse_command(msg("deploy 91a2e06"), OWNER) == ("deploy", "harness:91a2e06")
+    assert parse_command(msg(" Deploy 91A2E066C768 "), OWNER) == ("deploy", "harness:91a2e066c768")
 
 
 def test_deploy_needs_seven_to_forty_hex():
@@ -84,7 +85,8 @@ def test_deploy_reply_names_the_full_commit(tmp_path):
     store = GrantStore(tmp_path / "grants.json")
     sha = "91a2e066c76837d9ac80243755ebc628993a0454"
     store.create_deploy_request(sha, now=1000.0)
-    assert handle(store, "deploy", "0000000", now=1001.0) == "No pending deploy of a commit starting 0000000."
+    # amended 2026-09-26 in review: mismatches now name the target being asked about
+    assert handle(store, "deploy", "0000000", now=1001.0) == "No pending harness deploy of a commit starting 0000000."
     assert handle(store, "deploy", "91a2e06", now=1002.0) == f"Deploy of {sha} to tig-server approved for 10 min."
     assert store.take_deploy_grant(now=1003.0) == sha
 
@@ -175,4 +177,43 @@ def test_fleet_deploy_reply_names_fleet(tmp_path):
     store = GrantStore(tmp_path / "g.json")
     sha = "91a2e066c76837d9ac80243755ebc628993a0454"
     store.create_deploy_request(sha, now=1000.0, target="fleet")
-    assert handle(store, "deploy", "91a2e06", now=1002.0) == f"Deploy of fleet {sha} to tig-server approved for 10 min."
+    # amended 2026-09-26 in review: the owner must now name the target; input changed, output did not
+    assert handle(store, "deploy", "fleet:91a2e06", now=1002.0) == f"Deploy of fleet {sha} to tig-server approved for 10 min."
+
+
+def test_bare_deploy_reply_does_not_approve_a_fleet_request(tmp_path):
+    """Fix round 1, item 1: a fleet request must not be approvable by an owner who typed a
+    bare `deploy <prefix>` believing it names a harness commit -- fleet main has no branch
+    protection, so a misread approval would be unrecoverable."""
+    from hermes_broker.approvals import handle
+    from hermes_broker.grants import GrantStore
+    store = GrantStore(tmp_path / "g.json")
+    sha = "91a2e066c76837d9ac80243755ebc628993a0454"
+    store.create_deploy_request(sha, now=1000.0, target="fleet")
+    assert handle(store, "deploy", "91a2e06", now=1001.0) == "No pending harness deploy of a commit starting 91a2e06."
+    # the request is still pending: naming the target now grants it
+    assert handle(store, "deploy", "fleet:91a2e06", now=1002.0) == f"Deploy of fleet {sha} to tig-server approved for 10 min."
+
+
+def test_deploy_fleet_reply_does_not_approve_a_harness_request(tmp_path):
+    from hermes_broker.approvals import handle
+    from hermes_broker.grants import GrantStore
+    store = GrantStore(tmp_path / "g.json")
+    sha = "91a2e066c76837d9ac80243755ebc628993a0454"
+    store.create_deploy_request(sha, now=1000.0, target="harness")
+    assert handle(store, "deploy", "fleet:91a2e06", now=1001.0) == "No pending fleet deploy of a commit starting 91a2e06."
+    assert handle(store, "deploy", "91a2e06", now=1002.0) == f"Deploy of {sha} to tig-server approved for 10 min."
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("deploy fleet abc1234", ("deploy", "fleet:abc1234")),
+    ("deploy harness abc1234", ("deploy", "harness:abc1234")),
+    ("deploy abc1234", ("deploy", "harness:abc1234")),
+    ("Deploy FLEET ABC1234", ("deploy", "fleet:abc1234")),
+])
+def test_deploy_reply_parses_the_named_target(text, expected):
+    assert parse_command(msg(text), OWNER) == expected
+
+
+def test_deploy_with_unknown_target_word_ignored():
+    assert parse_command(msg("deploy droplet abc1234"), OWNER) is None

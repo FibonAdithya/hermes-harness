@@ -73,21 +73,25 @@ def deploy_fleet(home: Path, sha: str) -> None:
         sys.exit(boxlib.refuse(f"main is at {main[:12]}, not the approved {sha[:12]}; request a new deploy"))
     previous = stamp.read_text().strip() if stamp.is_file() else g("rev-parse", "HEAD").stdout.strip()
 
-    def install(at: str) -> subprocess.CompletedProcess:
+    def install(at: str) -> tuple[str, subprocess.CompletedProcess]:
         for args in (("checkout", "-q", "main"), ("reset", "-q", "--hard", at)):
             r = g(*args)
             if r.returncode != 0:
-                return r
+                return f"git {args[0]}", r
         r = subprocess.run(["uv", "sync", "--locked", "--dev"], cwd=repo, capture_output=True, text=True, check=False)
         if r.returncode != 0:
-            return r
-        return subprocess.run(["make", "check"], cwd=repo, capture_output=True, text=True, check=False)
+            return "uv sync", r
+        return "make check", subprocess.run(["make", "check"], cwd=repo, capture_output=True, text=True, check=False)
 
-    r = install(sha)
+    step, r = install(sha)
     if r.returncode != 0:
         why = (r.stdout + r.stderr).strip()[-300:]
-        install(previous)
-        sys.exit(boxlib.refuse(f"make check failed at {sha[:12]}; back on {previous[:12]}: {why}"))
+        label = f"make check failed at {sha[:12]}" if step == "make check" else f"{step} failed"
+        _, rb = install(previous)
+        if rb.returncode != 0:
+            rb_why = (rb.stdout + rb.stderr).strip()[-300:]
+            sys.exit(boxlib.refuse(f"{label}; rollback to {previous[:12]} FAILED: {rb_why}"))
+        sys.exit(boxlib.refuse(f"{label}; back on {previous[:12]}: {why}"))
     stamp.parent.mkdir(parents=True, exist_ok=True)
     stamp.write_text(sha)
     print(json.dumps({"deployed": sha, "target": "fleet"}))

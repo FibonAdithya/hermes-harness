@@ -173,8 +173,10 @@ def request_deploy(sha: str, target: str = "harness") -> str:
 
     target is "harness" (hermes-harness master) or "fleet" (fleet main). sha is the
     full 40-character commit id. The owner approves by typing that commit's prefix
-    in the approvals chat; the approval covers that commit and target only, for one
-    deploy_harness() or deploy_fleet() call within 10 minutes.
+    in the approvals chat -- `deploy fleet <prefix>` for a fleet deploy, since a bare
+    `deploy <prefix>` is read as harness and never approves a fleet request. The
+    approval covers that commit and target only, for one deploy_harness() or
+    deploy_fleet() call within 10 minutes.
     """
     if target not in ("harness", "fleet"):
         return "target must be harness or fleet"
@@ -183,9 +185,10 @@ def request_deploy(sha: str, target: str = "harness") -> str:
         return "sha must be the full 40-character commit id"
     _store().create_deploy_request(sha, now=time.time(), target=target)
     what = "hermes-harness" if target == "harness" else "fleet"
+    reply_as = f"deploy {sha[:12]}" if target == "harness" else f"deploy fleet {sha[:12]}"
     return (
         f"Requested a deploy of {what} {sha} to tig-server.\n"
-        f"Ask the owner to read that commit and reply `deploy {sha[:12]}` "
+        f"Ask the owner to read that commit and reply `{reply_as}` "
         f"in the approvals chat within 2 minutes."
     )
 

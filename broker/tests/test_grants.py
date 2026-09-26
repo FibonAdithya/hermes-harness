@@ -167,7 +167,10 @@ SHA_F = "f" * 40
 
 def test_a_fleet_deploy_grant_is_not_a_harness_grant_and_is_not_spent_by_asking(store):
     store.create_deploy_request(SHA_F, now=1.0, target="fleet")
-    assert store.approve_deploy(SHA_F[:7], now=2.0) == SHA_F
+    # amended 2026-09-26 in review: a bare approval (target defaults to harness) must not
+    # grant a fleet request -- this is the exact vulnerability the review round fixed.
+    assert store.approve_deploy(SHA_F[:7], now=2.0) is None
+    assert store.approve_deploy(SHA_F[:7], now=2.0, target="fleet") == SHA_F
     assert store.deploy_target() == "fleet"
     assert store.take_deploy_grant(now=3.0) is None            # harness asks: refused, not consumed
     assert store.take_deploy_grant(now=3.0, target="fleet") == SHA_F
@@ -177,3 +180,19 @@ def test_a_fleet_deploy_grant_is_not_a_harness_grant_and_is_not_spent_by_asking(
 def test_unknown_deploy_target_rejected(store):
     with pytest.raises(ValueError):
         store.create_deploy_request(SHA_F, now=1.0, target="droplet")
+
+
+def test_approve_deploy_with_wrong_target_keeps_request_pending(store):
+    """Fix round 1, item 1 mutation target: drop the target comparison in approve_deploy."""
+    store.create_deploy_request(SHA_F, now=1000.0, target="fleet")
+    assert store.approve_deploy(SHA_F[:7], now=1001.0, target="harness") is None
+    assert store.approve_deploy(SHA_F[:7], now=1002.0, target="fleet") == SHA_F
+
+
+def test_expired_fleet_grant_is_consumed_and_gone(store):
+    """Fix round 1, item 4b."""
+    store.create_deploy_request(SHA_F, now=1000.0, target="fleet")
+    assert store.approve_deploy(SHA_F[:7], now=1000.0, target="fleet") == SHA_F
+    assert store.take_deploy_grant(now=1000.0 + 601, target="fleet") is None
+    # the grant is gone, not merely read as expired-in-place: a second ask also finds nothing
+    assert store.take_deploy_grant(now=1000.0 + 602, target="fleet") is None

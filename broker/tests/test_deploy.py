@@ -89,7 +89,8 @@ def test_deploy_fleet_uses_only_a_fleet_grant(fakes, store):
     server, calls, box_reply = fakes
     import time
     store.create_deploy_request(SHA, now=time.time(), target="fleet")
-    store.approve_deploy(SHA[:7], now=time.time())
+    # amended 2026-09-26 in review: approving a fleet request needs target="fleet" named
+    store.approve_deploy(SHA[:7], now=time.time(), target="fleet")
     with pytest.raises(Locked):
         server.deploy_harness()
     box_reply.clear()
@@ -103,3 +104,15 @@ def test_request_deploy_names_the_target(fakes, store):
     server, _, _ = fakes
     assert "fleet" in server.request_deploy(SHA, target="fleet")
     assert server.request_deploy(SHA, target="droplet").startswith("target must be")
+
+
+def test_deploy_fleet_does_not_consume_a_live_harness_grant(fakes, store):
+    """Fix round 1, item 4a."""
+    server, calls, _ = fakes
+    _approve(store)
+    with pytest.raises(Locked):
+        server.deploy_fleet()
+    assert calls == []
+    out = server.deploy_harness()
+    assert calls == [("box", "tig-server", "deploy", {"sha": SHA}, 900)]
+    assert out.startswith(f"tig-server: deployed {SHA[:12]}")

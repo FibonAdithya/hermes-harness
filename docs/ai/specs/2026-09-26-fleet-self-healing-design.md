@@ -261,8 +261,12 @@ changes its own CLI or the running daemon.
 3. `request_deploy(sha, target="harness")` gains `target` ∈ {`harness`,
    `fleet`}. The pending deploy and the resulting single-use grant record the
    target; the owner still replies `deploy <prefix>`, and the reply message
-   names the target. A new tool `deploy_fleet()` consumes a `fleet` grant;
-   `deploy_harness()` refuses one.
+   names the target. (Amended 2026-09-26 in review: for a fleet deploy the
+   owner must reply `deploy fleet <prefix>` — a bare `deploy <prefix>` is
+   read as `harness` and never approves a `fleet` request, since fleet `main`
+   has no branch protection and a misread approval would be unrecoverable.)
+   A new tool `deploy_fleet()` consumes a `fleet` grant; `deploy_harness()`
+   refuses one.
 4. The `deploy` verb takes `target`. For `fleet` it:
    - refuses unless `sha == origin/main`;
    - refuses while any fleet night unit is active;

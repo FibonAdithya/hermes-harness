@@ -109,8 +109,10 @@ class GrantStore:
         data["pending_deploy"] = {"sha": sha, "target": target, "expires_at": now + REQUEST_TTL_SECONDS}
         self._write(data)
 
-    def approve_deploy(self, prefix: str, now: float) -> str | None:
-        """Grant the pending deploy if `prefix` starts its commit. A mismatch keeps it pending."""
+    def approve_deploy(self, prefix: str, now: float, target: str = "harness") -> str | None:
+        """Grant the pending deploy if `prefix` starts its commit and `target` matches the
+        request's own target. A mismatch on either -- wrong prefix, or an owner naming the
+        wrong target -- keeps the request pending rather than granting it."""
         data = self._read()
         req = data.get("pending_deploy")
         if req is None:
@@ -118,6 +120,8 @@ class GrantStore:
         if req["expires_at"] <= now:
             data.pop("pending_deploy")
             self._write(data)
+            return None
+        if req.get("target", "harness") != target:
             return None
         prefix = prefix.lower()
         if len(prefix) < MIN_SHA_PREFIX or not req["sha"].startswith(prefix):

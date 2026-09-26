@@ -93,3 +93,41 @@ def test_unknown_target_refused(tmp_path):
     _, home, _, first, shims = setup(tmp_path)
     rc, out = run(home, shims, {"sha": first, "target": "droplet"})
     assert rc == 2 and out["error"] == "deploy target must be harness or fleet"
+
+
+def _flaky_uv(fail_on_call: int, message: str) -> str:
+    """A uv shim that fails on exactly the Nth invocation (1-based) and succeeds otherwise,
+    tracked with a counter file so the same shim can be used across install() and its rollback."""
+    return (
+        "#!/bin/sh\n"
+        f"n=$(cat \"$HOME/uv_count\" 2>/dev/null || echo 0); n=$((n+1))\n"
+        f"echo \"$n\" > \"$HOME/uv_count\"\n"
+        f"if [ \"$n\" -eq {fail_on_call} ]; then echo '{message}' >&2; exit 1; fi\n"
+        "echo \"uv $*\" >> \"$HOME/uv.log\"\n"
+    )
+
+
+def test_uv_sync_failure_is_labeled_and_rolled_back(tmp_path):
+    up, home, box, first, shims = setup(tmp_path)
+    want = commit(up, msg="second")
+    (shims / "uv").write_text(_flaky_uv(1, "uv sync exploded"))
+    (shims / "uv").chmod(0o755)
+    rc, out = run(home, shims, {"sha": want, "target": "fleet"})
+    assert rc == 2 and "uv sync failed" in out["error"] and "make check failed" not in out["error"]
+    assert git(box, "rev-parse", "HEAD") == first
+
+
+def test_rollback_failure_is_reported(tmp_path):
+    up, home, box, first, shims = setup(tmp_path)
+    red = commit(up, check_rc=1, msg="red")
+    # 1st uv sync call is install(red)'s -- let it pass so make check is what fails there;
+    # 2nd uv sync call is the rollback's -- make that one explode.
+    (shims / "uv").write_text(_flaky_uv(2, "uv sync exploded on rollback"))
+    (shims / "uv").chmod(0o755)
+    rc, out = run(home, shims, {"sha": red, "target": "fleet"})
+    assert rc == 2
+    assert f"make check failed at {red[:12]}" in out["error"]
+    assert f"rollback to {first[:12]} FAILED" in out["error"]
+    assert "uv sync exploded on rollback" in out["error"]
+    # the rollback's checkout/reset ran before its uv sync failed, so HEAD is back on first
+    assert git(box, "rev-parse", "HEAD") == first
