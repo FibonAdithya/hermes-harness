@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""Open fleet:triage issues in every repo under ~/TIG that has a fleet.toml. Ungated, read-only."""
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import boxlib  # noqa: E402
+import tasklib  # noqa: E402
+
+boxlib.read_json_stdin(sys.stdin.buffer)
+home = Path(os.environ.get("HOME", "/home/adi"))
+issues, ok, errors = [], [], []
+for repo in tasklib.fleet_repos(home):
+    try:
+        slug = tasklib.slug(repo)
+        rows = tasklib.triage(tasklib.real_gh, slug)
+    except (ValueError, TypeError) as exc:
+        errors.append(f"{repo.name}: {exc}")
+        continue
+    ok.append(repo.name)
+    issues += [{"repo": repo.name, "slug": slug, **r} for r in rows]
+print(json.dumps({"issues": issues, "repos_ok": ok, "errors": errors}))
