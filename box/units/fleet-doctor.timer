@@ -2,7 +2,9 @@
 Description=fleet-doctor hourly
 
 [Timer]
-OnCalendar=hourly
+# Half past, not on the hour: fleet-night.timer fires at 23:00, and a night that
+# is still starting reads stale. doctor.run also skips nights under 10 minutes old.
+OnCalendar=*:30
 Persistent=false
 
 [Install]

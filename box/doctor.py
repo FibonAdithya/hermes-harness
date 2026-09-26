@@ -11,6 +11,7 @@ import collections
 import hashlib
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -20,6 +21,7 @@ import tasklib
 MAX_NEW_ISSUES = 3
 EVIDENCE_LINES = 20
 S4_THRESHOLD = 3
+STARTING_GRACE_SECONDS = 600
 LOG_TAIL_BYTES = 256 * 1024
 # 21 evidence lines (20 plus one note) of at most 141 characters, a key of at
 # most 201 and the header come to about 3300, under tasklib.MAX_BODY (3500), so
@@ -161,8 +163,28 @@ def _body(night_id: str, fleet_sha: str, f: Finding) -> str:
             f"Key: `{_safe_key(f.key)}`\nSuggested reply: `{f.suggested}`\n\n```\n{fence}\n```\n")
 
 
-def run(home: Path, gh: tasklib.Gh) -> dict:
+def _started_at(d: Path) -> float:
+    """meta.json's started_at if it is a number, else the night dir's mtime."""
+    try:
+        meta = json.loads(boxlib.read_small(d / "meta.json", 65536) or "{}")
+        t = meta.get("started_at") if isinstance(meta, dict) else None
+        if isinstance(t, (int, float)) and not isinstance(t, bool):
+            return float(t)
+    except (ValueError, json.JSONDecodeError):
+        pass
+    return d.stat().st_mtime
+
+
+def _too_young(night: dict, d: Path, now: float) -> bool:
+    """start_night writes status before systemd-run starts the unit, so for a few
+    seconds a night that is starting reads `stale` (or `unknown`) with no log.
+    Leave it, unmarked, for a later run rather than file a false S2 no-log."""
+    return night["status"] in ("stale", "unknown") and now - _started_at(d) < STARTING_GRACE_SECONDS
+
+
+def run(home: Path, gh: tasklib.Gh, now: float | None = None) -> dict:
     home = Path(home)
+    now = time.time() if now is None else now
     root = boxlib.nights_root({"HOME": str(home)})
     fleet_dir = home / "TIG" / "fleet"
     fleet_slug = tasklib.slug(fleet_dir)
@@ -173,6 +195,8 @@ def run(home: Path, gh: tasklib.Gh) -> dict:
     for night in boxlib.read_status(root):
         d = root / night["id"]
         if not night["id"].startswith("fleet-") or night["status"] not in TERMINAL or (d / "doctored").exists():
+            continue
+        if _too_young(night, d, now):
             continue
         mine = {"filed": [], "commented": [], "skipped": 0}
         try:

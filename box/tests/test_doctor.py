@@ -308,3 +308,54 @@ def test_examine_keeps_at_most_evidence_lines_of_the_log(tmp_path):
     d = make_night(tmp_path, log=log)
     [f] = doctor.examine({"id": NIGHT, "status": "failed"}, d, tmp_path / "TIG" / "fleet-fixture")
     assert len(f.evidence) == doctor.EVIDENCE_LINES and f.evidence[-1] == "line 499"
+
+
+def _starting_night(tmp_path, status, started_at=1_000_000.0, meta=True):
+    fleet_repo(tmp_path)
+    d = make_night(tmp_path, status=status, log=None)
+    if meta:
+        (d / "meta.json").write_text(json.dumps({"kind": "fleet", "repo": "fleet-fixture", "started_at": started_at}))
+    else:
+        (d / "meta.json").unlink()
+    return d
+
+
+@pytest.mark.parametrize("status", ["stale", "unknown"])
+def test_a_young_starting_night_is_skipped_and_left_unmarked(tmp_path, monkeypatch, status):
+    """fleet-doctor.timer can fire while fleet-night.timer is starting a night: status
+    is written before systemd-run, so it reads stale/unknown with no log yet."""
+    import boxlib
+    monkeypatch.setattr(boxlib, "unit_active", lambda night_id: False)
+    d = _starting_night(tmp_path, None if status == "unknown" else "running")
+    gh = gh_for_fleet()
+    out = doctor.run(tmp_path, gh, now=1_000_000.0 + 599)
+    assert out["filed"] == [] and gh.issues == {}
+    assert not (d / "doctored").exists() and not (d / "doctor.json").exists()
+    # the same night, 11 minutes on, is examined
+    out = doctor.run(tmp_path, gh, now=1_000_000.0 + 660)
+    assert out["filed"] == [1] and "no-log" in gh.issues[1]["title"] and (d / "doctored").exists()
+
+
+def test_a_young_night_without_numeric_started_at_falls_back_to_the_dir_mtime(tmp_path, monkeypatch):
+    import os
+    import boxlib
+    monkeypatch.setattr(boxlib, "unit_active", lambda night_id: False)
+    d = _starting_night(tmp_path, "running", started_at="soon")
+    os.utime(d, (2_000_000.0, 2_000_000.0))
+    gh = gh_for_fleet()
+    assert doctor.run(tmp_path, gh, now=2_000_000.0 + 60)["filed"] == []
+    assert not (d / "doctored").exists()
+    assert doctor.run(tmp_path, gh, now=2_000_000.0 + 660)["filed"] == [1]
+
+
+def test_a_young_failed_night_is_examined_at_once(tmp_path):
+    """The grace applies only to stale/unknown: a night that already failed is done starting."""
+    fleet_repo(tmp_path)
+    make_night(tmp_path, status="failed", log=CRASH, runlog=[])
+    out = doctor.run(tmp_path, gh_for_fleet(), now=1.0 + 10)
+    assert out["filed"] == [1]
+
+
+def test_doctor_timer_is_off_the_hour():
+    timer = (Path(__file__).parent.parent / "units" / "fleet-doctor.timer").read_text()
+    assert "OnCalendar=*:30" in timer and "hourly" not in timer.replace("fleet-doctor hourly", "")
