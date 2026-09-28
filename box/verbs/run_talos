@@ -15,14 +15,15 @@ resume = a.get("resume")
 try:
     if resume is not None:
         # Talos reads these from the job's job.json and ignores them on a resume.
-        extra = sorted(k for k in ("challenge", "direction", "iterations", "compute_usd", "mode") if k in a)
+        extra = sorted(k for k in ("challenge", "direction", "iterations", "compute_usd", "mode", "nonces") if k in a)
         if extra:
             raise ValueError(f"resume takes only backend; drop {', '.join(extra)}")
         workdir, argv, secs = boxlib.talos_resume_command(home, resume, backend)
     else:
         workdir, argv, secs = boxlib.talos_command(
             home, a.get("challenge", ""), a.get("direction", ""), int(a.get("iterations", 10)), backend,
-            a.get("compute_usd", boxlib.DEFAULT_TALOS_COMPUTE_USD), a.get("mode", "single-shot"))
+            a.get("compute_usd", boxlib.DEFAULT_TALOS_COMPUTE_USD), a.get("mode", "single-shot"),
+            nonces=a.get("nonces"))
 except (ValueError, TypeError) as exc:
     sys.exit(boxlib.refuse(str(exc)))
 if not (workdir / "talos.config.json").is_file():

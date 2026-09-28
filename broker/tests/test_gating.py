@@ -114,7 +114,7 @@ def test_run_talos_refuses_new_run_arguments_alongside_resume(store, monkeypatch
 
     job = "20260924-230101-knapsack"
     for extra in ({"challenge": "hypergraph"}, {"direction": "d"}, {"iterations": 30}, {"iterations": 0},
-                  {"compute_usd": 10}, {"mode": "agentic"}):
+                  {"compute_usd": 10}, {"mode": "agentic"}, {"nonces": 1}):
         out = server.run_talos(resume=job, **extra)
         assert "resume" in out and next(iter(extra)) in out, (extra, out)
     assert sent == []
@@ -173,6 +173,20 @@ def test_run_talos_forwards_agentic_mode(store, monkeypatch):
     out = server.run_talos("knapsack", "d", 3, "c3", mode="agentic")
     assert sent[0][1]["mode"] == "agentic"
     assert "agentic" in out
+
+
+def test_run_talos_forwards_nonces_only_when_set(store, monkeypatch):
+    from hermes_broker import server
+
+    monkeypatch.setattr(server, "_store", lambda: store)
+    monkeypatch.setattr(server, "_target", lambda box: "tig-server")
+    sent = []
+    monkeypatch.setattr(server.box, "call", lambda t, v, a, timeout=60: sent.append((v, a)) or {"id": "talos-x"})
+    store.approve(store.create_request("tig-server", 30, "x", now=time.time()), now=time.time())
+    server.run_talos("knapsack", "d", 3, "c3", nonces=1)
+    assert sent[0][1]["nonces"] == 1
+    server.run_talos("knapsack", "d", 3, "c3")
+    assert "nonces" not in sent[1][1]
 
 
 def test_request_access_avoids_live_task_codes(store, tmp_path, monkeypatch):

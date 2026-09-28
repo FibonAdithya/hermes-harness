@@ -94,7 +94,7 @@ def run_fleet(repo: str, hours: int = 8) -> str:
 
 @mcp.tool()
 def run_talos(challenge: str = "", direction: str = "", iterations: int | None = None, backend: str = "local",
-              resume: str = "", compute_usd: float | None = None, mode: str = "") -> str:
+              resume: str = "", compute_usd: float | None = None, mode: str = "", nonces: int | None = None) -> str:
     """Start a Talos autoresearch run on the box. Requires a grant. backend is local, modal or c3.
 
     local is free. modal and c3 bill real money for compute: compute_usd caps it
@@ -106,6 +106,10 @@ def run_talos(challenge: str = "", direction: str = "", iterations: int | None =
     compiles that session runs are NOT counted in compute_usd. A pause of an
     agentic night can take up to 30 minutes to land.
 
+    nonces (optional, 1..64) sets the nonces per track in each of Talos's training
+    and held-out sets; omitted means Talos's default of 8. Fewer iterate faster
+    (nonces=1 is about 8x faster on a GPU challenge) but score less robustly.
+
     To continue a Talos job that stopped (paused, cancelled, failed, or cut off by
     the night's time limit), pass resume=<job id> and the backend it ran on, and
     nothing else: the job keeps its own challenge, direction and budget. The job
@@ -114,7 +118,7 @@ def run_talos(challenge: str = "", direction: str = "", iterations: int | None =
     require_grant(_store(), "tig-server", now=time.time())
     if resume:
         extra = [k for k, v in (("challenge", challenge), ("direction", direction), ("iterations", iterations),
-                                 ("compute_usd", compute_usd), ("mode", mode))
+                                 ("compute_usd", compute_usd), ("mode", mode), ("nonces", nonces))
                  if v not in ("", None)]
         if extra:
             return f"resume takes only backend; drop {', '.join(extra)}"
@@ -123,7 +127,7 @@ def run_talos(challenge: str = "", direction: str = "", iterations: int | None =
     r = box.call(_target("tig-server"), "run_talos",
                  {"challenge": challenge, "direction": direction, "iterations": int(30 if iterations is None else iterations),
                   "backend": backend, "compute_usd": float(5 if compute_usd is None else compute_usd),
-                  "mode": mode or "single-shot"})
+                  "mode": mode or "single-shot", **({"nonces": nonces} if nonces is not None else {})})
     return r.get("error") or (f"talos night {r['id']} started ({challenge}, {backend}, {mode or 'single-shot'}, compute capped at "
                               f"${5 if compute_usd is None else compute_usd:g}). Poll night_status().")
 

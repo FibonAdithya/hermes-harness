@@ -1,3 +1,5 @@
+import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -52,6 +54,35 @@ def test_talos_command_refuses_bad_inputs():
     for bad in [0, 501]:
         with pytest.raises(ValueError):
             boxlib.talos_command(HOME, "knapsack", "x", bad, "local")
+
+
+def test_talos_command_forwards_nonces():
+    _, argv, _ = boxlib.talos_command(HOME, "knapsack", "x", 1, "local", nonces=1)
+    assert argv[-3:] == ["--nonces", "1", "--yes"]
+    _, argv, _ = boxlib.talos_command(HOME, "knapsack", "x", 1, "c3", 40, "agentic", nonces=64)
+    assert argv[-5:] == ["--mode", "agentic", "--nonces", "64", "--yes"]
+
+
+def test_talos_command_without_nonces_leaves_talos_default():
+    _, argv, _ = boxlib.talos_command(HOME, "knapsack", "x", 1, "local")
+    assert "--nonces" not in argv
+    assert argv == boxlib.talos_command(HOME, "knapsack", "x", 1, "local", nonces=None)[1]
+
+
+def test_talos_command_refuses_bad_nonces():
+    for bad in [0, -1, 65, True]:
+        with pytest.raises(ValueError):
+            boxlib.talos_command(HOME, "knapsack", "x", 1, "local", nonces=bad)
+
+
+def test_run_talos_verb_refuses_nonces_alongside_resume(tmp_path):
+    """A resumed job keeps the nonce set frozen in its job.json."""
+    verb = Path(__file__).resolve().parents[1] / "verbs" / "run_talos"
+    args = {"resume": "20260924-230101-knapsack", "backend": "local", "nonces": 1}
+    proc = subprocess.run([str(verb)], input=json.dumps(args).encode(), env={"HOME": str(tmp_path)},
+                          capture_output=True, check=False)
+    assert proc.returncode == 2
+    assert "nonces" in json.loads(proc.stdout)["error"]
 
 
 def test_add_repo_check():
