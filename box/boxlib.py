@@ -213,6 +213,9 @@ TALOS_BACKENDS = ("local", "modal", "c3")
 TALOS_PAID_BACKENDS = ("c3",)
 MAX_FLEET_HOURS = 24
 MAX_TALOS_ITER = 500
+# Nonces per track in each of Talos's training and held-out sets. Unset leaves
+# Talos's own default (8); fewer iterate faster but score less robustly.
+MAX_TALOS_NONCES = 64
 TALOS_MODES = ("single-shot", "agentic")
 TALOS_STOP_SEC = 600
 # An agentic iteration is a claude session of up to 30 minutes; Talos sees a stop
@@ -251,7 +254,8 @@ def _compute_usd(v) -> float:
 
 
 def talos_command(home: Path, challenge: str, direction: str, iterations: int, backend: str,
-                  compute_usd: float = DEFAULT_TALOS_COMPUTE_USD, mode: str = "single-shot") -> tuple[Path, list[str], int]:
+                  compute_usd: float = DEFAULT_TALOS_COMPUTE_USD, mode: str = "single-shot",
+                  nonces: int | None = None) -> tuple[Path, list[str], int]:
     if challenge not in TALOS_CHALLENGES:
         raise ValueError(f"unknown challenge: {challenge!r}")
     if backend not in TALOS_BACKENDS:
@@ -263,10 +267,13 @@ def talos_command(home: Path, challenge: str, direction: str, iterations: int, b
     usd = _compute_usd(compute_usd)
     if mode not in TALOS_MODES:
         raise ValueError(f"mode must be one of {', '.join(TALOS_MODES)}: {mode!r}")
+    if nonces is not None and (isinstance(nonces, bool) or not 1 <= int(nonces) <= MAX_TALOS_NONCES):
+        raise ValueError(f"nonces must be 1..{MAX_TALOS_NONCES}: {nonces!r}")
     workdir = Path(home) / f"talos-{backend}"
     argv = [str(workdir / ".venv" / "bin" / "talos"), "run", "--challenge", challenge,
             "--direction", direction, "--budget-iterations", str(int(iterations)),
-            "--budget-compute-usd", str(usd), *(["--mode", "agentic"] if mode == "agentic" else []), "--yes"]
+            "--budget-compute-usd", str(usd), *(["--mode", "agentic"] if mode == "agentic" else []),
+            *(["--nonces", str(int(nonces))] if nonces is not None else []), "--yes"]
     return workdir, argv, 12 * 3600
 
 
