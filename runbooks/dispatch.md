@@ -1,9 +1,11 @@
 # Dispatch runbook
 
 Everything below runs on the droplet as the `hermes` user. If you reached the
-box through the DigitalOcean console you are `root` — run `sudo -iu hermes`
-first, or every `systemctl --user` command will look at root's manager and find
-nothing. No command here needs `sudo`.
+box through the DigitalOcean console you are `root` — run `sudo -iu hermes`,
+then `export XDG_RUNTIME_DIR=/run/user/$(id -u)`. Without the switch every
+`systemctl --user` command looks at root's manager and finds nothing; without
+the export it fails with "Failed to connect to bus: No medium found". Only
+deleting a stale repo mirror needs `sudo`.
 
 ## Granting and revoking
 
@@ -64,11 +66,46 @@ ssh tig-gpu /venv/main/bin/gpuq list
 
 `gpuq` is not on the PATH for a non-interactive shell; always use the full path.
 
+## The repo mirrors
+
+> **Not live yet (checked 2026-10-17).** The script, the units and the SOUL.md
+> section are installed, but the listing token was never created, the only run
+> was the deliberate no-credential failure on 2026-08-17, and the timer is
+> disabled. `/root/repos` does not exist, although SOUL.md tells the agent it
+> does. To finish: VM plan Task 18, Step 1 (token), then Steps 5–8. Until then
+> the commands below show a disabled timer and a failed service.
+
+The assistant reads your code at `/root/repos/<name>` in its sandbox
+(`~/.hermes/sandboxes/docker/default/home/repos` on the host). Every repo you own
+is mirrored every 30 minutes; a new repo appears on its own, and there is no list
+to maintain.
+
+```bash
+systemctl --user list-timers hermes-repo-sync.timer --no-pager
+journalctl --user -u hermes-repo-sync.service -n 40 --no-pager
+systemctl --user start hermes-repo-sync.service    # refresh now
+```
+
+- **A repo is missing.** Check the log for `FAILED clone <repo>`. If the whole run
+  says `FATAL: repo listing failed`, the listing token has expired — rotate it
+  below. If it says `previous run still going`, a slow pass is holding the lock;
+  that is normal, not an error.
+- **`STALE mirror: <name>`** means you renamed or deleted that repo. Nothing
+  removes it automatically, by design. Delete it yourself when you are sure:
+  `sudo rm -rf ~/.hermes/sandboxes/docker/default/home/repos/<name>`.
+- **The mirrors are replicas, not workspaces.** Every pass does `reset --hard`, so
+  anything written there is discarded. Do not keep work in them.
+
 ## Rotating credentials
 
 - **GitHub PAT** — regenerate the fine-grained token, then
   `ssh -t tig-server 'nano /etc/hermes-exec/github-token'`. Never pass it as a
   shell argument.
+- **Repo-listing PAT** (mirrors only, read-only, Metadata scope) — regenerate,
+  then `GH_CONFIG_DIR=~/.hermes/gh-config gh auth login --with-token` and paste
+  it. Verify with `GH_CONFIG_DIR=~/.hermes/gh-config gh api user -q .login`. This
+  token lives outside the agent's `/root` deliberately — do not move it into the
+  sandbox.
 - **Claude Code credential** — the executor mounts the box's own login,
   `~adi/.claude/.credentials.json`, read-only. Re-login with `ssh -t tig-adi claude`.
 - **Approvals bot token** — BotFather `/revoke`, then edit
@@ -80,7 +117,12 @@ ssh tig-gpu /venv/main/bin/gpuq list
 - `deploy_harness` without an approved deploy, or a second time on one
   approval → `LOCKED: no approved deploy`.
 - A cron job asking for access → it gets a code nobody approves, then `LOCKED`.
-- `curl` from inside the agent's sandbox → no network, by design.
+- `curl` from inside the agent's sandbox → no network, by design. Check the right
+  container: names are hashes, and the `prompt-backend-probe` one is on `bridge`
+  on purpose. Use
+  `docker ps --filter label=hermes-task-id=default --format '{{.Names}}'`, and
+  trust `.HostConfig.NetworkMode`, not the `hermes-egress` label.
+- A file the agent writes under `/root/repos` → gone on the next mirror pass.
 - A push to `master` from the executor → rejected by branch protection.
 - The executor merging its own pull request → **possible, accepted** (its token
   is the owner's, by decision). `harness-pull.timer` stays disabled on both
