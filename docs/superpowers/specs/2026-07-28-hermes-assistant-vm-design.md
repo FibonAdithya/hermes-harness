@@ -421,7 +421,10 @@ is not quietly misleading.
     **lingering** (`loginctl show-user hermes` → `Linger=yes`), not from the
     unit file — without it nothing starts until someone logs in. Note that the
     DigitalOcean console logs in as `root` by default, where `--user` targets
-    root's own manager and finds nothing; `sudo -iu hermes` first.
+    root's own manager and finds nothing; `sudo -iu hermes`, then
+    `export XDG_RUNTIME_DIR=/run/user/$(id -u)` (without the export,
+    `systemctl --user` fails with "Failed to connect to bus: No medium found";
+    verified 2026-10-17).
     `runbooks/recovery.md` was corrected on 2026-08-03.
 
 16. **The agent's own `cronjob` tool strips file and terminal tools from every
@@ -593,6 +596,13 @@ is not quietly misleading.
     prompt-injectable agent a working credential — and an allowlist limited to
     `github.com` would not help, since a token turns a gist or an issue body into
     an exfiltration channel.
+
+    **Status (checked 2026-10-17): designed, not live.** Task 18 stopped after
+    Steps 2–4 and 9: the script and units are installed and SOUL.md describes
+    the mirrors, but the listing PAT (Step 1) was never created, the service has
+    only run once (the intended no-credential failure), and the timer is
+    disabled. `/root/repos` does not exist. The rest of this entry describes
+    the design.
 
     Instead, a `hermes-repo-sync` timer clones every owned repo host-side into
     `/root/repos/<name>` every 30 minutes, using the same throwaway-root-container

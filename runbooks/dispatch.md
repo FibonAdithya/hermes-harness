@@ -1,9 +1,11 @@
 # Dispatch runbook
 
 Everything below runs on the droplet as the `hermes` user. If you reached the
-box through the DigitalOcean console you are `root` — run `sudo -iu hermes`
-first, or every `systemctl --user` command will look at root's manager and find
-nothing. No command here needs `sudo`.
+box through the DigitalOcean console you are `root` — run `sudo -iu hermes`,
+then `export XDG_RUNTIME_DIR=/run/user/$(id -u)`. Without the switch every
+`systemctl --user` command looks at root's manager and finds nothing; without
+the export it fails with "Failed to connect to bus: No medium found". Only
+deleting a stale repo mirror needs `sudo`.
 
 ## Granting and revoking
 
@@ -65,6 +67,13 @@ ssh tig-gpu /venv/main/bin/gpuq list
 `gpuq` is not on the PATH for a non-interactive shell; always use the full path.
 
 ## The repo mirrors
+
+> **Not live yet (checked 2026-10-17).** The script, the units and the SOUL.md
+> section are installed, but the listing token was never created, the only run
+> was the deliberate no-credential failure on 2026-08-17, and the timer is
+> disabled. `/root/repos` does not exist, although SOUL.md tells the agent it
+> does. To finish: VM plan Task 18, Step 1 (token), then Steps 5–8. Until then
+> the commands below show a disabled timer and a failed service.
 
 The assistant reads your code at `/root/repos/<name>` in its sandbox
 (`~/.hermes/sandboxes/docker/default/home/repos` on the host). Every repo you own

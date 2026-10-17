@@ -48,8 +48,11 @@ you need it. Verify you can still log into the console after any rebuild.
    `systemctl --user status hermes-gateway`,
    `journalctl --user -u hermes-gateway -n 100`, and `df -h` (a full disk is a
    common cause). If you logged into the console as `root` rather than
-   `hermes`, `--user` targets root's own manager and finds nothing; switch with
-   `machinectl shell hermes@` or `sudo -iu hermes` first.
+   `hermes`, `--user` targets root's own manager and finds nothing. Switch
+   with `sudo -iu hermes`, then `export XDG_RUNTIME_DIR=/run/user/$(id -u)`.
+   The export is required: without it every `systemctl --user` fails with
+   "Failed to connect to bus: No medium found", and `su - hermes` fails the
+   same way. `machinectl` is not installed on the droplet.
 
 3. **Console shows an unresponsive box?** Control panel → **Power** →
    **Power Cycle**. This is a power-pull; verified safe against this

@@ -14,6 +14,12 @@
 > delivering to Telegram, verified by a real run that read the calendar and
 > triaged live mail.
 >
+> **Task 18 (repo mirrors, 2026-08-17): partial, checked 2026-10-17.** Steps
+> 2–4 and 9 are done (script, units, the loud-failure check, the SOUL.md
+> section). Steps 1 and 5–8 are not: no listing PAT in `~/.hermes/gh-config`,
+> no successful run, timer disabled, `/root/repos` absent. SOUL.md therefore
+> tells the agent about mirrors that do not exist. Resume at Step 1.
+>
 > **Deviations from the plan as written:** the sandbox is additionally run with
 > `TERMINAL_DOCKER_NETWORK=false` (`--network=none`) to close the exfiltration
 > path; the wiki is cloned **host-side** rather than by the agent, since the
