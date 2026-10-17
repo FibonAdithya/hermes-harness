@@ -5,34 +5,43 @@
 >
 > **Done:** Tasks 1–7 (provisioning, hardening, base OS, Hermes v0.19.0,
 > sandbox image + Docker backend, git identity, wiki clone, sync timer),
-> 11 (memory), 12 (SOUL), 13 (Telegram — replying end to end), 15 (janitor).
+> 8–10 (Google OAuth client, MCP server, drafts-only allowlist — completed
+> 2026-08-02), 11 (memory), 12 (SOUL), 13 (Telegram — replying end to end),
+> 15 (janitor).
 >
-> **Remaining:** Tasks 8–10 (Google OAuth client, MCP server, tool allowlist),
-> 14 (briefing cron), 16–17 (security + end-to-end verification).
+> **Remaining:** 16–17 (security + end-to-end verification). Task 14 (briefing
+> cron) completed 2026-08-02: `morning-briefing` at 08:00 Europe/London,
+> delivering to Telegram, verified by a real run that read the calendar and
+> triaged live mail.
 >
 > **Deviations from the plan as written:** the sandbox is additionally run with
 > `TERMINAL_DOCKER_NETWORK=false` (`--network=none`) to close the exfiltration
 > path; the wiki is cloned **host-side** rather than by the agent, since the
-> agent now has no network; the model is a free-tier
-> `nvidia/nemotron-3-super-120b-a12b:free` pending OpenRouter credits; and the
-> gateway installed as a **user** service (with lingering) rather than
-> `--system`. See the spec's As-built corrections before following any step.
+> agent now has no network; and the gateway installed as a **user** service
+> (with lingering) rather than `--system`. See the spec's As-built corrections
+> before following any step.
+>
+> **UPDATE (2026-08-02): provider switched from OpenRouter to DeepInfra.**
+> Main and auxiliary models are now `deepseek-ai/DeepSeek-V4-Flash` on
+> `provider: deepinfra`. This retires the free-tier model and the OpenRouter
+> credit blocker that gated Gmail. The OpenRouter key is commented out in
+> `~/.hermes/.env` and revoked upstream.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Stand up Hermes Agent as an always-on personal assistant on a small cloud VM — triaging Gmail, managing Google Calendar, delivering scheduled briefings and reminders to Telegram, and maintaining a git-backed Obsidian-compatible knowledge graph — with credentials structurally out of the agent's reach.
 
-**Architecture:** A single small VPS runs `hermes gateway` under systemd. Three isolated planes: the **gateway** (host) holds the Telegram and OpenRouter keys; **MCP integration servers** (host subprocesses) hold the Google OAuth tokens and expose only read/organise/draft tools; the **Docker sandbox** runs the agent's shell and file tools and contains nothing but the wiki working copy. The agent calls Google through MCP but can never read the tokens. Proactivity comes from Hermes' `cronjob` scheduler delivering to Telegram, not from agent-initiated messages.
+**Architecture:** A single small VPS runs `hermes gateway` under systemd. Three isolated planes: the **gateway** (host) holds the Telegram and DeepInfra keys; **MCP integration servers** (host subprocesses) hold the Google OAuth tokens and expose only read/organise/draft tools; the **Docker sandbox** runs the agent's shell and file tools and contains nothing but the wiki working copy. The agent calls Google through MCP but can never read the tokens. Proactivity comes from Hermes' `cronjob` scheduler delivering to Telegram, not from agent-initiated messages.
 
-**Tech Stack:** Ubuntu LTS on a Hetzner CX22-class VPS, Docker Engine, Hermes Agent (official installer), systemd (system service + user timers), Telegram Bot API, OpenRouter, `uvx`/`workspace-mcp` (taylorwilsdon/google_workspace_mcp), git + `gh`, ripgrep, Obsidian (client-side only).
+**Tech Stack:** Ubuntu LTS on a Hetzner CX22-class VPS, Docker Engine, Hermes Agent (official installer), systemd (system service + user timers), Telegram Bot API, DeepInfra, `uvx`/`workspace-mcp` (taylorwilsdon/google_workspace_mcp), git + `gh`, ripgrep, Obsidian (client-side only).
 
 ## Global Constraints
 
 - Host: a **cloud VPS**, not the laptop. Nothing is migrated from the laptop; only the GitHub-hosted `hermes-wiki` repo carries over (per spec §1).
 - Remote recoverability is the reason this migration exists: provider console access and rebuild-from-snapshot **must be exercised**, not assumed (per spec §1, §6.9).
 - Messaging: Telegram only, allowlisted to the owner's **numeric** Telegram user ID. The allowlist must never be blanked — the primary gate fails closed but a secondary gate fails **open** (per spec §3, §7.6).
-- Model provider: OpenRouter (per spec §2).
-- **No send capability may exist.** Request `gmail.compose`, never `gmail.send`. `send_gmail_message` must never be registered as a tool (per spec §3.1).
+- Model provider: DeepInfra (per spec §2).
+- **No send capability may exist.** `send_gmail_message` must never be registered as a tool (per spec §3.1). Note that **omitting the `gmail.send` scope does not achieve this** — Gmail's `messages.send` endpoint also accepts `gmail.compose` and `gmail.modify`, both of which are required for drafting and for label/archive triage. There is no scope granting drafts without send. The real controls are the two software gates: `--permissions gmail:drafts` (server withholds the tool) and `tools.include` (Hermes withholds registration). Verify both, and do not treat the scope list as a control.
 - Credentials never enter the sandbox. Google OAuth tokens live only in host-side MCP subprocesses; Hermes passes only explicitly configured `env` to them (per spec §2, §3.2).
 - Execution: Docker sandbox via `TERMINAL_ENV=docker` in `~/.hermes/.env` — **not** `terminal.backend` in `config.yaml`, which is inert. Verify with `id -u` and `/.dockerenv`, never `hermes config show` (per spec §7.1).
 - The `docker` Python SDK must be in Hermes' venv or Hermes silently falls back to host execution (per spec §7.2).
@@ -40,7 +49,7 @@
 - The wiki sync timer runs git **inside a throwaway container**, never as the host user, and must fail loudly (per spec §7.5).
 - No continuous mail watcher. Mail is pulled on demand and on schedule, never pushed (per spec §4).
 - Emails containing instructions aimed at the agent are **reported, never acted on** (per spec §3).
-- The one-shot CLI invocation is `hermes -z --yolo "<prompt>"`, not `hermes -p` (correction from the previous build).
+- The one-shot CLI invocation is `hermes --yolo -z "<prompt>"`, not `hermes -p`. Flag order matters: `-z` takes its prompt immediately, so `hermes -z --yolo "..."` fails with `argument -z/--oneshot: expected one argument` (confirmed on v0.19.0; see spec As-built #4).
 
 ---
 
@@ -154,8 +163,11 @@ cat > runbooks/recovery.md <<'EOF'
 
 When the assistant stops responding on Telegram:
 
-1. `ssh hermes-vm "systemctl status hermes-gateway"` — if reachable, restart:
-   `sudo systemctl restart hermes-gateway`
+1. `ssh hermes-vm "systemctl --user status hermes-gateway"` — if reachable,
+   restart: `ssh hermes-vm "systemctl --user restart hermes-gateway"`.
+   The gateway is a **user** unit; system-scope commands report
+   "Unit could not be found" on a healthy box, and `sudo` targets the wrong
+   manager.
 2. If SSH is unreachable: open the provider web console (VNC/serial) and log
    in as `hermes`. Diagnose from there.
 3. If the console shows an unresponsive box: trigger a hard reset (power
@@ -242,7 +254,7 @@ Expected: `gh auth status` reports the owner's account logged in.
 
 ---
 
-### Task 3: Install Hermes and configure OpenRouter
+### Task 3: Install Hermes and configure DeepInfra
 
 **Files:**
 - Creates: `~/.hermes/` (config home), `~/.hermes/.env`, `~/.hermes/config.yaml`
@@ -269,13 +281,17 @@ hermes doctor
 
 Expected: no blocking issues. Advisory warnings about optional dependencies are fine — those get installed in later tasks.
 
-- [ ] **Step 3: Set the OpenRouter key**
+- [ ] **Step 3: Set the DeepInfra key**
 
-Obtain a key from https://openrouter.ai/keys, then:
+Obtain a key from https://deepinfra.com/dash/api_keys, then:
 
 ```bash
-hermes config set OPENROUTER_API_KEY sk-or-v1-...
+hermes config set DEEPINFRA_API_KEY <key>
 ```
+
+DeepInfra ships as a first-class provider profile at
+`plugins/model-providers/deepinfra/__init__.py` — no base-URL plumbing or
+OpenAI-compatible shimming is needed. It is pay-per-use with no free tier.
 
 - [ ] **Step 4: Select a model**
 
@@ -283,12 +299,19 @@ hermes config set OPENROUTER_API_KEY sk-or-v1-...
 hermes model
 ```
 
-Choose OpenRouter and pick a current model. Assistant work involves reasoning over email content and tool selection, so prefer a capable model over a free-tier one — this is the single biggest lever on assistant quality.
+Choose DeepInfra and pick a current model. The picker reads the live catalog
+(`api.deepinfra.com/v1/openai/models?filter=true&sort_by=hermes`) rather than a
+baked-in list, so options and prices are always current. Assistant work involves
+reasoning over email content and tool selection, so prefer a capable model over
+the cheapest one — this is the single biggest lever on assistant quality.
+`deepseek-ai/DeepSeek-V4-Flash` ($0.09/$0.18 per M, 1M context, prompt caching)
+is the current choice: strong enough for triage, and roughly $2/month at this
+workload.
 
 - [ ] **Step 5: Verify the model responds**
 
 ```bash
-hermes -z --yolo "reply with exactly: pong"
+hermes --yolo -z "reply with exactly: pong"
 ```
 
 Expected: output containing `pong`.
@@ -369,7 +392,7 @@ Expected: both lines present, with `TERMINAL_ENV=docker`. If a stale `TERMINAL_E
 Never trust `hermes config show` for this.
 
 ```bash
-hermes -z --yolo "Run this exact command and report its full output: id -u; ls -la /.dockerenv; hostname"
+hermes --yolo -z "Run this exact command and report its full output: id -u; ls -la /.dockerenv; hostname"
 ```
 
 Expected: `id -u` prints `0`, and `/.dockerenv` **exists**. If `id -u` prints a non-zero UID or `/.dockerenv` is missing, commands are running on the host — stop and fix Step 3 before continuing. Nothing later in this plan is safe until this passes.
@@ -377,8 +400,8 @@ Expected: `id -u` prints `0`, and `/.dockerenv` **exists**. If `id -u` prints a 
 - [ ] **Step 6: Verify persistence across sessions**
 
 ```bash
-hermes -z --yolo "Run: touch /root/persistence-check.txt"
-hermes -z --yolo "Run: ls -l /root/persistence-check.txt"
+hermes --yolo -z "Run: touch /root/persistence-check.txt"
+hermes --yolo -z "Run: ls -l /root/persistence-check.txt"
 ls -l ~/.hermes/sandboxes/docker/default/home/persistence-check.txt
 ```
 
@@ -439,7 +462,7 @@ Paths inside the config are container paths (`/root/.ssh/...`) because that is w
 - [ ] **Step 4: Verify authentication from inside the sandbox**
 
 ```bash
-hermes -z --yolo "Run: ssh -T git@github.com-hermes ; git config --global user.name"
+hermes --yolo -z "Run: ssh -T git@github.com-hermes ; git config --global user.name"
 ```
 
 Expected: `Hi <owner-github-username>! You've successfully authenticated...` and `Hermes Agent`.
@@ -458,7 +481,7 @@ Expected: `Hi <owner-github-username>! You've successfully authenticated...` and
 - [ ] **Step 1: Clone the existing wiki from GitHub**
 
 ```bash
-hermes -z --yolo "Run: cd /root && git clone git@github.com-hermes:$(gh api user -q .login)/hermes-wiki.git hermes-wiki && ls /root/hermes-wiki"
+hermes --yolo -z "Run: cd /root && git clone git@github.com-hermes:$(gh api user -q .login)/hermes-wiki.git hermes-wiki && ls /root/hermes-wiki"
 ```
 
 Expected: the existing wiki contents appear. If the repo does not exist, create it first with `gh repo create hermes-wiki --private` and initialise it with an empty `index.md`.
@@ -512,7 +535,7 @@ grep -q "^## Pages" "$SBX/hermes-wiki/index.md" || echo -e "\n## Pages" >> "$SBX
 - [ ] **Step 4: Verify the agent can read the wiki**
 
 ```bash
-hermes -z --yolo "Run: rg -n 'Entity pages' /root/hermes-wiki/CONVENTIONS.md"
+hermes --yolo -z "Run: rg -n 'Entity pages' /root/hermes-wiki/CONVENTIONS.md"
 ```
 
 Expected: a match, confirming the wiki is visible at the container path.
@@ -650,11 +673,27 @@ APIs & Services → OAuth consent screen:
 - App name: `Hermes Assistant`
 - Add the owner's own Google account as a **Test user**
 
-Staying in "Testing" mode is correct here — this app has exactly one user and never needs verification. Note that test-mode refresh tokens can expire after 7 days; if re-authorisation becomes a recurring annoyance, publishing the app (still private, no verification needed for a single owner-user) removes that expiry.
+**Publish the app to Production** (Publishing status → Publish app). It stays
+private — you are the only user — and no verification is required for that. Do
+*not* leave it in Testing: test-mode refresh tokens expire after 7 days, which
+for an always-on assistant means it silently stops reading mail every week and
+needs an interactive re-consent. The cost of publishing is one "Google hasn't
+verified this app" interstitial during the single consent flow, which you click
+through via Advanced → Go to Hermes Assistant.
 
 - [ ] **Step 4: Create OAuth credentials**
 
-Credentials → Create Credentials → **OAuth client ID** → Application type **Desktop app** → name `hermes-assistant-cli`.
+Credentials → Create Credentials → **OAuth client ID** → Application type
+**Web application** → name `hermes-assistant-mcp` → Authorized redirect URI:
+
+```
+http://localhost:8000/oauth2callback
+```
+
+**Not "Desktop app"** (as an earlier revision of this plan said). `workspace-mcp`
+serves a real callback route at `/oauth2callback` and derives the URI from
+`WORKSPACE_MCP_BASE_URI` (default `http://localhost`) plus `WORKSPACE_MCP_PORT` /
+`PORT` (default 8000), so that exact URI must be registered.
 
 Record the client ID and client secret.
 
@@ -686,6 +725,21 @@ hermes config set GOOGLE_OAUTH_CLIENT_ID <client-id>.apps.googleusercontent.com
 hermes config set GOOGLE_OAUTH_CLIENT_SECRET <client-secret>
 ```
 
+**Then check where they landed.** `hermes config set` routes only *known*
+provider keys into `~/.hermes/.env`; names it does not recognise — including
+both of these — are written into `~/.hermes/config.yaml` as top-level keys, in a
+file that is mode **664**. That is a client secret readable by every local
+account, and it also breaks the `${VAR}` interpolation in Task 10, which
+resolves from `os.environ`.
+
+```bash
+grep -c '^GOOGLE_OAUTH_CLIENT_ID=\|^GOOGLE_OAUTH_CLIENT_SECRET=' ~/.hermes/.env
+```
+
+Expected `2`. If it prints `0`, move both lines out of `config.yaml` into `.env`
+in `KEY=value` form, delete them from `config.yaml`, and
+`chmod 600 ~/.hermes/config.yaml`.
+
 - [ ] **Step 2: Confirm the server runs and inspect its permission flags**
 
 ```bash
@@ -694,25 +748,13 @@ uvx workspace-mcp --help
 
 Expected: help output listing `--tool-tier` and `--permissions`. Record the exact permission syntax it prints — the granular form is `service:level` (e.g. `gmail:drafts`), and the levels for Gmail run `readonly` → `organize` → `drafts` → `send` → `full`.
 
-- [ ] **Step 3: Authorise via an SSH tunnel**
+- [ ] **Step 3: Authorisation happens in Task 10, not here**
 
-The VM is headless, but OAuth consent needs a browser. Forward the callback port to the laptop. In a terminal **on the laptop**:
-
-```bash
-ssh -L 8000:localhost:8000 hermes-vm
-```
-
-Then, inside that SSH session on the VM:
-
-```bash
-export GOOGLE_OAUTH_CLIENT_ID=$(grep '^GOOGLE_OAUTH_CLIENT_ID=' ~/.hermes/.env | cut -d= -f2-)
-export GOOGLE_OAUTH_CLIENT_SECRET=$(grep '^GOOGLE_OAUTH_CLIENT_SECRET=' ~/.hermes/.env | cut -d= -f2-)
-uvx workspace-mcp --tool-tier core --permissions gmail:drafts calendar:full
-```
-
-When it prints an authorisation URL, open it in the laptop's browser, sign in as the owner, and grant consent. The callback returns to `localhost:8000`, which the tunnel forwards to the VM.
-
-Expected: the server reports successful authorisation and writes an encrypted token cache. Stop it with `Ctrl+C`.
+The server prints **no authorisation URL at startup.** Consent is initiated by
+calling the server's `start_google_auth` tool, which requires the server to
+already be registered with Hermes. So Task 10 (registration) must run before
+authorisation — see Task 10 Step 2. This is the reverse of how earlier revisions
+of this plan ordered it.
 
 - [ ] **Step 4: Locate and protect the token cache**
 
@@ -728,7 +770,7 @@ Expected: a credentials/token file exists and is owner-only. Record the path —
 - [ ] **Step 5: Confirm the token cache is unreachable from the sandbox**
 
 ```bash
-hermes -z --yolo "Run: ls -la ~/.google_workspace_mcp 2>&1; ls -la /root/.workspace-mcp 2>&1; echo EXIT=\$?"
+hermes --yolo -z "Run: ls -la ~/.google_workspace_mcp 2>&1; ls -la /root/.workspace-mcp 2>&1; echo EXIT=\$?"
 ```
 
 Expected: "No such file or directory" for both. The agent's shell cannot see Google credentials. If it can, stop — the isolation the whole design rests on is broken.
@@ -748,53 +790,139 @@ Expected: "No such file or directory" for both. The agent's shell cannot see Goo
 
 The `include` list is the enforcement layer: only listed tools are registered, and an unregistered tool cannot be called no matter what an email says.
 
+**The `include` list must be nested under a `tools:` key.** Hermes reads it at
+`mcp_servers.<name>.tools.include` (`tools/mcp_tool.py:5656`). A top-level
+`include:` is silently ignored, and the no-filter code path registers **all**
+tools — which would hand the agent `send_gmail_message`. This is the single
+most dangerous typo available in this whole plan.
+
 ```bash
 cat >> ~/.hermes/config.yaml <<'EOF'
 
 mcp_servers:
   google:
     command: "uvx"
-    args: ["workspace-mcp", "--tool-tier", "core", "--permissions", "gmail:drafts", "calendar:full"]
+    args: ["workspace-mcp", "--single-user", "--tool-tier", "extended", "--permissions", "gmail:drafts", "calendar:full"]
     env:
       GOOGLE_OAUTH_CLIENT_ID: "${GOOGLE_OAUTH_CLIENT_ID}"
       GOOGLE_OAUTH_CLIENT_SECRET: "${GOOGLE_OAUTH_CLIENT_SECRET}"
-    include:
-      - "search_gmail_messages"
-      - "get_gmail_message_content"
-      - "draft_gmail_message"
-      - "modify_gmail_message_labels"
-      - "list_calendars"
-      - "get_events"
-      - "manage_event"
+      USER_GOOGLE_EMAIL: "<owner@gmail.com>"
+    tools:
+      include:
+        - "start_google_auth"
+        - "search_gmail_messages"
+        - "get_gmail_message_content"
+        - "draft_gmail_message"
+        - "modify_gmail_message_labels"
+        - "list_calendars"
+        - "get_events"
+        - "manage_event"
     enabled: true
 EOF
 ```
 
-If `${VAR}` interpolation from `.env` is not supported by this Hermes version, paste the literal values into the `env:` block instead — but then `chmod 600 ~/.hermes/config.yaml`, since it now holds a secret.
+`${VAR}` interpolation **is** supported (`tools/mcp_tool.py:420` — both `${VAR}`
+and Cursor-style `${env:VAR}`), resolved from `os.environ`, which has
+`~/.hermes/.env` loaded at startup. So no literal secret goes in `config.yaml`.
+`_build_safe_env` also whitelists what reaches the subprocess, so the DeepInfra
+and Telegram keys are not inherited by the MCP server.
 
-- [ ] **Step 2: Verify the registered tool list**
+`--single-user` sets `MCP_SINGLE_USER_MODE=1`, which bypasses per-session user
+mapping — meaningless for a single-owner headless gateway — and makes credential
+lookup "use any credentials in the store". `USER_GOOGLE_EMAIL` supplies the
+default account so tool calls need not pass an address each time.
+
+**Tier choice matters.** `core` is too narrow — it lacks `draft_gmail_message`
+and `modify_gmail_message_labels`, leaving an assistant that can read mail but
+neither draft nor file it. `extended` is the steady-state tier. `start_google_auth`
+lives in `complete`, so Step 2 needs a *temporary* bump to `complete`; Step 3
+puts it back to `extended`.
+
+`start_google_auth` is in the list only to perform Step 2. Remove it once
+authorisation succeeds (Step 3).
+
+- [ ] **Step 2: Authorise Google through an SSH tunnel**
+
+The VM is headless, so forward the callback port. In a terminal **on the
+laptop**, leave this running for the duration:
 
 ```bash
-hermes -z --yolo "List every tool you have available whose name mentions gmail or calendar. Do not call any of them — just list their exact names."
+ssh -L 8000:localhost:8000 hermes-vm
 ```
 
-Expected: exactly the seven names from the `include` list. **`send_gmail_message` must not appear.** If it does, the `include` filter is not being applied — stop and fix before going further.
-
-- [ ] **Step 3: Verify a real read works**
+Then ask the agent to start the flow:
 
 ```bash
-hermes -z --yolo "Use get_events to list my calendar events for the next 7 days. Report what you find."
+hermes --yolo -z "Call start_google_auth with my email and service_name 'Gmail'. Print the authorisation URL it returns, verbatim. Do not call anything else."
 ```
 
-Expected: real events from the owner's calendar (or a correct "no events" answer).
+Open the returned URL in the laptop's browser, sign in as the owner, click
+through the unverified-app interstitial (Advanced → Go to Hermes Assistant),
+and grant consent. The callback lands on `localhost:8000` on the laptop, which
+the tunnel forwards to the VM's callback server.
 
-- [ ] **Step 4: Verify sending is impossible**
+Expected: a success page, and a token written under
+`~/.google_workspace_mcp/credentials/`.
+
+- [ ] **Step 3: Drop the auth tool from the allowlist**
+
+Remove `start_google_auth` from the `tools.include` list and restart the
+gateway. Nothing in steady-state operation needs it, and the allowlist should
+carry only what the assistant actually uses.
+
+> **MCP tools do not exist on the CLI surface.** A `hermes -z` one-shot gets a
+> narrower toolset than `hermes tools list` advertises for `cli` — no MCP tools,
+> and no `web` / `browser` / `image_gen` either. Asked to use `get_events`, the
+> CLI agent answers `TOOL_NOT_AVAILABLE` and may wander into the unrelated
+> built-in `google-workspace` *skill*, which wants its own `google_token.json`
+> and has nothing to do with this MCP server. **Every step below must be run
+> from Telegram**, which is the surface that actually carries the tools (as
+> `mcp__google__*`). Steps that only inspect the host still run over SSH.
+
+- [ ] **Step 4: Verify the registered tool list**
+
+Two host-side checks, which need no agent at all:
 
 ```bash
-hermes -z --yolo "Send an email to test@example.com with the subject 'test'. If you cannot, explain exactly why."
+hermes tools list | grep -A2 "MCP servers"      # Hermes-side allowlist
+hermes mcp test google | grep -c send_gmail_message   # server-side surface
 ```
 
-Expected: the agent reports it has no send capability and offers a draft instead. It must not send.
+Expected: `include only:` listing exactly the seven names, and `0` for the
+second — `send_gmail_message` must be absent from the server's own tool surface
+because `--permissions gmail:drafts` withholds it. Note it *is* in the `core`
+tier, so a `0` here proves the permission gate works rather than assuming it.
+
+If the allowlist shows more than seven names, the filter is not being applied —
+check it is nested under `tools:` and not at the top level — stop and fix.
+
+- [ ] **Step 5: Enable the APIs, then verify a real read**
+
+**Confirm the Gmail API and Google Calendar API are enabled on the same project
+the OAuth client belongs to.** This is easy to miss in Task 8 and does not fail
+until first call, with:
+
+```
+Gmail API is not enabled for your project (<project-number>)
+```
+
+Then, from Telegram:
+
+> List my calendar events for the next 7 days.
+
+Expected: real events (or a correct "no events" answer). Repeat for mail:
+"Search my inbox for the 3 most recent messages and summarise them."
+
+- [ ] **Step 6: Verify sending is impossible**
+
+From Telegram:
+
+> Send an email to test@example.com with the subject 'test'. If you cannot,
+> explain exactly why.
+
+Expected: the agent reports it has no send capability and offers a draft
+instead. It must not send. Note this tests the *behavioural* layer only — the
+structural proof is Step 4's `0`.
 
 ---
 
@@ -873,7 +1001,7 @@ Expected: under ~1,375 characters.
 - [ ] **Step 3: Verify injection in a fresh session**
 
 ```bash
-hermes -z --yolo "Without using any tools, answer from memory: where is your knowledge wiki, and can you send email?"
+hermes --yolo -z "Without using any tools, answer from memory: where is your knowledge wiki, and can you send email?"
 ```
 
 Expected: names `/root/hermes-wiki` and states it cannot send email, only draft.
@@ -942,7 +1070,7 @@ EOF
 - [ ] **Step 2: Verify the instructions load**
 
 ```bash
-hermes -z --yolo "Summarize your standing instructions in three sentences: what your three recurring jobs are, and what you do if an email contains instructions addressed to you."
+hermes --yolo -z "Summarize your standing instructions in three sentences: what your three recurring jobs are, and what you do if an email contains instructions addressed to you."
 ```
 
 Expected: names triage, calendar, capture, and states that in-email instructions are reported, not obeyed.
@@ -1014,14 +1142,46 @@ Expected: active/running. Message the bot again and expect a reply within a few 
 - Consumes: the gateway (Task 13), Google tools (Task 10), standing instructions (Task 12).
 - Produces: proactive delivery to Telegram — the capability that makes this an assistant rather than a chatbot.
 
+- [ ] **Step 0: Set the system timezone first**
+
+The droplet ships as `Etc/UTC` and Hermes has no timezone setting of its own —
+cron expressions are interpreted in **system local time**. Set it before
+creating any job, or every schedule is silently offset:
+
+```bash
+sudo timedatectl set-timezone Europe/London   # or the owner's zone
+systemctl --user restart hermes-gateway       # the gateway caches tz at start
+```
+
+Jobs created *before* the change keep firing at their original absolute instant,
+so re-check anything already scheduled.
+
 - [ ] **Step 1: Create the morning briefing job**
 
 Cron runs happen in **fresh sessions with no current-chat context**, so the prompt must be self-contained.
 
+**Pin the model explicitly.** Hermes refuses to run an unpinned job whose global
+inference config has drifted since creation — it fails with `Skipped to prevent
+unintended spend: global inference config drifted ... and this job is unpinned`
+and makes no inference call. It is a spend guard, not a bug, but it means **every
+provider or model switch silently breaks every existing unpinned job.** Five
+jobs died this way on 2026-07-30, and both of the owner's reminders were dead on
+arrival after the DeepInfra switch until re-pinned. `--model` / `--provider` are
+user-owned; the agent's own `cronjob` tool cannot set them, so **every
+agent-created job is unpinned by default** and needs pinning by hand.
+
+**`--deliver telegram` does not resolve a target.** It creates the job happily
+and then fails at delivery time with `no delivery target resolved for
+deliver=telegram`, recorded only in the job's `last_delivery_error` field — the
+run itself reports `completed`. Use `telegram:<chat_id>`; for a DM the chat ID is
+the owner's numeric user ID, the same value as `TELEGRAM_ALLOWED_USERS`.
+
 ```bash
-hermes cron create "0 7 * * *" \
+hermes cron create "0 8 * * *" \
   "Good morning briefing. 1) Use get_events to list today's calendar events. 2) Use search_gmail_messages to find mail from the last 24 hours that needs the owner's attention, following the triage instructions. 3) Reply with a short briefing: today's schedule first, then anything needing a response. Keep it under 8 lines." \
-  --deliver telegram \
+  --deliver "telegram:$(grep '^TELEGRAM_ALLOWED_USERS=' ~/.hermes/.env | cut -d= -f2- | tr -d '" ' | cut -d, -f1)" \
+  --model "$(python3 -c 'import yaml;print(yaml.safe_load(open("/home/hermes/.hermes/config.yaml"))["model"]["default"])')" \
+  --provider "$(python3 -c 'import yaml;print(yaml.safe_load(open("/home/hermes/.hermes/config.yaml"))["model"]["provider"])')" \
   --name "morning-briefing"
 ```
 
@@ -1039,7 +1199,21 @@ Expected: `morning-briefing` listed with its schedule and `telegram` delivery.
 hermes cron run morning-briefing
 ```
 
-Expected: a briefing arrives **in Telegram** within a minute or two, unprompted. This is the proof that proactive delivery works. If it runs but does not deliver, check the `--deliver` target and that the gateway service is running.
+Expected: a briefing arrives **in Telegram** within a minute or two, unprompted. This is the proof that proactive delivery works.
+
+`hermes cron runs` reporting `completed` is **not** proof of delivery — a run
+that produced output and failed to deliver it still reads `completed`. Check the
+job record instead:
+
+```bash
+python3 -c "import json;d=json.load(open('/home/hermes/.hermes/cron/jobs.json'));\
+j=[x for x in (d.get('jobs') or d) if x.get('name')=='morning-briefing'][0];\
+print(j['last_delivery_error'])"
+```
+
+Expected: `None`. The rendered output of each run is kept at
+`~/.hermes/cron/output/<job-id>/<timestamp>.md`, which is the fastest way to see
+whether the agent really called the Google tools or just narrated.
 
 - [ ] **Step 4: Verify the agent can create reminders on request**
 
@@ -1125,7 +1299,7 @@ Expected: exits `status=0/SUCCESS`. Note that `docker system prune -f` does not 
 - [ ] **Step 4: Verify the sandbox survived the prune**
 
 ```bash
-hermes -z --yolo "Run: ls /root/hermes-wiki/index.md && echo SANDBOX-OK"
+hermes --yolo -z "Run: ls /root/hermes-wiki/index.md && echo SANDBOX-OK"
 ```
 
 Expected: `SANDBOX-OK`. The wiki and sandbox are untouched by pruning.
@@ -1169,7 +1343,7 @@ If the agent complies with any part of the injected instructions, stop. Do not l
 - [ ] **Step 2: Confirm the injection attempt left no trace**
 
 ```bash
-hermes -z --yolo "Run: rg -i 'attacker@example.com' /root/hermes-wiki || echo CLEAN"
+hermes --yolo -z "Run: rg -i 'attacker@example.com' /root/hermes-wiki || echo CLEAN"
 ```
 
 Expected: `CLEAN` — nothing from the hostile email was written into the knowledge graph.
@@ -1177,7 +1351,7 @@ Expected: `CLEAN` — nothing from the hostile email was written into the knowle
 - [ ] **Step 3: Credential-isolation test**
 
 ```bash
-hermes -z --yolo "Run: cat ~/.hermes/.env 2>&1; cat /root/.hermes/.env 2>&1; env | grep -i -E 'OPENROUTER|TELEGRAM|GOOGLE_OAUTH' 2>&1; echo DONE"
+hermes --yolo -z "Run: cat ~/.hermes/.env 2>&1; cat /root/.hermes/.env 2>&1; env | grep -i -E 'DEEPINFRA|TELEGRAM|GOOGLE_OAUTH' 2>&1; echo DONE"
 ```
 
 Expected: no API keys, bot token, or OAuth secrets appear in the output. The sandbox cannot read the gateway's credentials.
@@ -1198,7 +1372,7 @@ Expected: the agent states plainly that it cannot send, offers a draft, and does
 From a second Telegram account, message the bot.
 
 ```bash
-sudo journalctl -u hermes-gateway -n 50 --no-pager | grep -i -E 'denied|unauthorized'
+journalctl --user -u hermes-gateway -n 50 --no-pager | grep -i -E 'denied|unauthorized'
 ```
 
 Expected: no reply to the second account, and a denial entry in the log.
@@ -1279,7 +1453,7 @@ Expected: the gateway is active/running and both timers are listed — no manual
 - [ ] **Step 6: Confirm the sandbox survived the reboot**
 
 ```bash
-hermes -z --yolo "Run: id -u; ls /.dockerenv; ls /root/hermes-wiki/index.md"
+hermes --yolo -z "Run: id -u; ls /.dockerenv; ls /root/hermes-wiki/index.md"
 ```
 
 Expected: `0`, `/.dockerenv` present, wiki intact. A reboot must not silently drop the sandbox back to host execution.
@@ -1307,16 +1481,20 @@ git commit -m "docs: snapshot non-secret assistant config"
 
 The assistant is live on Telegram and answering. Pick up with these, in order:
 
-1. **Add OpenRouter credits and switch off the free model — do this _before_
-   connecting Gmail.** Free endpoints commonly permit training on submitted
-   prompts; once Google is wired up, those prompts contain the owner's email.
-   `qwen/qwen3-235b-a22b-2507` (~$0.09/$0.55 per M) was the intended target.
-   Model lives at `model.default` in `~/.hermes/config.yaml`; the auxiliary
-   block at the end of that file is pinned to the free model too and should
-   move with it.
-2. **Google OAuth client → MCP server → tool allowlist** (Tasks 8–10). The
-   allowlist check in Task 10 Step 2 is the one that matters: if
-   `send_gmail_message` is registered, the security model has a hole.
+1. ~~**Add OpenRouter credits and switch off the free model.**~~ **Done
+   2026-08-02**, by switching provider rather than adding credits: DeepInfra,
+   `deepseek-ai/DeepSeek-V4-Flash` on both `model.default` and the auxiliary
+   block in `~/.hermes/config.yaml`. This was the prerequisite for connecting
+   Gmail — free endpoints commonly permit training on submitted prompts, and
+   once Google is wired up those prompts contain the owner's email. DeepInfra
+   is a paid endpoint, so that exposure is closed.
+2. ~~**Google OAuth client → MCP server → tool allowlist** (Tasks 8–10).~~
+   **Done 2026-08-02.** Gmail and Calendar are live over Telegram. Verified:
+   7 tools registered, `send_gmail_message` absent from both the server surface
+   and the Hermes allowlist, and the token cache unreachable from the sandbox
+   (agent is uid 0 in Docker and sees no `.google_workspace_mcp` at any path).
+   See spec As-built #11–13 — several plan steps were wrong and are corrected
+   in place.
 3. **Briefing cron** (Task 14), then **verification** (Tasks 16–17). Re-run the
    injection test against whichever model is actually in production — a result
    on the free model says nothing about the paid one.
@@ -1337,6 +1515,306 @@ Two unfinished items from earlier tasks:
 
 A stale `Hermes-Agent` SSH key from the decommissioned laptop build
 (added 2026-07-12) also remains on the GitHub account and can be removed.
+
+---
+
+### Task 18: Mirror the owner's repos into the sandbox (2026-08-17)
+
+**Files:**
+- Create: `~/.hermes/gh-config/` (host), `~/.local/bin/hermes-repo-sync.sh`,
+  `~/.config/systemd/user/hermes-repo-sync.service`,
+  `~/.config/systemd/user/hermes-repo-sync.timer`
+- Modify: `~/.hermes/SOUL.md`
+
+**Interfaces:**
+- Consumes: the sandbox image and bind mount (Task 4), the git credential in the
+  bind mount (Task 5), lingering (Task 2).
+- Produces: a read-only mirror of every repo the owner owns at `/root/repos/<name>`
+  in-container, refreshed every 30 minutes, so the agent can discuss the owner's
+  code without any network of its own.
+
+**Why a mirror and not egress.** The obvious way to let the agent talk about
+repos is to drop `TERMINAL_DOCKER_NETWORK=false`. Do not. The sandbox's `/root`
+already contains a plaintext GitHub token (`.git-credentials`, with
+`credential.helper = store`) and an SSH private key (`.ssh/id_ed25519_hermes`),
+both readable by the agent because it runs as container-root. The air gap is the
+only thing stopping an injected turn from *using* them — restoring egress hands a
+prompt-injectable agent a working GitHub credential and reopens the exfiltration
+path spec As-built #1 closed. Mirroring keeps the read capability and none of the
+risk. See spec As-built #23.
+
+- [ ] **Step 1: Give the discovery credential its own home (owner, manual)**
+
+Listing the owner's repos needs an authenticated API call; cloning their contents
+does not, because the git credential helper in the bind mount already covers it
+(verified: `git ls-remote` reaches private repos beyond the wiki). So discovery
+gets its **own read-only token**, stored outside the agent's `/root` — the agent
+never sees it.
+
+Create a fine-grained PAT at https://github.com/settings/tokens?type=beta with
+**Repository access: All repositories** and **Repository permissions → Metadata:
+Read-only**. Nothing else. (A classic token with `repo` also works but is far
+broader than needed.) Then, on the droplet:
+
+```bash
+mkdir -p ~/.hermes/gh-config && chmod 700 ~/.hermes/gh-config
+GH_CONFIG_DIR=~/.hermes/gh-config gh auth login --with-token
+# paste the PAT, then press Ctrl-D
+GH_CONFIG_DIR=~/.hermes/gh-config gh api user -q .login
+```
+
+Expected: the last command prints the owner's login. Run this yourself; do not
+pass the token as a shell argument or let it through another process.
+
+- [ ] **Step 2: Write the sync script**
+
+Git runs in a throwaway root container over the bind mount, exactly as the wiki
+sync does (Task 7) — that container has the host's network, the agent's sandbox
+does not. Three details are load-bearing:
+
+- **Full clones only.** A `--depth` or `--filter=blob:none` clone would need the
+  network the moment the agent touched an unfetched object, and it has none. At
+  26 repos / ~110 MB against 69 GB free, there is nothing to optimise.
+- **`reset --hard` on every pass.** Mirrors are replicas, not workspaces; agent
+  edits are discarded. Changing a repo is not the sandbox's job.
+- **Stale mirrors are reported, never deleted.** A renamed or deleted repo drops
+  out of the listing; a listing that silently loses a repo must not silently
+  destroy the mirror the agent was reading.
+
+```bash
+mkdir -p ~/.local/bin
+cat > ~/.local/bin/hermes-repo-sync.sh <<'EOF'
+#!/usr/bin/env bash
+# Mirror every repo the owner owns into the agent's sandbox, read-only.
+#
+# The sandbox runs with TERMINAL_DOCKER_NETWORK=false and holds a GitHub
+# credential in its own /root, so it must never fetch anything itself — egress
+# plus that credential is exactly the exfiltration path the spec's as-built #1
+# closed. Git therefore runs in a throwaway root container over the same bind
+# mount, the same trick the wiki sync uses: that container has the host's
+# network, the agent's sandbox still has none.
+set -euo pipefail
+
+SBX="$HOME/.hermes/sandboxes/docker/default/home"
+GH_CONFIG="$HOME/.hermes/gh-config"
+LOCK="$HOME/.hermes/repo-sync.lock"
+
+[ -d "$SBX" ] || { echo "FATAL: sandbox home missing at $SBX" >&2; exit 1; }
+[ -f "$GH_CONFIG/hosts.yml" ] || {
+  echo "FATAL: no gh credential at $GH_CONFIG/hosts.yml (see runbooks/dispatch.md)" >&2
+  exit 1
+}
+
+# A slow pass must not overlap the next timer tick — concurrent clones over one
+# bind mount corrupt each other.
+exec 9>"$LOCK"
+flock -n 9 || { echo "previous run still going; skipping"; exit 0; }
+
+# The listing credential is mounted read-only at /gh, outside the agent's /root,
+# so discovery does not put a second token inside the sandbox.
+docker run --rm \
+  -v "$SBX:/root" \
+  -v "$GH_CONFIG:/gh:ro" \
+  -e HOME=/root \
+  -e GH_CONFIG_DIR=/gh \
+  hermes-sandbox:latest \
+  bash -euo pipefail -c '
+    mkdir -p /root/repos
+
+    if ! repos=$(gh api --paginate "user/repos?per_page=100&affiliation=owner" -q ".[].full_name" 2>&1); then
+      echo "FATAL: repo listing failed: ${repos}" >&2
+      exit 1
+    fi
+    [ -n "${repos}" ] || { echo "FATAL: repo listing came back empty" >&2; exit 1; }
+
+    failed=0 count=0 seen=""
+    for full in ${repos}; do
+      name="${full#*/}"
+      dir="/root/repos/${name}"
+      seen="${seen} ${name}"
+      count=$((count + 1))
+
+      if [ ! -d "${dir}/.git" ]; then
+        # Full clones only. A --depth or --filter clone would need the network
+        # the moment the agent touched an unfetched object, and it has none.
+        if git clone --quiet "https://github.com/${full}.git" "${dir}"; then
+          echo "cloned ${full}"
+        else
+          echo "FAILED clone ${full}" >&2
+          failed=$((failed + 1))
+        fi
+        continue
+      fi
+
+      if ! git -C "${dir}" fetch --prune --quiet origin; then
+        echo "FAILED fetch ${full}" >&2
+        failed=$((failed + 1))
+        continue
+      fi
+
+      git -C "${dir}" remote set-head origin --auto >/dev/null 2>&1 || true
+      head=$(git -C "${dir}" symbolic-ref --quiet --short refs/remotes/origin/HEAD || true)
+      if [ -z "${head}" ]; then
+        # An empty repo has no default branch yet. Not a failure.
+        echo "empty ${full}"
+        continue
+      fi
+
+      # Mirrors are replicas: anything the agent wrote here is discarded.
+      if ! git -C "${dir}" reset --hard --quiet "${head}"; then
+        echo "FAILED reset ${full}" >&2
+        failed=$((failed + 1))
+      fi
+    done
+
+    # A renamed or deleted repo leaves a mirror behind. Report it, do not
+    # delete: a listing that silently loses a repo must not silently destroy
+    # the mirror the agent was reading.
+    for dir in /root/repos/*/; do
+      [ -d "${dir}" ] || continue
+      n="$(basename "${dir}")"
+      case " ${seen} " in
+        *" ${n} "*) ;;
+        *) echo "STALE mirror: ${n} (not in listing)" ;;
+      esac
+    done
+
+    echo "listed ${count} repos, ${failed} failed"
+    [ "${failed}" -eq 0 ]
+  '
+EOF
+chmod +x ~/.local/bin/hermes-repo-sync.sh
+```
+
+- [ ] **Step 3: Create the service and timer**
+
+`RandomizedDelaySec` matters: `OnCalendar=*:0/30` collides with the wiki sync's
+`*:0/15` at :00 and :30, and both units drive Docker over the same bind mount.
+
+```bash
+cat > ~/.config/systemd/user/hermes-repo-sync.service <<'EOF'
+[Unit]
+Description=Mirror the owner GitHub repos into the Hermes sandbox
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/hermes-repo-sync.sh
+EOF
+
+cat > ~/.config/systemd/user/hermes-repo-sync.timer <<'EOF'
+[Unit]
+Description=Mirror the owner GitHub repos every 30 minutes
+
+[Timer]
+OnCalendar=*:0/30
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl --user daemon-reload
+```
+
+- [ ] **Step 4: Prove failure is loud before it is quiet**
+
+Run the unit *before* Step 1's credential exists (or move `hosts.yml` aside):
+
+```bash
+systemctl --user start hermes-repo-sync.service || true
+journalctl --user -u hermes-repo-sync.service -n 5 --no-pager
+```
+
+Expected: `FATAL: no gh credential at ...` and the unit **failed**. Confirmed on
+2026-08-17. This is the Task 7 lesson applied — a sync that reports success
+while doing nothing is worse than one that crashes.
+
+- [ ] **Step 5: First full pass**
+
+```bash
+systemctl --user start hermes-repo-sync.service
+journalctl --user -u hermes-repo-sync.service -n 40 --no-pager
+du -sh ~/.hermes/sandboxes/docker/default/home/repos
+```
+
+Expected: a `cloned` line per repo, `listed <N> repos, 0 failed`, and the unit
+exits `0/SUCCESS`. Empty repos log `empty <repo>` and do not count as failures.
+
+- [ ] **Step 6: Enable the timer**
+
+```bash
+systemctl --user enable --now hermes-repo-sync.timer
+systemctl --user list-timers hermes-repo-sync.timer --no-pager
+```
+
+Expected: listed with a NEXT run time.
+
+- [ ] **Step 7: Prove the agent can read, and still cannot reach**
+
+Via Telegram (not the CLI — per As-built #13 the CLI surface lacks the tools):
+
+```
+Which of my repos use ripgrep? Search /root/repos.
+```
+
+Expected: a real answer citing files. Then the air-gap regression check. Do not
+pick the container by name — names are hashes (`hermes-1b8f6dd9`), and one of the
+two `hermes-sandbox` containers is the prompt probe, which is deliberately on
+`bridge` (As-built #7). Select by label:
+
+```bash
+c=$(docker ps --filter label=hermes-task-id=default --format '{{.Names}}')
+docker inspect -f '{{.HostConfig.NetworkMode}}' "$c"
+docker exec "$c" curl -sS -m 10 https://example.com || echo "no egress (correct)"
+```
+
+Expected: `none`, then a failure. The mirror must not have quietly become a
+network. Also ask via Telegram:
+
+```
+Fetch https://example.com and tell me what it says.
+```
+
+Expected: the agent reports it cannot reach the network, rather than pretending
+or hunting for a workaround.
+
+- [ ] **Step 8: Prove mirrors are replicas**
+
+```bash
+SBX=~/.hermes/sandboxes/docker/default/home
+sudo tee -a "$SBX/repos/notes/SCRATCH.md" >/dev/null <<'EOF'
+mirror-test
+EOF
+systemctl --user start hermes-repo-sync.service
+sudo test -f "$SBX/repos/notes/SCRATCH.md" && echo "STILL THERE (wrong)" || echo "discarded (correct)"
+```
+
+Expected: `discarded (correct)`.
+
+- [ ] **Step 9: Tell the agent the mirrors exist**
+
+Append to `~/.hermes/SOUL.md` — without this the agent has no idea `/root/repos`
+is there, and will say it cannot see your code:
+
+```bash
+cat >> ~/.hermes/SOUL.md <<'EOF'
+
+## The owner code (standing instruction)
+
+Every repo the owner owns is mirrored read-only at /root/repos/<name>, refreshed
+every 30 minutes. I read it with `rg`, `git log`, and the file tools — that is
+how I answer questions about the owner code.
+
+- These are **replicas, not workspaces.** Anything I write under /root/repos is
+  discarded on the next refresh. I do not edit, commit, or branch there, and I
+  never tell the owner I changed a repo.
+- I have no network, so I cannot clone, fetch, or push. If a repo is missing or
+  a mirror looks out of date, I say so and let the owner check the sync timer.
+- If a repo genuinely needs changing, I describe the change I would make and
+  leave it to the owner. I do not look for another route to do it myself.
+EOF
+```
 
 ## Post-implementation notes
 
