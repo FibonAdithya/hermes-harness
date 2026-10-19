@@ -69,6 +69,28 @@ def config_set(key, value):
     set_config_value(key, value)
 
 
+def config_set_json(key, value):
+    """Set `key` to a JSON value (a list or dict). `config_set` only takes strings,
+    so this repeats set_config_value's write path for config.yaml: read the raw user
+    config, set the nested key, write it back atomically. Only the approved new-reach
+    change (tuner/proposals.py) calls it."""
+    from hermes_cli.config import (
+        _set_nested, ensure_hermes_home, get_config_path, is_managed,
+        require_readable_config_before_write)
+    from utils import atomic_yaml_write, fast_safe_load
+    if is_managed():
+        raise RuntimeError("config is managed; cannot set values")
+    config_path = get_config_path()
+    require_readable_config_before_write(config_path)
+    user_config = {}
+    if config_path.exists():
+        with open(config_path, encoding="utf-8") as f:
+            user_config = fast_safe_load(f) or {}
+    _set_nested(user_config, key, value)
+    ensure_hermes_home()
+    atomic_yaml_write(config_path, user_config, sort_keys=False)
+
+
 def oneshot(instructions, user_input, max_tokens):
     """One LLM call on the main provider/model from config. Subscription billing
     reports $0 ("included"), so the raw token counts are returned too."""
@@ -93,7 +115,7 @@ def oneshot(instructions, user_input, max_tokens):
 
 
 OPS = {f.__name__: f for f in (scan, get_job, list_jobs, update_job, create_job,
-                               remove_job, config_get, config_set, oneshot)}
+                               remove_job, config_get, config_set, config_set_json, oneshot)}
 
 
 def main(argv, stdin, stdout, stderr):

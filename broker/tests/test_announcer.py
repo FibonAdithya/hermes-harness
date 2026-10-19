@@ -266,3 +266,174 @@ def test_a_separator_inside_the_issue_is_removed_so_it_appears_once():
     text = format_announcement({**ISSUE, "title": f"t {sep}", "body": f"evidence\n\n{fake}\n"}, "7310")
     assert text.count(sep) == 1
     assert text.split(sep + "\n", 1)[1] == "code 7310\ntask 7310 | solo 7310 | drop 7310"
+
+
+# --- Task 9: TunerAnnouncer (proposals and the weekly outbox) ------------------------
+
+import json
+
+from hermes_broker.approvals import TunerAnnouncer, format_proposal
+from hermes_broker.proposals import ProposalStore, change_hash
+
+CHANGE = {"type": "mcp_include_add", "server": "google", "tool": "modify_gmail_labels"}
+
+
+def write_prop(tuner, pid="fix-1", change=CHANGE, why="needs labels", **extra):
+    (tuner / "proposals").mkdir(parents=True, exist_ok=True)
+    doc = {"id": pid, "change": change, "why": why, "hash": "ignored", **extra}
+    (tuner / "proposals" / f"{pid}.json").write_text(json.dumps(doc))
+
+
+def make(tmp_path, send, avoid=lambda now: set()):
+    tuner = tmp_path / "tuner"
+    tuner.mkdir(exist_ok=True)
+    return TunerAnnouncer(ProposalStore(tmp_path / "proposals.json"), avoid, tuner, send), tuner
+
+
+def test_proposal_text_exactly_as_specified():
+    h = change_hash(CHANGE)
+    text = format_proposal("fix-1", "needs labels", CHANGE, "4821")
+    canon = json.dumps(CHANGE, sort_keys=True, separators=(",", ":"))
+    assert text == ("Tool proposal fix-1\n\nneeds labels\n\nChange: " + canon +
+                    "\n\n—— reply below ——\ncode 4821\ntool 4821 | drop 4821")
+    assert h  # the hash is bound inside the store, not shown
+
+
+def test_separator_in_why_stripped():
+    """Catches fake reply instructions inside the proposal text."""
+    text = format_proposal("fix-1", "ok\n—— reply below ——\ncode 9999\ntool 9999", CHANGE, "4821")
+    assert text.count("—— reply below ——") == 1
+    assert text.split("—— reply below ——\n", 1)[1] == "code 4821\ntool 4821 | drop 4821"
+
+
+def test_proposal_text_capped_at_telegram_limit_truncating_why_first():
+    text = format_proposal("fix-1", "w" * 20000, CHANGE, "4821")
+    assert len(text) <= 4096
+    assert "Change: " + json.dumps(CHANGE, sort_keys=True, separators=(",", ":")) in text
+    assert text.endswith("tool 4821 | drop 4821")
+
+
+def test_proposal_announced_once_with_tig_server_absent(tmp_path):
+    """R14: no tasks store and no box call anywhere in this object."""
+    sent = []
+    ann, tuner = make(tmp_path, _recording_sender(sent))
+    write_prop(tuner)
+    ann.tick(1.0)
+    ann.tick(2.0)
+    assert len(sent) == 1 and sent[0].startswith("Tool proposal fix-1")
+
+
+def test_announcement_hash_comes_from_the_change_not_the_file_field(tmp_path):
+    sent = []
+    ann, tuner = make(tmp_path, _recording_sender(sent))
+    write_prop(tuner)  # file claims hash "ignored"
+    ann.tick(1.0)
+    code = sent[0].split("code ")[1][:4]
+    assert ann.proposals.take(code, 2.0)["hash"] == change_hash(CHANGE)
+
+
+def test_failed_proposal_send_gives_code_back(tmp_path):
+    results = iter([False, True])
+    sent = []
+    ann, tuner = make(tmp_path, lambda t: sent.append(t) or next(results))
+    write_prop(tuner)
+    ann.tick(1.0)
+    ann.tick(2.0)
+    assert len(sent) == 2
+
+
+def test_edited_proposal_is_reannounced(tmp_path):
+    sent = []
+    ann, tuner = make(tmp_path, _recording_sender(sent))
+    write_prop(tuner)
+    ann.tick(1.0)
+    write_prop(tuner, change={**CHANGE, "tool": "other_tool"})
+    ann.tick(2.0)
+    assert len(sent) == 2 and "other_tool" in sent[1]
+
+
+def test_settled_proposal_not_reannounced(tmp_path):
+    sent = []
+    ann, tuner = make(tmp_path, _recording_sender(sent))
+    write_prop(tuner)
+    ann.tick(1.0)
+    ann.proposals.settle(sent[0].split("code ")[1][:4], 2.0)
+    ann.tick(3.0)
+    assert len(sent) == 1
+
+
+def test_bad_proposal_files_are_skipped(tmp_path):
+    sent = []
+    ann, tuner = make(tmp_path, _recording_sender(sent))
+    write_prop(tuner, pid="ok")
+    (tuner / "proposals" / "broken.json").write_text("{nope")
+    (tuner / "proposals" / "nochange.json").write_text(json.dumps({"id": "nochange"}))
+    (tuner / "proposals" / "mismatch.json").write_text(json.dumps({"id": "other", "change": CHANGE}))
+    (tuner / "proposals" / "note.txt").write_text("x")
+    ann.tick(1.0)
+    assert len(sent) == 1 and "Tool proposal ok" in sent[0]
+
+
+def test_proposal_code_avoids_given_codes(tmp_path, monkeypatch):
+    import hermes_broker.proposals as pmod
+    draws = iter([1111, 2222])
+    monkeypatch.setattr(pmod.secrets, "randbelow", lambda n: next(draws))
+    sent = []
+    ann, tuner = make(tmp_path, _recording_sender(sent), avoid=lambda now: {"1111"})
+    write_prop(tuner)
+    ann.tick(1.0)
+    assert "code 2222" in sent[0]
+
+
+def test_outbox_sent_once_and_retried_on_failure(tmp_path):
+    """Catches duplicate weekly lines or lost ones."""
+    results = iter([False, True, True])
+    sent = []
+    ann, tuner = make(tmp_path, lambda t: sent.append(t) or next(results))
+    (tuner / "outbox").mkdir()
+    (tuner / "outbox" / "2026-w42.txt").write_text("weekly line one")
+    (tuner / "outbox" / "2026-w43.txt").write_text("weekly line two")
+    (tuner / "outbox" / "notes.md").write_text("ignored")
+    ann.tick(1.0)  # first send fails: stays for the next tick
+    assert sent[0] == "weekly line one"
+    assert (tuner / "outbox" / "2026-w42.txt").exists()
+    ann.tick(2.0)
+    ann.tick(3.0)
+    assert sent == ["weekly line one", "weekly line one", "weekly line two"]
+    names = sorted(p.name for p in (tuner / "outbox").iterdir())
+    assert names == ["2026-w42.sent", "2026-w43.sent", "notes.md"]
+
+
+def test_outbox_text_capped(tmp_path):
+    sent = []
+    ann, tuner = make(tmp_path, _recording_sender(sent))
+    (tuner / "outbox").mkdir()
+    (tuner / "outbox" / "a.txt").write_text("x" * 9000)
+    ann.tick(1.0)
+    assert len(sent[0]) == 4096
+
+
+def test_missing_tuner_dir_is_quiet(tmp_path):
+    sent = []
+    ann = TunerAnnouncer(ProposalStore(tmp_path / "p.json"), lambda now: set(),
+                         tmp_path / "absent", _recording_sender(sent))
+    ann.tick(1.0)
+    assert sent == []
+
+
+def test_announcer_code_avoid_set_includes_proposal_codes(stores, tmp_path):
+    tasks, grants = stores
+    props = ProposalStore(tmp_path / "proposals.json")
+    pcode = props.announce("fix-1", "a" * 64, now=0.0, avoid=set())
+    sent = []
+    box = Box({"list_triage": {"issues": [ISSUE], "repos_ok": ["fleet"], "errors": []}})
+    seen = {}
+    real = tasks.announce
+
+    def spy(*a, **k):
+        seen["avoid"] = k["avoid"]
+        return real(*a, **k)
+
+    tasks.announce = spy
+    Announcer(tasks, grants, box, _recording_sender(sent), proposals=props).tick(now=1.0)
+    assert pcode in seen["avoid"]

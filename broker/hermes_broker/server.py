@@ -18,6 +18,7 @@ from mcp.server import MCPServer
 from . import box, gpuq
 from .config import BrokerConfig, load_config
 from .grants import GrantStore
+from .proposals import ProposalStore
 from .ssh import Unreachable, run_ssh
 from .tasks import TaskStore
 
@@ -72,7 +73,9 @@ def request_access(box: str, minutes: int, reason: str) -> str:
     the code. They approve in the approvals chat. This grants nothing by itself.
     """
     now = time.time()
-    avoid = TaskStore(_config().state_dir / "tasks.json").live_codes(now)
+    state_dir = _config().state_dir
+    avoid = (TaskStore(state_dir / "tasks.json").live_codes(now)
+             | ProposalStore(state_dir / "proposals.json").live_codes(now))
     code = _store().create_request(box, minutes, reason, now=now, avoid=avoid)
     return (
         f"Requested {box} for {minutes} minutes.\n"

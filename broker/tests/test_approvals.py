@@ -1,3 +1,4 @@
+import json
 from hermes_broker.approvals import parse_command
 
 OWNER = 111222333
@@ -217,3 +218,129 @@ def test_deploy_reply_parses_the_named_target(text, expected):
 
 def test_deploy_with_unknown_target_word_ignored():
     assert parse_command(msg("deploy droplet abc1234"), OWNER) is None
+
+
+# --- Task 9: tool proposals -------------------------------------------------------
+
+def test_tool_verb_parsed_and_forward_rejected():
+    assert parse_command(msg("tool 4821"), OWNER) == ("tool", "4821")
+    assert parse_command(msg("  TOOL 4821 "), OWNER) == ("tool", "4821")
+    assert parse_command(msg("tool 48211"), OWNER) is None
+    assert parse_command(msg("tool"), OWNER) is None
+    assert parse_command(msg("tool 4821", forward_origin={"type": "user"}), OWNER) is None
+    assert parse_command(msg("tool 4821", forward_from={"id": 5}), OWNER) is None
+    other = msg("tool 4821")
+    other["message"]["from"]["id"] = 999
+    assert parse_command(other, OWNER) is None
+
+
+H = "e" * 64
+
+
+def _setup(tmp_path):
+    from hermes_broker.grants import GrantStore
+    from hermes_broker.proposals import ProposalStore
+    from hermes_broker.tasks import TaskStore
+    return (GrantStore(tmp_path / "grants.json"), TaskStore(tmp_path / "tasks.json"),
+            ProposalStore(tmp_path / "proposals.json"), tmp_path)
+
+
+def test_tool_approval_records_exactly_the_hash_and_replies(tmp_path):
+    from hermes_broker.approvals import _dispatch
+    grants, tasks, props, state = _setup(tmp_path)
+    code = props.announce("fix-1", H, now=1.0, avoid=set())
+    out = _dispatch(msg(f"tool {code}"), OWNER, grants, tasks, None, (), now_fn=lambda: 2.0,
+                    proposals=props, state_dir=state)
+    assert out == "Tool proposal fix-1 approved; the tuner applies it on its next run."
+    rows = json.loads((state / "approved_proposals.json").read_text())
+    assert [(r["proposal_id"], r["hash"]) for r in rows] == [("fix-1", H)]
+    assert not (state / "dropped_proposals.json").exists()
+    assert props.live_codes(2.0) == set()
+
+
+def test_unknown_tool_code_records_nothing(tmp_path):
+    from hermes_broker.approvals import _dispatch
+    grants, tasks, props, state = _setup(tmp_path)
+    out = _dispatch(msg("tool 0001"), OWNER, grants, tasks, None, (), now_fn=lambda: 2.0,
+                    proposals=props, state_dir=state)
+    assert "No announced tool proposal" in out
+    assert not (state / "approved_proposals.json").exists()
+
+
+def test_expired_tool_code_records_nothing(tmp_path):
+    from hermes_broker.approvals import _dispatch
+    grants, tasks, props, state = _setup(tmp_path)
+    code = props.announce("fix-1", H, now=1.0, avoid=set())
+    out = _dispatch(msg(f"tool {code}"), OWNER, grants, tasks, None, (), now_fn=lambda: 1e9,
+                    proposals=props, state_dir=state)
+    assert "No announced tool proposal" in out
+    assert not (state / "approved_proposals.json").exists()
+
+
+def test_drop_routes_to_proposal_when_code_is_a_proposal(tmp_path):
+    """Catches `drop` on a proposal closing a GitHub issue."""
+    from hermes_broker.approvals import _dispatch
+    grants, tasks, props, state = _setup(tmp_path)
+    code = props.announce("fix-1", H, now=1.0, avoid=set())
+    box_calls = []
+    out = _dispatch(msg(f"drop {code}"), OWNER, grants, tasks,
+                    lambda *a, **k: box_calls.append(a) or {}, (), now_fn=lambda: 2.0,
+                    proposals=props, state_dir=state)
+    assert "fix-1" in out and "dropped" in out.lower()
+    assert box_calls == []
+    (row,) = json.loads((state / "dropped_proposals.json").read_text())
+    assert (row["proposal_id"], row["hash"]) == ("fix-1", H)
+    assert not (state / "approved_proposals.json").exists()
+    # dropped means never re-announced
+    assert props.announce("fix-1", H, now=3.0, avoid=set()) is None
+
+
+def test_drop_routes_to_task_otherwise(tmp_path):
+    from hermes_broker.approvals import _dispatch
+    grants, tasks, props, state = _setup(tmp_path)
+    tcode = tasks.announce("fleet", "FibonAdithya/fleet", 7, H, now=1.0, avoid=set())
+    pcode = props.announce("fix-1", H, now=1.0, avoid={tcode})
+    box_calls = []
+    out = _dispatch(msg(f"drop {tcode}"), OWNER, grants, tasks,
+                    lambda verb, args, timeout=60: box_calls.append(verb) or {}, (), now_fn=lambda: 2.0,
+                    proposals=props, state_dir=state)
+    assert box_calls == ["close_task"] and out == "Dropped fleet#7."
+    assert props.live_codes(2.0) == {pcode}  # the proposal is untouched
+    assert not (state / "dropped_proposals.json").exists()
+
+
+def test_tool_reply_works_without_tig_server(tmp_path):
+    from hermes_broker.approvals import _dispatch
+    grants, _t, props, state = _setup(tmp_path)
+    code = props.announce("fix-1", H, now=1.0, avoid=set())
+    out = _dispatch(msg(f"tool {code}"), OWNER, grants, None, None, (), now_fn=lambda: 2.0,
+                    proposals=props, state_dir=state)
+    assert "approved" in out
+
+
+def test_record_failure_keeps_the_code_live(tmp_path, monkeypatch):
+    import hermes_broker.approvals as a
+    grants, tasks, props, state = _setup(tmp_path)
+    code = props.announce("fix-1", H, now=1.0, avoid=set())
+
+    def boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(a, "record_approval", boom)
+    out = a._dispatch(msg(f"tool {code}"), OWNER, grants, tasks, None, (), now_fn=lambda: 2.0,
+                      proposals=props, state_dir=state)
+    assert "failed" in out and props.live_codes(2.0) == {code}
+
+
+def test_codes_unique_across_three_stores(tmp_path, monkeypatch):
+    """Catches a code collision approving the wrong thing: every issuer avoids the other two."""
+    import hermes_broker.proposals as pmod
+    from hermes_broker.approvals import _avoid_codes
+    grants, tasks, props, _state = _setup(tmp_path)
+    g = grants.create_request("tig-server", 30, "r", now=1.0)
+    t = tasks.announce("fleet", "FibonAdithya/fleet", 1, H, now=1.0, avoid={g})
+    taken = [g, t]
+    draws = iter([int(g), int(t), 4242])
+    monkeypatch.setattr(pmod.secrets, "randbelow", lambda n: next(draws))
+    code = props.announce("fix-1", H, now=1.0, avoid=_avoid_codes(grants, tasks, None, 1.0))
+    assert code == "4242" and code not in taken

@@ -51,6 +51,7 @@ class Bridge(Protocol):
     def remove_job(self, job_id: str) -> bool: ...
     def config_get(self, key: str) -> Any: ...
     def config_set(self, key: str, value: Any) -> None: ...
+    def config_set_json(self, key: str, value: Any) -> None: ...
     def oneshot(self, instructions: str, user_input: str, max_tokens: int) -> dict: ...
     def restart_gateway(self) -> None: ...
 
@@ -111,6 +112,11 @@ class HermesBridge:
     def config_set(self, key, value):
         self._call("config_set", key=key, value=encode_config_value(value))
 
+    def config_set_json(self, key, value):
+        """Set `key` to a JSON value (a list or dict that `config_set` cannot carry).
+        Used only for owner-approved new-reach changes (spec 4.6)."""
+        self._call("config_set_json", key=key, value=value)
+
     def oneshot(self, instructions, user_input, max_tokens):
         return self._call("oneshot", instructions=instructions, user_input=user_input,
                           max_tokens=max_tokens)
@@ -130,7 +136,7 @@ class FakeBridge:
     ones told to fail via `fail` (a set of method names)."""
 
     MUTATING = frozenset({"update_job", "create_job", "remove_job", "config_set",
-                          "restart_gateway", "oneshot"})
+                          "config_set_json", "restart_gateway", "oneshot"})
 
     def __init__(self, jobs: dict[str, dict] | None = None, config: dict | None = None,
                  oneshot_script: list[dict] | None = None, fail: set[str] | None = None,
@@ -188,6 +194,10 @@ class FakeBridge:
     def config_set(self, key, value):
         self._enter("config_set", key, value)
         encode_config_value(value)  # same type limits as the real bridge
+        self.config[key] = copy.deepcopy(value)
+
+    def config_set_json(self, key, value):
+        self._enter("config_set_json", key, value)
         self.config[key] = copy.deepcopy(value)
 
     def oneshot(self, instructions, user_input, max_tokens):

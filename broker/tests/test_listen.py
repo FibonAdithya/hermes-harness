@@ -23,3 +23,11 @@ def test_missing_tig_server_disables_task_wiring(caplog):
 def test_present_tig_server_wires_task_store_and_call():
     tasks, call = _task_wiring(_cfg({"tig-server": "user@host"}))
     assert tasks is not None and callable(call)
+
+
+def test_proposal_wiring_does_not_need_tig_server():
+    from hermes_broker.listen import _proposal_wiring
+    cfg = _cfg({})
+    store, tuner_dir = _proposal_wiring(cfg)
+    assert store is not None and tuner_dir == cfg.tuner_dir
+    assert store.path == cfg.state_dir / "proposals.json"
