@@ -14,7 +14,8 @@ mkdir -p "$HOME/.hermes/plugins"
 ln -sfn "$repo/tuner/plugin/hermes-tuner" "$HOME/.hermes/plugins/hermes-tuner"
 echo "linked ~/.hermes/plugins/hermes-tuner -> $repo/tuner/plugin/hermes-tuner"
 
-mkdir -p -m 700 "$HOME/.hermes/tuner"
+mkdir -p "$HOME/.hermes/tuner"
+chmod 700 "$HOME/.hermes/tuner"
 echo "ensured ~/.hermes/tuner (mode 700)"
 
 mkdir -p "$units"

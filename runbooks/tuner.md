@@ -127,8 +127,8 @@ systemctl --user start hermes-tuner.service
 journalctl --user -u hermes-tuner -n 50
 ```
 
-Dry run (no change is made anywhere; it prints the report, including what it
-would do under `planned`):
+Dry run (no fix is applied and no Hermes call mutates anything; it prints the
+report, including what it would do under `planned`):
 
 ```bash
 cd ~/hermes-harness/tuner && .venv/bin/python -m hermes_tuner run --dry-run
@@ -143,7 +143,8 @@ forwarded, not copied from elsewhere):
 - `tool 7391` approves it. The tuner applies it on its next run.
 - `drop 7391` discards it.
 
-Codes are single-use. Editing a proposal after approval voids the approval.
+Codes are single-use and expire (7-day TTL). If a code has expired, wait for the
+tuner's re-announcement and use the new code. Editing a proposal after approval voids the approval.
 
 ## One-time owner steps
 
