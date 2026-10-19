@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import posixpath
 import re
 import sqlite3
 from collections.abc import Iterator
@@ -11,6 +12,10 @@ from . import policy
 from .model import Session, ToolCall
 
 JOB_SESSION_RE = re.compile(r"^cron_([0-9a-f]{12})_\d{8}_\d{6}$")
+MAX_CHAIN_HOPS = 100
+_CHUNK = 500
+_SESSION_COLS = ("s.id, s.source, s.started_at, s.input_tokens, s.output_tokens, "
+                 "s.cache_read_tokens, s.estimated_cost_usd")
 
 
 class HistoryUnavailable(Exception):
@@ -43,13 +48,19 @@ def _issued_calls(tool_calls_json: str | None) -> Iterator[tuple[str, str, dict]
         if name == "tool_call":
             name = args.get("name") or "?"
             args = _args(args.get("arguments"))
-        yield str(e.get("id")), name, args
+        cid = e.get("id")
+        if isinstance(cid, str) and cid:
+            yield cid, name, args
 
 
 def _is_untrusted(name: str, args: dict) -> bool:
     if name == "read_file":
-        path = str(args.get("path", ""))
-        return not path.startswith(policy.TRUSTED_READ_ROOTS)
+        path = args.get("path")
+        if not isinstance(path, str) or not posixpath.isabs(path):
+            return True
+        return not posixpath.normpath(path).startswith(policy.TRUSTED_READ_ROOTS)
+    if name == "?":
+        return True
     return name in policy.UNTRUSTED_TOOLS or name.startswith(policy.UNTRUSTED_PREFIXES)
 
 
@@ -83,7 +94,8 @@ class History:
             params = (since,)
         rows = self._q(
             "select id, session_id, role, content, tool_call_id, tool_calls, tool_name, timestamp "
-            f"from messages {where} order by id", params)
+            f"from messages {where}{' and' if where else ' where'} role in ('assistant', 'tool') "
+            "order by id", params)
         issued: dict[tuple[str, str], tuple[str, dict]] = {}
         for r in rows:
             if r["role"] == "assistant" and r["tool_calls"]:
@@ -92,43 +104,100 @@ class History:
             elif r["role"] == "tool":
                 if since is not None and session_ids is None and r["timestamp"] < since:
                     continue
-                cid = str(r["tool_call_id"])
-                name, args = issued.get((r["session_id"], cid), ("?", {}))
+                cid = r["tool_call_id"]
+                name, args = issued.get((r["session_id"], cid), ("?", {})) if cid else ("?", {})
                 if r["tool_name"]:
                     name = r["tool_name"]
                 text = r["content"] or ""
                 ref = args.get("message_id")
                 yield r["session_id"], ToolCall(
-                    call_id=cid,
+                    call_id=cid or "",
                     name=name,
                     arg_keys=tuple(sorted(args)),
                     ref=ref if isinstance(ref, str) else None,
                     result_chars=len(text),
                 ), args, text
 
+    def _chains(self, roots: list[sqlite3.Row]) -> dict[str, list[str]]:
+        """Map each root id to its session ids: itself, then compression continuations.
+
+        Follows parent links whose parent ended with 'compression', breadth-first,
+        at most MAX_CHAIN_HOPS deep; a session already seen is not revisited.
+        """
+        chains = {r["id"]: [r["id"]] for r in roots}
+        owner = {r["id"]: r["id"] for r in roots}
+        frontier = list(owner)
+        for _ in range(MAX_CHAIN_HOPS):
+            if not frontier:
+                break
+            nxt: list[str] = []
+            for i in range(0, len(frontier), _CHUNK):
+                part = frontier[i:i + _CHUNK]
+                for c in self._q(
+                        "select c.id, c.parent_session_id as parent from sessions c "
+                        "join sessions p on p.id = c.parent_session_id "
+                        "where p.end_reason = 'compression' and c.parent_session_id in "
+                        f"({','.join('?' * len(part))}) order by c.started_at, c.id", tuple(part)):
+                    if c["id"] in owner:
+                        continue
+                    owner[c["id"]] = owner[c["parent"]]
+                    chains[owner[c["id"]]].append(c["id"])
+                    nxt.append(c["id"])
+            frontier = nxt
+        return chains
+
+    def _chain_calls(self, chains: dict[str, list[str]]) -> dict[str, list]:
+        """Group (ToolCall, args, text) by root id, root session first."""
+        owner = {sid: root for root, ids in chains.items() for sid in ids}
+        order = {sid: n for ids in chains.values() for n, sid in enumerate(ids)}
+        per_session: dict[str, list] = {sid: [] for sid in owner}
+        ids = list(owner)
+        for i in range(0, len(ids), _CHUNK):
+            for sid, call, args, text in self._calls(ids[i:i + _CHUNK]):
+                per_session[sid].append((call, args, text))
+        return {root: [x for sid in sorted(sids, key=order.get) for x in per_session[sid]]
+                for root, sids in chains.items()}
+
     def sessions(self, since: float, until: float | None = None) -> list[Session]:
-        sql = ("select id, source, started_at, input_tokens, output_tokens, cache_read_tokens, "
-               "estimated_cost_usd from sessions where started_at >= ?")
+        """One Session per run: a compression chain is merged into its root.
+
+        The window applies to the root's started_at; continuations come along even
+        if they started later. A continuation whose root is outside the window is
+        not returned.
+        """
+        sql = (f"select {_SESSION_COLS} from sessions s "
+               "left join sessions p on p.id = s.parent_session_id "
+               "where s.started_at >= ? and coalesce(p.end_reason, '') != 'compression'")
         params: tuple = (since,)
         if until is not None:
-            sql += " and started_at < ?"
+            sql += " and s.started_at < ?"
             params += (until,)
-        rows = self._q(sql + " order by started_at", params)
-        by_session: dict[str, list[ToolCall]] = {r["id"]: [] for r in rows}
-        for sid, call, _args_, _text in self._calls(list(by_session)) if by_session else ():
-            by_session[sid].append(call)
+        roots = self._q(sql + " order by s.started_at", params)
+        if not roots:
+            return []
+        chains = self._chains(roots)
+        member_rows = {r["id"]: r for r in roots}
+        extra = [sid for ids in chains.values() for sid in ids[1:]]
+        for i in range(0, len(extra), _CHUNK):
+            part = extra[i:i + _CHUNK]
+            for r in self._q(f"select {_SESSION_COLS} from sessions s where s.id in "
+                             f"({','.join('?' * len(part))})", tuple(part)):
+                member_rows[r["id"]] = r
+        calls = self._chain_calls(chains)
         out = []
-        for r in rows:
+        for r in roots:
+            members = [member_rows[sid] for sid in chains[r["id"]]]
             m = JOB_SESSION_RE.match(r["id"])
             out.append(Session(
                 id=r["id"],
                 source=r["source"],
                 job_id=m.group(1) if m else None,
                 started_at=r["started_at"],
-                est_cost=r["estimated_cost_usd"] or 0.0,
-                prompt_tokens=(r["input_tokens"] or 0) + (r["cache_read_tokens"] or 0),
-                output_tokens=r["output_tokens"] or 0,
-                calls=tuple(by_session[r["id"]]),
+                est_cost=sum(x["estimated_cost_usd"] or 0.0 for x in members),
+                prompt_tokens=sum((x["input_tokens"] or 0) + (x["cache_read_tokens"] or 0)
+                                  for x in members),
+                output_tokens=sum(x["output_tokens"] or 0 for x in members),
+                calls=tuple(c for c, _a, _t in calls[r["id"]]),
             ))
         return out
 
@@ -137,7 +206,9 @@ class History:
         return rows[0]["t"] or 0.0
 
     def calls_with_args(self, session_id: str) -> list[tuple[str, dict]]:
-        return [(c.name, a) for _s, c, a, _t in self._calls([session_id])]
+        """Calls (name, args) of the run rooted at `session_id`, continuations included."""
+        chains = self._chains([{"id": session_id}])
+        return [(c.name, a) for c, a, _t in self._chain_calls(chains)[session_id]]
 
     def untrusted_texts(self, since: float) -> Iterator[str]:
         for _s, c, a, text in self._calls(None, since):

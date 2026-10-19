@@ -12,7 +12,8 @@ def make_db(path: Path, sessions: list[dict]) -> Path:
         create table sessions (
             id text primary key, source text, started_at real,
             input_tokens integer, output_tokens integer, cache_read_tokens integer,
-            estimated_cost_usd real, model text);
+            estimated_cost_usd real, model text,
+            parent_session_id text, end_reason text);
         create table messages (
             id integer primary key autoincrement, session_id text, role text,
             content text, tool_call_id text, tool_calls text, tool_name text,
@@ -20,9 +21,10 @@ def make_db(path: Path, sessions: list[dict]) -> Path:
     """)
     for s in sessions:
         conn.execute(
-            "insert into sessions values (?,?,?,?,?,?,?,?)",
+            "insert into sessions values (?,?,?,?,?,?,?,?,?,?)",
             (s["id"], s["source"], s["started_at"], s.get("in", 0), s.get("out", 0),
-             s.get("cache", 0), s.get("cost", 0.0), s.get("model", "m")))
+             s.get("cache", 0), s.get("cost", 0.0), s.get("model", "m"),
+             s.get("parent"), s.get("end_reason")))
         calls = s.get("calls", [])
         t = s["started_at"]
         if calls:
