@@ -177,7 +177,7 @@ class FakeBridge:
         self._enter("create_job", prompt, schedule, name, deliver, enabled_toolsets)
         # Monotonic: len(self.jobs) would reuse an id after remove_job.
         self._next_id += 1
-        job_id = f"fake{self._next_id:08x}"
+        job_id = f"{self._next_id:012x}"  # 12 lowercase hex, like Hermes job ids
         self.jobs[job_id] = {"id": job_id, "prompt": prompt, "schedule": schedule,
                              "next_run_at": schedule, "name": name, "deliver": deliver,
                              "enabled_toolsets": copy.deepcopy(enabled_toolsets)}

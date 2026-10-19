@@ -249,12 +249,14 @@ class _Cycle(DraftSteps):
             if isinstance(times, list) else []
 
     def _restarted_between(self, scheduled_at: float | None, shadow_start: float) -> bool:
-        """True when a gateway restart r satisfies scheduled_at < r <= shadow_start: the
-        tool dir was written at scheduling, so only a later restart loaded it before the
-        shadow ran. An unknown scheduling time fails closed."""
+        """True when a gateway restart r satisfies scheduled_at <= r <= shadow_start. The
+        tool dir is written at scheduling (step 7) and the restart step (8) runs later in
+        the same cycle with the same `now`, so r == scheduled_at means the restart loaded
+        the tool; the lock keeps two cycles from sharing a `now`. An unknown scheduling
+        time fails closed."""
         if scheduled_at is None:
             return False
-        return any(scheduled_at < r <= shadow_start for r in self._restart_times())
+        return any(scheduled_at <= r <= shadow_start for r in self._restart_times())
 
     def _compare(self, live: object, shadow: Session, old: Session):
         rule = policy.EDITABLE_JOBS.get(live) if isinstance(live, str) else None

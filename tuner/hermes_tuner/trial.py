@@ -10,7 +10,8 @@ Nothing here reads the clock: `now` is always a parameter.
 
 `root` holds `shadow_jobs.json`:
     {"<shadow job id>": {"fix_id", "live_job_id", "run_at": <epoch s>,
-                         "created_at": <epoch s>, "removed_at": <epoch s, once cleaned up>}}
+                         "created_at": <epoch s>, "scheduled_at": <epoch s, = created_at>,
+                         "removed_at": <epoch s, once cleaned up>}}
 and the plugin writes `shadow/<session id>.jsonl` (one intent per line).
 """
 from __future__ import annotations

@@ -486,7 +486,8 @@ def test_shadow_that_ran_before_restart_fails(env):
     ([SHADOW_T - 3600], True),               # between scheduling and the shadow
     ([SHADOW_T], True),                      # exactly at the shadow start: allowed
     ([SCHEDULED_AT - DAY], False),           # before scheduling: tool never loaded
-    ([SCHEDULED_AT], False),                 # at scheduling: not after the tool dir
+    ([SCHEDULED_AT], True),                  # same cycle: restart step follows scheduling
+    ([SCHEDULED_AT - 1], False),             # just before scheduling
     ([SHADOW_T + 60], False),                # after the shadow ran
     ([SCHEDULED_AT - DAY, SHADOW_T + 60], False),
     ([SCHEDULED_AT - DAY, SHADOW_T - 3600, NOW - 600], True),  # later restarts don't matter
@@ -643,3 +644,34 @@ def test_restart_times_pruned_to_28_days(env):
         {"restart_times": [NOW - 29 * DAY, NOW - 27 * DAY], "pending_restart": True}))
     run_cycle(env, FakeBridge(jobs=jobs()), NOW)
     assert state(env)["restart_times"] == [NOW - 27 * DAY, NOW]
+
+
+def test_composed_shadow_restarted_in_its_scheduling_cycle_reaches_trial(env):
+    """The designed path, end to end: cycle 1 drafts a composed tool, writes the tool
+    dir, schedules the shadow and restarts the gateway in the same run (same `now`).
+    The shadow runs at run_at with the tool loaded, the live run 20 min later; cycle 2
+    compares them and the fix goes into trial."""
+    build(env, triage_runs())
+    b1 = FakeBridge(jobs=jobs(), oneshot_script=[reply(COMPOSED_REPLY)])
+    r1 = run_cycle(env, b1, NOW)
+    assert r1.restarted and state(env)["restart_times"] == [NOW]
+    (shadow_id, entry), = json.loads((env.root / "shadow_jobs.json").read_text()).items()
+    assert entry["scheduled_at"] == NOW
+    run_at = entry["run_at"]
+    calls = [(GET, {"message_id": "m1"}, "b"), (GET, {"message_id": "m2"}, "b")]
+    sessions = triage_runs()
+    sessions.append({"id": sid(shadow_id, run_at), "source": "cron", "started_at": run_at,
+                     "cost": 0.08, "in": 80_000, "out": 800, "calls": calls})
+    sessions.append({"id": sid(TRIAGE, run_at + 1200), "source": "cron",
+                     "started_at": run_at + 1200, "cost": 0.10, "in": 100_000, "out": 1000,
+                     "calls": calls})
+    env.db.unlink()
+    build(env, sessions)
+    b2 = FakeBridge(jobs=jobs())
+    r2 = run_cycle(env, b2, run_at + 7200)
+    (rec,) = Ledger.load(env.root).records
+    assert rec.state == "trial" and rec.kind == "composed_tool", rec.reason
+    assert rec.id in r2.applied
+    assert (env.root / "tools" / "tuned_triage" / "program.py").exists()
+    assert b2.jobs[TRIAGE]["prompt"] == "new prompt"
+    assert "tuner" in b2.jobs[TRIAGE]["enabled_toolsets"]
