@@ -1,4 +1,5 @@
 """Policy constants. Single source; nothing else hard-codes these."""
+import re
 
 # Config keys the tuner may change through the bridge (spec 5.1).
 CONFIG_ALLOW_PREFIXES = ("tools.tool_search.", "compression.")
@@ -10,6 +11,8 @@ CONFIG_FORBIDDEN_PREFIXES = (
 
 # Composed tools (spec 5.2).
 TOOL_PREFIX = "tuned_"
+# A composed tool's name (and its directory name): limits, ledger and plugin share it.
+TOOL_NAME_RE = re.compile(re.escape(TOOL_PREFIX) + r"[A-Za-z0-9_]{1,58}")
 TOOLSET = "tuner"
 SANDBOX_ARGV = (
     "docker", "run", "--rm", "-i", "--network=none", "--memory", "512m",

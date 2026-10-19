@@ -68,8 +68,8 @@ def _check_composed(fix: Fix, ctx: LimitContext) -> list[str]:
     reasons = _check_job_target(fix)
     p = fix.payload
     name = p.get("name")
-    if not isinstance(name, str) or not name.startswith(policy.TOOL_PREFIX):
-        reasons.append(f"tool name must start with {policy.TOOL_PREFIX!r}")
+    if not isinstance(name, str) or not policy.TOOL_NAME_RE.fullmatch(name):
+        reasons.append(f"tool name must match {policy.TOOL_NAME_RE.pattern}")
     if isinstance(name, str) and name in ctx.existing_tools \
             and not name.startswith(policy.TOOL_PREFIX):
         reasons.append(f"tool name {name!r} would shadow an existing tool")

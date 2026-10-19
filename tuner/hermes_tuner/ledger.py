@@ -32,7 +32,7 @@ State = Literal["rejected", "shadow_pending", "shadow_failed", "trial", "kept",
 ACTIVE_STATES = frozenset({"shadow_pending", "trial", "applied"})
 APPLIED_STATES = frozenset({"trial", "applied", "kept"})
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,100}")
-_TOOL_NAME = re.compile(re.escape(policy.TOOL_PREFIX) + r"[A-Za-z0-9_]{1,58}")
+_TOOL_NAME = policy.TOOL_NAME_RE
 
 
 @dataclass

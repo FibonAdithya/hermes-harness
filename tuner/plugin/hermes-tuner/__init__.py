@@ -51,7 +51,7 @@ SHADOW_DUE_BEFORE_S = 2 * 3600
 SHADOW_DUE_AFTER_S = 10 * 60
 _ROOTS: dict[tuple[str, str], str] = {}
 _ROOTS_MAX = 4096
-_TOOL_NAME = re.compile(re.escape(policy.TOOL_PREFIX) + r"[A-Za-z0-9_]{1,58}")
+_TOOL_NAME = policy.TOOL_NAME_RE
 
 
 # --- paths (read at call time so tests and profiles can move HERMES_HOME) ---

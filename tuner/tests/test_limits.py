@@ -273,3 +273,22 @@ def test_never_touch_beats_editable(tmp_path, monkeypatch):
 def test_unhashable_target_does_not_raise(tmp_path):
     bad = Fix("f", "job_prompt", ["x"], {"prompt": "p", "add_toolsets": []}, "k")  # type: ignore[arg-type]
     assert check_fix(bad, ctx(tmp_path))
+
+
+@pytest.mark.parametrize("name", ["tuned_a-b", "tuned_", "tuned_" + "x" * 59, "tuned_é",
+                                  "tuned_ok\n", "tuned_a.b", "tuned_a/../b"])
+def test_composed_name_must_fullmatch_the_ledger_pattern(tmp_path, name):
+    """m2: a name the ledger and plugin would refuse is refused at the gate."""
+    assert any("tool name must match" in r for r in check_fix(composed(name=name), ctx(tmp_path)))
+
+
+@pytest.mark.parametrize("name", ["tuned_ok_1", "tuned_" + "x" * 58])
+def test_composed_name_matching_the_pattern_passes(tmp_path, name):
+    assert check_fix(composed(name=name), ctx(tmp_path)) == []
+
+
+def test_one_tool_name_pattern_everywhere():
+    from hermes_tuner import ledger, policy
+    from test_relay import load_plugin
+    assert ledger._TOOL_NAME is policy.TOOL_NAME_RE
+    assert load_plugin()._TOOL_NAME is policy.TOOL_NAME_RE
