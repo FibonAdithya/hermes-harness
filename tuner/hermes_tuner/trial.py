@@ -19,13 +19,13 @@ import json
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
 from . import policy
 from .bridge import Bridge, BridgeError
-from .ledger import FixRecord, _atomic_write, _job_after
+from .ledger import FixRecord, atomic_write, job_after_for
 from .measure import JobStats, job_stats
 from .model import Fix, Session
 
@@ -50,15 +50,20 @@ class Verdict:
 # --- shadow jobs ---------------------------------------------------------------
 
 def _read_entries(root: Path) -> dict:
+    """The ledger entries; {} only when the file does not exist. A corrupt or
+    unreadable file raises, so it is never overwritten with an empty one."""
     try:
-        data = json.loads((Path(root) / SHADOW_FILE).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        text = (Path(root) / SHADOW_FILE).read_text(encoding="utf-8")
+    except FileNotFoundError:
         return {}
-    return data if isinstance(data, dict) else {}
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError(f"{SHADOW_FILE} is not a JSON object")
+    return data
 
 
 def _write_entries(root: Path, entries: dict) -> None:
-    _atomic_write(Path(root) / SHADOW_FILE,
+    atomic_write(Path(root) / SHADOW_FILE,
                   json.dumps(entries, indent=2, sort_keys=True).encode("utf-8"))
 
 
@@ -105,14 +110,10 @@ def schedule_shadow(fix: Fix, job: dict, bridge: Bridge, root: Path, now: float)
     run_at = live_at - policy.SHADOW_LEAD_MIN * 60
     if run_at <= now:
         raise ValueError("shadow time is not in the future")
-    p = fix.payload
-    if fix.kind == "composed_tool":
-        add = [policy.TOOLSET]
-    else:
-        add = p.get("add_toolsets", [])
-        if not isinstance(add, list) or any(t != policy.TOOLSET for t in add):
-            raise ValueError(f"add_toolsets may only contain {policy.TOOLSET!r}")
-    toolsets = _job_after(job, prompt, add)["enabled_toolsets"]
+    after = job_after_for(fix, job)
+    if after is None:  # unreachable: _shadow_prompt rejected a missing job_prompt
+        raise ValueError("fix does not change the job prompt")
+    toolsets = after["enabled_toolsets"]
     schedule = datetime.fromtimestamp(run_at, timezone.utc).isoformat()
     created = bridge.create_job(prompt, schedule, policy.SHADOW_PREFIX + fix.id,
                                 "local", toolsets)

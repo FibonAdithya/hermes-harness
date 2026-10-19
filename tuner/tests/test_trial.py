@@ -9,9 +9,9 @@ from pathlib import Path
 import pytest
 
 from hermes_tuner import policy
-from hermes_tuner.bridge import BridgeError, FakeBridge
+from hermes_tuner.bridge import FakeBridge
 from hermes_tuner.ledger import FixRecord
-from hermes_tuner.measure import JobStats, job_stats
+from hermes_tuner.measure import JobStats
 from hermes_tuner.model import Fix, Session, ToolCall
 from hermes_tuner.trial import (
     Verdict, baseline_stats, calendar_events, cleanup_shadows, compare_calendar,
@@ -299,7 +299,7 @@ def test_shadow_record_failure_removes_the_job(tmp_path, monkeypatch):
 
     def boom(*a, **k):
         raise OSError("disk full")
-    monkeypatch.setattr(trial, "_atomic_write", boom)
+    monkeypatch.setattr(trial, "atomic_write", boom)
     with pytest.raises(OSError):
         schedule_shadow(job_fix(), bridge.jobs[LIVE], bridge, tmp_path, NOW)
     assert list(bridge.jobs) == [LIVE]
@@ -383,3 +383,37 @@ def test_read_intents_rejects_path_injection(tmp_path):
     for bad in ["../secret", "../../secret", "/etc/passwd", "secret", ROOT_ID + "/../x",
                 ROOT_ID + "\n", 5, None]:
         assert read_intents(tmp_path, [bad]) == []
+
+
+def test_shadow_toolsets_equal_what_apply_sets_on_the_live_job(tmp_path):
+    from hermes_tuner.ledger import Ledger, apply, job_after_for
+    for payload_extra, expected in [({"add_toolsets": []}, ["web"]), ({}, ["web", "tuner"]),
+                                    ({"add_toolsets": ["tuner"]}, ["web", "tuner"])]:
+        fix = Fix("f1", "composed_tool", LIVE,
+                  {"name": "tuned_x", "description": "d", "parameters": {"type": "object"},
+                   "calls": ["web_search"], "mutating": False, "program": "print(1)\n",
+                   "job_prompt": "NEW PROMPT", **payload_extra}, "k")
+        shadow_bridge = FakeBridge(jobs={LIVE: live_job()})
+        sid = schedule_shadow(fix, shadow_bridge.jobs[LIVE], shadow_bridge, tmp_path / f"s{len(expected)}{len(payload_extra)}", NOW)
+        live_bridge = FakeBridge(jobs={LIVE: live_job()})
+        root = tmp_path / f"t{len(expected)}{len(payload_extra)}"
+        ledger = Ledger.load(root)
+        ledger.add(FixRecord("f1", fix.kind, LIVE, "k", "shadow_pending", 1.0), fix)
+        apply(fix, ledger, live_bridge, root, 100.0, skills_root=tmp_path)
+        assert shadow_bridge.jobs[sid]["enabled_toolsets"] == expected
+        assert live_bridge.jobs[LIVE]["enabled_toolsets"] == expected
+        assert job_after_for(fix, live_job())["enabled_toolsets"] == expected
+        assert shadow_bridge.jobs[sid]["prompt"] == live_bridge.jobs[LIVE]["prompt"]
+
+
+def test_corrupt_shadow_file_is_not_overwritten(tmp_path):
+    bad = tmp_path / "shadow_jobs.json"
+    bad.write_text("{not json")
+    bridge = FakeBridge(jobs={LIVE: live_job()})
+    with pytest.raises(ValueError):
+        schedule_shadow(job_fix(), bridge.jobs[LIVE], bridge, tmp_path, NOW)
+    assert bad.read_text() == "{not json"
+    assert list(bridge.jobs) == [LIVE]  # the created shadow job was rolled back
+    with pytest.raises(ValueError):
+        cleanup_shadows(bridge, tmp_path, NOW)
+    assert bad.read_text() == "{not json"

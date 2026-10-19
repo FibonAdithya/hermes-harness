@@ -65,7 +65,7 @@ def _mkdirs(path: Path) -> None:
         d.chmod(0o700)
 
 
-def _atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
+def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
     _mkdirs(path.parent)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")
     try:
@@ -81,7 +81,7 @@ def _atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
 
 
 def _write_json(path: Path, obj: Any) -> None:
-    _atomic_write(path, json.dumps(obj, indent=2, sort_keys=True).encode("utf-8"))
+    atomic_write(path, json.dumps(obj, indent=2, sort_keys=True).encode("utf-8"))
 
 
 def _read_json(path: Path) -> Any:
@@ -210,6 +210,32 @@ def _add_toolsets(payload: dict, default: list[str]) -> list[str]:
     return add
 
 
+def job_after_for(fix: Fix, live: dict) -> dict | None:
+    """The job's `prompt` and `enabled_toolsets` after `fix` is applied to `live`.
+
+    The one place that decides this; `apply` and the shadow run both use it.
+    Returns None for a composed_tool fix without a job_prompt (the job is not
+    touched). Raises ValueError for a fix kind with no job change, a bad prompt
+    or a bad add_toolsets.
+    """
+    p = fix.payload if isinstance(fix.payload, dict) else {}
+    if fix.kind == "job_prompt":
+        prompt, add = p.get("prompt"), None
+        if not isinstance(prompt, str):
+            raise ValueError("job_prompt payload needs a prompt string")
+        add = _add_toolsets(p, [])
+    elif fix.kind == "composed_tool":
+        prompt = p.get("job_prompt")
+        if prompt is None:
+            return None
+        if not isinstance(prompt, str):
+            raise ValueError("job_prompt must be a string or null")
+        add = _add_toolsets(p, [policy.TOOLSET])
+    else:
+        raise ValueError(f"{fix.kind!r} fixes do not change a job")
+    return _job_after(live, prompt, add)
+
+
 def _read_job(bridge: Bridge, job_id: str) -> dict:
     job = bridge.get_job(job_id)
     if job is None:
@@ -246,8 +272,8 @@ def _write_tool_dir(tools: Path, name: str, spec: dict, program: str) -> None:
     tmp = Path(tempfile.mkdtemp(dir=tools, prefix=".tmp-"))
     try:
         tmp.chmod(0o700)
-        _atomic_write(tmp / "tool.json", json.dumps(spec, indent=2).encode())
-        _atomic_write(tmp / "program.py", program.encode("utf-8"))
+        atomic_write(tmp / "tool.json", json.dumps(spec, indent=2).encode())
+        atomic_write(tmp / "program.py", program.encode("utf-8"))
         os.rename(tmp, final)  # same filesystem; fails rather than replacing a dir
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -287,7 +313,7 @@ def apply(fix: Fix, ledger: Ledger, bridge: Bridge, root: Path, now: float,
     if fix.kind == "job_prompt":
         if not isinstance(p.get("prompt"), str):
             raise ValueError("job_prompt payload needs a prompt string")
-        add = _add_toolsets(p, [])
+        job_after_for(fix, {})  # validate before any state changes
     elif fix.kind == "config":
         if not isinstance(p.get("key"), str) or "value" not in p:
             raise ValueError("config payload needs a key and a value")
@@ -297,7 +323,7 @@ def apply(fix: Fix, ledger: Ledger, bridge: Bridge, root: Path, now: float,
         job_prompt = p.get("job_prompt")
         if job_prompt is not None and not isinstance(job_prompt, str):
             raise ValueError("job_prompt must be a string or null")
-        add = _add_toolsets(p, [policy.TOOLSET]) if job_prompt is not None else []
+        job_after_for(fix, {})
     rec = ledger.get(fix.id)
     if rec is None:
         rec = FixRecord(fix.id, fix.kind, fix.target, fix.candidate_key,
@@ -313,7 +339,7 @@ def apply(fix: Fix, ledger: Ledger, bridge: Bridge, root: Path, now: float,
             live = _read_job(bridge, fix.target)
             before = {"prompt": live.get("prompt"),
                       "enabled_toolsets": live.get("enabled_toolsets")}
-            after = _job_after(live, p["prompt"], add)
+            after = job_after_for(fix, live)
             _write_json(vdir / "before.json", before)
             _write_json(after_path, after)
             bridge.update_job(fix.target, _job_updates(before, after))
@@ -338,7 +364,7 @@ def apply(fix: Fix, ledger: Ledger, bridge: Bridge, root: Path, now: float,
             _write_json(vdir / "before.json", {
                 "file": str(path), "b64": base64.b64encode(old_bytes).decode(), "mode": mode})
             _write_json(after_path, {"file": str(path), "text": text})
-            _atomic_write(path, text.encode("utf-8"), mode)
+            atomic_write(path, text.encode("utf-8"), mode)
         else:
             tools = root / "tools"
             before: dict = {"tool": None, "job": None}
@@ -347,7 +373,7 @@ def apply(fix: Fix, ledger: Ledger, bridge: Bridge, root: Path, now: float,
                 live = _read_job(bridge, fix.target)
                 before["job"] = {"prompt": live.get("prompt"),
                                  "enabled_toolsets": live.get("enabled_toolsets")}
-                after["job"] = _job_after(live, job_prompt, add)
+                after["job"] = job_after_for(fix, live)
             _write_json(vdir / "before.json", before)
             _write_json(after_path, after)
             _write_tool_dir(tools, spec["name"], spec, program)
@@ -402,7 +428,7 @@ def rollback(record: FixRecord, ledger: Ledger, bridge: Bridge, root: Path, now:
             if cur == original:
                 pass  # already restored (a retry)
             elif cur == after["text"].encode("utf-8"):
-                _atomic_write(path, original, before["mode"])
+                atomic_write(path, original, before["mode"])
             else:
                 changed.append("skill file")
         elif record.kind == "composed_tool":
