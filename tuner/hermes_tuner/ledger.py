@@ -354,6 +354,9 @@ def apply(fix: Fix, ledger: Ledger, bridge: Bridge, root: Path, now: float,
         if not isinstance(p.get("key"), str) or "value" not in p:
             raise ValueError("config payload needs a key and a value")
         encode_config_value(p["value"])  # ValueError for None/list/dict, before any write
+        if not _round_trips(p["value"]):  # -1, NaN, inf, 1e-05, "on": Hermes would change it
+            raise ValueError(f"config value {p['value']!r} does not survive "
+                             "`hermes config set` unchanged")
     elif fix.kind == "composed_tool":
         spec, program = _tool_files(p)
         job_prompt = p.get("job_prompt")

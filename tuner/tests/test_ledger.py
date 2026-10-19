@@ -96,14 +96,15 @@ def test_unknown_payload_keys_are_ignored(tmp_path):
 
 def test_rollback_restores_exact_previous_value(tmp_path):
     root, skills, bridge, ledger = make(tmp_path)
-    f = Fix("c1", "config", "tools.tool_search.enabled",
-            {"key": "tools.tool_search.enabled", "value": "off"}, "k")
+    bridge.config["compression.threshold"] = 0.8
+    f = Fix("c1", "config", "compression.threshold",
+            {"key": "compression.threshold", "value": 0.5}, "k")
     rec = do_apply(f, ledger, bridge, root, skills)
     assert rec.needs_restart is True
-    assert bridge.config_get("tools.tool_search.enabled") == "off"
+    assert bridge.config_get("compression.threshold") == 0.5
     out = do_rollback(rec, ledger, bridge, root, skills)
     assert out.state == "rolled_back"
-    assert bridge.config_get("tools.tool_search.enabled") == "auto"
+    assert repr(bridge.config_get("compression.threshold")) == "0.8"
 
 
 def test_rollback_job_prompt_restores_prompt_and_toolsets(tmp_path):
@@ -127,7 +128,7 @@ def test_rollback_skips_owner_edit(tmp_path):
 
 def test_rollback_config_skips_owner_edit(tmp_path):
     root, skills, bridge, ledger = make(tmp_path)
-    f = Fix("c1", "config", "k", {"key": "compression.threshold", "value": "0.5"}, "k")
+    f = Fix("c1", "config", "k", {"key": "compression.threshold", "value": 0.5}, "k")
     bridge.config["compression.threshold"] = 0.8
     rec = do_apply(f, ledger, bridge, root, skills)
     bridge.config["compression.threshold"] = 0.9
@@ -136,19 +137,20 @@ def test_rollback_config_skips_owner_edit(tmp_path):
 
 
 def test_config_coercion_does_not_look_like_owner_edit(tmp_path):
-    # Hermes coerces "off" to False for non-string settings; that is not an owner edit.
+    # The live value read back as its string form ("false") is the value written
+    # (False), not an owner edit.
     root, skills, bridge, ledger = make(tmp_path)
     bridge.config["compression.enabled"] = True
-    f = Fix("c1", "config", "k", {"key": "compression.enabled", "value": "off"}, "k")
+    f = Fix("c1", "config", "k", {"key": "compression.enabled", "value": False}, "k")
     rec = do_apply(f, ledger, bridge, root, skills)
-    bridge.config["compression.enabled"] = False  # what Hermes stores for "off"
+    bridge.config["compression.enabled"] = "false"
     assert do_rollback(rec, ledger, bridge, root, skills).state == "rolled_back"
     assert bridge.config["compression.enabled"] is True
 
 
 def test_config_without_previous_value_is_refused(tmp_path):
     root, skills, bridge, ledger = make(tmp_path)
-    f = Fix("c1", "config", "k", {"key": "compression.new_key", "value": "1"}, "k")
+    f = Fix("c1", "config", "k", {"key": "compression.new_key", "value": 1}, "k")
     rec = do_apply(f, ledger, bridge, root, skills)
     assert rec.state == "bridge_error" and "roll" in rec.reason
     assert "compression.new_key" not in bridge.config
@@ -376,11 +378,35 @@ def test_unsettable_config_value_writes_nothing(tmp_path, bad):
     assert not [c for c in bridge.calls if c[0] in FakeBridge.MUTATING]
 
 
+@pytest.mark.parametrize("new", [-1, float("nan"), float("inf"), float("-inf"), 1e-05, "on",
+                                 "1", -0.5])
+def test_config_new_value_that_does_not_round_trip_writes_nothing(tmp_path, new):
+    """M2: a value `hermes config set` would not store as given is refused before
+    any write."""
+    root, skills, bridge, ledger = make(tmp_path)
+    bridge.config["compression.x"] = 0.5
+    f = Fix("c1", "config", "k", {"key": "compression.x", "value": new}, "k")
+    with pytest.raises(ValueError):
+        do_apply(f, ledger, bridge, root, skills, add=False)
+    assert ledger.records == [] and not (root / "versions").exists()
+    assert bridge.config["compression.x"] == 0.5
+    assert not [c for c in bridge.calls if c[0] in FakeBridge.MUTATING]
+
+
+@pytest.mark.parametrize("new", [0.7, 3, True, "auto"])
+def test_config_new_value_that_round_trips_is_applied(tmp_path, new):
+    root, skills, bridge, ledger = make(tmp_path)
+    bridge.config["compression.x"] = 0.5
+    f = Fix("c1", "config", "k", {"key": "compression.x", "value": new}, "k")
+    assert do_apply(f, ledger, bridge, root, skills).state == "trial"
+    assert bridge.config["compression.x"] == new
+
+
 @pytest.mark.parametrize("old", [{"a": 1}, [1, 2], -1, 1e-05, "on", float("nan")])
 def test_config_with_unrestorable_old_value_is_refused(tmp_path, old):
     root, skills, bridge, ledger = make(tmp_path)
     bridge.config["compression.x"] = old
-    f = Fix("c1", "config", "k", {"key": "compression.x", "value": "1"}, "k")
+    f = Fix("c1", "config", "k", {"key": "compression.x", "value": 0.5}, "k")
     rec = do_apply(f, ledger, bridge, root, skills)
     assert rec.state == "bridge_error" and "restored" in rec.reason
     assert repr(bridge.config["compression.x"]) == repr(old)
