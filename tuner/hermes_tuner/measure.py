@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from statistics import median
 
+from hermes_tuner import policy
 from hermes_tuner.model import Session
 
 
@@ -52,3 +53,12 @@ def weekly_spend(sessions: list[Session], job_ids: set[str]) -> float:
     """Sum of est_cost over every session whose job_id is in `job_ids`,
     zero-call runs included (spend is spend)."""
     return sum(s.est_cost for s in sessions if s.job_id in job_ids)
+
+
+def run_cost(session: Session) -> float:
+    """est_cost when it is a number above zero, else a token-based estimate
+    (subscription billing reports $0)."""
+    c = session.est_cost
+    if isinstance(c, (int, float)) and not isinstance(c, bool) and c > 0:
+        return float(c)
+    return (session.prompt_tokens + session.output_tokens) * policy.FALLBACK_USD_PER_MTOK / 1e6

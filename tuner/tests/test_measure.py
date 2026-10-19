@@ -1,3 +1,4 @@
+import pytest
 from hermes_tuner.measure import chat_stats, job_stats, weekly_spend
 from hermes_tuner.model import Session, ToolCall
 
@@ -52,3 +53,13 @@ def test_weekly_spend_sums_selected_jobs_including_zero_call_runs():
           _s("c", job="j2", cost=4.0), _s("d", job="j3", cost=8.0)]
     assert weekly_spend(ss, {"j1", "j2"}) == 7.0
     assert weekly_spend(ss, set()) == 0.0
+
+
+def test_run_cost_prefers_estimate_else_tokens():
+    from hermes_tuner import policy
+    from hermes_tuner.measure import run_cost
+    s = _s("a", cost=0.25)
+    assert run_cost(s) == 0.25
+    s0 = Session(id="b", source="cron", job_id="j", started_at=1.0, est_cost=0.0,
+                 prompt_tokens=600_000, output_tokens=400_000, calls=())
+    assert run_cost(s0) == pytest.approx(policy.FALLBACK_USD_PER_MTOK)
