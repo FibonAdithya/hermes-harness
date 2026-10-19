@@ -42,12 +42,12 @@ def job_cost_baseline(sessions: Iterable[Session], job_id: str, applied_at: floa
 
 def tuner_spend(ledger: Ledger, sessions: Iterable[Session], shadow_ids: Iterable[str],
                 since: float, until: float | None = None) -> float:
-    """Drafting spend on records created in [since, until) plus run_cost of shadow-job
+    """Drafting spend on records created in (since, until] plus run_cost of shadow-job
     sessions started in that window."""
     shadows = set(shadow_ids)
 
     def inside(t: float) -> bool:
-        return t >= since and (until is None or t < until)
+        return t > since and (until is None or t <= until)
 
     drafting = sum(r.spend_usd for r in ledger.records if inside(r.created_at))
     shadow = sum(run_cost(s) for s in sessions if s.job_id in shadows and inside(s.started_at))
@@ -56,7 +56,7 @@ def tuner_spend(ledger: Ledger, sessions: Iterable[Session], shadow_ids: Iterabl
 
 def savings(ledger: Ledger, sessions: list[Session], since: float, until: float) -> float:
     """Σ over jobs with a job fix in trial or kept, of Σ over that job's runs in
-    [since, until) after the fix went live, of (baseline − run_cost(run)).
+    (since, until] after the fix was applied, of (baseline − run_cost(run)).
 
     Per job the baseline is the one before its EARLIEST live fix, so two fixes kept
     one after the other on the same job are not counted twice. Config and skill
@@ -72,7 +72,7 @@ def savings(ledger: Ledger, sessions: list[Session], since: float, until: float)
         if base is None:
             continue
         total += sum(base - run_cost(s) for s in job_runs(sessions, job)
-                     if since <= s.started_at < until and s.started_at >= applied_at)
+                     if since < s.started_at <= until and s.started_at >= applied_at)
     return total
 
 
@@ -81,22 +81,25 @@ def _money(x: float) -> str:
 
 
 def weekly_line(ledger: Ledger, sessions: list[Session], now: float,
-                shadow_ids: Iterable[str] = (), errors: int = 0) -> str:
-    """One line covering the 7 days before `now`. `errors` counts errors that are not
-    ledger records (the cycle's own error log); bridge_error records created in the
-    window are added to it."""
-    since = now - 7 * DAY
+                shadow_ids: Iterable[str] = (), errors: int = 0,
+                since: float | None = None) -> str:
+    """One line covering (since, now]; `since` defaults to 7 days before `now`. The
+    cycle passes the time the previous line was written, so an outcome stamped by
+    the run that writes a line is in exactly one line. `errors` is the number of
+    failures in the window (the cycle logs each failure once, including those that
+    left a bridge_error record, so records are not counted again here)."""
+    if since is None:
+        since = now - 7 * DAY
 
     def inside(t: float | None) -> bool:
-        return t is not None and since <= t < now
+        return t is not None and since < t <= now
 
     saved = savings(ledger, sessions, since, now)
     applied = sum(inside(r.applied_at) for r in ledger.records)
     kept = sum(r.state == "kept" and inside(r.decided_at) for r in ledger.records)
     rolled = sum(r.state == "rolled_back" and inside(r.decided_at) for r in ledger.records)
     spent = tuner_spend(ledger, sessions, shadow_ids, since, now)
-    errs = errors + sum(r.state == "bridge_error" and inside(r.created_at)
-                        for r in ledger.records)
+    errs = errors
     line = (f"Hermes tuner: saved ~{_money(saved)} this week (ESTIMATE), {applied} applied, "
             f"{kept} kept, {rolled} rolled back; tuner spent {_money(spent)}")
     if errs:

@@ -50,6 +50,9 @@ class FixRecord:
     spend_usd: float = 0.0
     needs_restart: bool = False
     decided_at: float | None = None  # when a trial was kept or rolled back
+    # When the fix took effect: applied_at, or for a fix that needs a gateway restart
+    # the restart time (spec 4.7). None until then.
+    live_from: float | None = None
 
 
 # --- atomic file helpers ------------------------------------------------------
@@ -96,6 +99,14 @@ def _check_id(fix_id: str) -> None:
         raise ValueError(f"unsafe fix id {fix_id!r}")
 
 
+def _compat(r: dict) -> dict:
+    """Records saved before live_from existed: live from applied_at unless the fix
+    needed a restart (then unknown, so None)."""
+    if "live_from" not in r:
+        r = dict(r, live_from=None if r.get("needs_restart") else r.get("applied_at"))
+    return r
+
+
 class Ledger:
     def __init__(self, root: Path, records: list[FixRecord] | None = None):
         self.root = Path(root)
@@ -106,7 +117,7 @@ class Ledger:
         path = Path(root) / "ledger.json"
         if not path.exists():
             return cls(root)
-        return cls(root, [FixRecord(**r) for r in _read_json(path)["records"]])
+        return cls(root, [FixRecord(**_compat(r)) for r in _read_json(path)["records"]])
 
     def save(self) -> None:
         _write_json(self.root / "ledger.json", {"records": [asdict(r) for r in self.records]})
@@ -387,6 +398,7 @@ def apply(fix: Fix, ledger: Ledger, bridge: Bridge, root: Path, now: float,
         after_path.unlink(missing_ok=True)
         return _set_state(ledger, rec, "bridge_error", f"{type(exc).__name__}: {exc}")
     rec.applied_at, rec.needs_restart = now, needs_restart(fix)
+    rec.live_from = None if rec.needs_restart else now
     return _set_state(ledger, rec, "trial")
 
 

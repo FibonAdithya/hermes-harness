@@ -52,8 +52,8 @@ class DraftSteps:
         spend28 = tuner_spend(self.ledger, self.sessions, self.shadow_ids, now - 28 * DAY)
         saved28 = savings(self.ledger, self.sessions, now - 28 * DAY, now)
         if spend28 > saved28:
-            self.report.budget = (f"paused: 28-day spend ${spend28:.2f} > 28-day savings "
-                                  f"${saved28:.2f} (ESTIMATE)")
+            self.report.budget = (f"paused: 28-day spend ${spend28:.4f} > 28-day savings "
+                                  f"${saved28:.4f} (ESTIMATE)")
             return
         window = [s for s in self.sessions if s.started_at >= now - 28 * DAY]
         self.skill_names = self._skill_names(window)
@@ -249,4 +249,6 @@ class DraftSteps:
             self.report.rejected.append(rec.id)
             return False
         self.report.shadowed.append(rec.id)
+        # A composed tool is visible to the shadow only after a gateway restart.
+        self.restart_wanted |= rec.needs_restart
         return True

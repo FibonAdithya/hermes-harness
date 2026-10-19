@@ -10,8 +10,9 @@ left half-applied. A dry run makes no mutating bridge call (no drafting either)
 and writes nothing under `root`; it lists what it would do in `planned`.
 
 Besides the ledger, `root/cycle_state.json` holds {"pending_restart": bool,
-"weekly_written": "YYYY-Www", "errors": [{"at": epoch, "error": str}]} (errors
-from the last 28 days, counted in the weekly line).
+"last_restart_at": epoch, "weekly_written": "YYYY-Www", "weekly_written_at": epoch,
+"errors": [{"at": epoch, "error": str}]} (errors from the last 28 days; each failure
+is logged once and the weekly line counts the log).
 """
 from __future__ import annotations
 
@@ -30,7 +31,7 @@ from .budget import DAY, JOB_KINDS, weekly_line
 from .cycle_draft import GLOBAL_KINDS, DraftSteps
 from .fingerprint import CopyIndex
 from .history import History, HistoryUnavailable
-from .ledger import (FixRecord, Ledger, _tool_files, _tool_matches, apply, atomic_write,
+from .ledger import (APPLIED_STATES, FixRecord, Ledger, _tool_files, _tool_matches, apply, atomic_write,
                      rollback)
 from .measure import run_cost
 from .model import Fix, Session
@@ -41,6 +42,7 @@ __all__ = ["CycleConfig", "CycleReport", "run_cycle", "weekly_line"]
 
 HISTORY_DAYS = 35          # detection window (28) plus a week of margin
 SHADOW_GRACE_S = 2 * DAY   # a shadow that has not run 2 days after run_at failed
+NO_LIVE_RUN_S = 3 * DAY    # a shadow with no live run to compare 3 days after run_at failed
 ERROR_KEEP_S = 28 * DAY
 STATE_FILE = "cycle_state.json"
 
@@ -216,12 +218,20 @@ class _Cycle(DraftSteps):
                 if run_at is None or self.now - run_at > SHADOW_GRACE_S:
                     self._shadow_failed(rec, "shadow did not run")
                 continue
+            if rec.needs_restart:
+                restarted = self.state.get("last_restart_at")
+                if not isinstance(restarted, (int, float)) or restarted > shadow.started_at:
+                    self._shadow_failed(rec, "shadow ran before restart")
+                    continue
             if not shadow.calls:
                 self._shadow_failed(rec, "shadow run made no tool calls")
                 continue
             old = next((s for s in by_start if s.job_id == live and s.calls
                         and s.started_at > shadow.started_at), None)
             if old is None:
+                run_at = trial._epoch(entry.get("run_at"))
+                if run_at is not None and self.now - run_at > NO_LIVE_RUN_S:
+                    self._shadow_failed(rec, "no live run to compare")
                 continue  # wait for the live run to compare with
             verdict = self._compare(live, shadow, old)
             if verdict is None:
@@ -308,15 +318,18 @@ class _Cycle(DraftSteps):
         for rec in [r for r in self.ledger.records if r.state == "trial"]:
             if rec.applied_at is None:
                 continue
+            if rec.live_from is None:
+                continue  # waiting for the gateway restart that makes it live (spec 4.7)
             if rec.kind in JOB_KINDS:
+                # baseline: before applied_at; trial runs: after the fix went live
                 base = trial.baseline_stats(self.sessions, rec.target, rec.applied_at)
                 verdict = trial.trial_verdict(
-                    rec, trial.trial_stats(self.sessions, rec.target, rec.applied_at),
+                    rec, trial.trial_stats(self.sessions, rec.target, rec.live_from),
                     base.median_prompt_tokens if base is not None else 0.0)
             elif rec.kind in GLOBAL_KINDS:
-                if self.now - rec.applied_at < policy.GLOBAL_TRIAL_DAYS * DAY:
+                if self.now - rec.live_from < policy.GLOBAL_TRIAL_DAYS * DAY:
                     continue
-                verdict = self._global_verdict(rec.applied_at)
+                verdict = self._global_verdict(rec.applied_at, rec.live_from)
             else:
                 continue
             if verdict == "keep":
@@ -324,14 +337,14 @@ class _Cycle(DraftSteps):
             elif verdict == "rollback":
                 self._rollback(rec)
 
-    def _global_verdict(self, applied_at: float) -> str:
+    def _global_verdict(self, applied_at: float, live_from: float) -> str:
         """keep only if the median run_cost over chat sessions and editable-job runs
-        since applied_at is strictly below the 28 days before (prompt tokens when
-        both medians are 0)."""
+        since live_from is strictly below the 28 days before applied_at (prompt
+        tokens when both medians are 0)."""
         def runs(lo: float, hi: float) -> list[Session]:
             return [s for s in self.sessions if lo <= s.started_at < hi and s.calls
                     and (s.source == "telegram" or s.job_id in policy.EDITABLE_JOBS)]
-        after = [s for s in runs(applied_at, float("inf")) if s.started_at > applied_at]
+        after = [s for s in runs(live_from, float("inf")) if s.started_at > live_from]
         before = runs(applied_at - 28 * DAY, applied_at)
         if not after or not before:
             return "rollback"
@@ -367,6 +380,7 @@ class _Cycle(DraftSteps):
         out.decided_at = self.now
         if out.state == "rolled_back":
             out.reason = "trial: not cheaper than baseline"
+            self.restart_wanted |= out.needs_restart
         self.ledger.save()
         self.report.rolled_back.append(rec.id)
 
@@ -423,7 +437,12 @@ class _Cycle(DraftSteps):
             if restart_allowed(datetime.fromtimestamp(self.now, timezone.utc), last, next_runs):
                 self.bridge.restart_gateway()
                 self.state["pending_restart"] = False
+                self.state["last_restart_at"] = self.now
                 self.report.restarted = True
+                for r in self.ledger.records:
+                    if r.state in APPLIED_STATES and r.needs_restart and r.live_from is None:
+                        r.live_from = self.now
+                self.ledger.save()
         except (BridgeError, HistoryUnavailable) as exc:
             self.err(f"restart: {type(exc).__name__}: {exc}")
 
@@ -436,15 +455,20 @@ class _Cycle(DraftSteps):
         if (self.state.get("weekly_written") == tag or path.exists()
                 or path.with_suffix(".sent").exists()):
             return
+        since = self.state.get("weekly_written_at")
+        if not isinstance(since, (int, float)) or since >= self.now:
+            since = self.now - 7 * DAY
         if self.dry:  # _finish_errors does not log in a dry run
             recent = len(self.report.errors)
         else:
-            recent = sum(1 for e in self.state.get("errors", [])
-                         if isinstance(e, dict) and self.now - e.get("at", 0) < 7 * DAY)
-        line = weekly_line(self.ledger, self.sessions, self.now, self.shadow_ids, errors=recent)
+            recent = sum(1 for e in self.state.get("errors", []) if isinstance(e, dict)
+                         and isinstance(e.get("at"), (int, float)) and since < e["at"] <= self.now)
+        line = weekly_line(self.ledger, self.sessions, self.now, self.shadow_ids, errors=recent,
+                           since=since)
         self.report.weekly = line
         if self.dry:
             self.plan(f"weekly line {tag}")
             return
         atomic_write(path, (line + "\n").encode("utf-8"))
         self.state["weekly_written"] = tag
+        self.state["weekly_written_at"] = self.now

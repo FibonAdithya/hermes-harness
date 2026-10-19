@@ -142,7 +142,7 @@ def apply_approved(proposal_id: str, bridge: Bridge, ledger: Ledger, root: Path,
         rec = FixRecord(pid, "new_reach", tool, fix.candidate_key, "approved", now)
         ledger.add(rec, fix)
     if key is None:
-        rec.applied_at, rec.needs_restart = now, False
+        rec.applied_at, rec.needs_restart, rec.live_from = now, False, now
         return _set_state(ledger, rec, "applied")
     vdir = ledger.version_dir(pid)
     try:
@@ -157,5 +157,5 @@ def apply_approved(proposal_id: str, bridge: Bridge, ledger: Ledger, root: Path,
             bridge.config_set_json(key, new)
     except (BridgeError, ValueError, OSError) as exc:
         return _set_state(ledger, rec, "bridge_error", f"{type(exc).__name__}: {exc}")
-    rec.applied_at, rec.needs_restart = now, True
+    rec.applied_at, rec.needs_restart, rec.live_from = now, True, None
     return _set_state(ledger, rec, "applied")
