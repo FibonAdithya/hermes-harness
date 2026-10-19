@@ -408,24 +408,27 @@ class _Cycle(DraftSteps):
         for rec in [r for r in self.ledger.records if r.state == "trial"]:
             if rec.applied_at is None:
                 continue
+            verdict = "continue"
             if rec.live_from is None:
-                continue  # waiting for the gateway restart that makes it live (spec 4.7)
-            if rec.kind in JOB_KINDS:
+                pass  # waiting for the gateway restart that makes it live (spec 4.7)
+            elif rec.kind in JOB_KINDS:
                 # baseline: before applied_at; trial runs: after the fix went live
                 base = trial.baseline_stats(self.sessions, rec.target, rec.applied_at)
                 verdict = trial.trial_verdict(
                     rec, trial.trial_stats(self.sessions, rec.target, rec.live_from),
                     base.median_prompt_tokens if base is not None else 0.0)
             elif rec.kind in GLOBAL_KINDS:
-                if self.now - rec.live_from < policy.GLOBAL_TRIAL_DAYS * DAY:
-                    continue
-                verdict = self._global_verdict(rec.applied_at, rec.live_from)
+                if self.now - rec.live_from >= policy.GLOBAL_TRIAL_DAYS * DAY:
+                    verdict = self._global_verdict(rec.applied_at, rec.live_from)
             else:
                 continue
+            start = rec.live_from if rec.live_from is not None else rec.applied_at
             if verdict == "keep":
                 self._keep(rec)
             elif verdict == "rollback":
                 self._rollback(rec)
+            elif self.now - start >= policy.TRIAL_DEADLINE_DAYS * DAY:
+                self._rollback(rec, f"no verdict in {policy.TRIAL_DEADLINE_DAYS} days")
 
     def _global_verdict(self, applied_at: float, live_from: float) -> str:
         """keep only if the median priced_cost over chat sessions and editable-job runs
@@ -454,7 +457,7 @@ class _Cycle(DraftSteps):
         self._close(rec, "kept", "trial: cheaper than baseline")
         self.report.kept.append(rec.id)
 
-    def _rollback(self, rec: FixRecord) -> None:
+    def _rollback(self, rec: FixRecord, reason: str = "trial: not cheaper than baseline") -> None:
         if self.dry:
             self.plan(f"rollback {rec.id}")
             return
@@ -469,7 +472,7 @@ class _Cycle(DraftSteps):
             return
         out.decided_at = self.now
         if out.state == "rolled_back":
-            out.reason = "trial: not cheaper than baseline"
+            out.reason = reason
             self.restart_wanted |= out.needs_restart
         self.ledger.save()
         self.report.rolled_back.append(rec.id)

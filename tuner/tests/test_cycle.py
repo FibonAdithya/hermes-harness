@@ -894,3 +894,48 @@ def test_unexpected_error_after_drafting_still_records_the_spend(env, monkeypatc
     assert rec.spend_usd == pytest.approx(12_000 * policy.USD_PER_MTOK / 1e6)
     assert report.spend_usd == pytest.approx(rec.spend_usd)
     assert (env.root / "outbox" / "weekly-2026-W43.txt").exists()
+
+
+# --- m3: a trial with no verdict after 21 days is rolled back ------------------------------
+
+@pytest.mark.parametrize("age, rolled", [(21 * DAY, True), (21 * DAY - 60, False)])
+def test_trial_waiting_for_a_restart_is_rolled_back_after_21_days(env, age, rolled):
+    build(env, triage_runs())
+    fix = config_trial(env)
+    led = Ledger.load(env.root)
+    rec = led.get(fix.id)
+    rec.applied_at, rec.live_from = NOW - age, None  # the restart never happened
+    led.save()
+    bridge = FakeBridge(jobs=jobs(), config={CFG_KEY: 0.7})
+    run_cycle(env, bridge, NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    if rolled:
+        assert rec.state == "rolled_back" and rec.reason == "no verdict in 21 days"
+        assert bridge.config[CFG_KEY] == 0.5
+    else:
+        assert rec.state == "trial" and bridge.config[CFG_KEY] == 0.7
+
+
+@pytest.mark.parametrize("age, rolled", [(21 * DAY, True), (20 * DAY, False)])
+def test_job_trial_short_of_runs_is_rolled_back_after_21_days(env, age, rolled):
+    # only 2 runs since the fix went live: fewer than JOB_TRIAL_RUNS, so no verdict
+    build(env, triage_runs(range(22, 40)) + triage_runs([1, 2]))
+    fix = Fix("20260928-aaaa0009", "job_prompt", TRIAGE, {"prompt": "p", "add_toolsets": []},
+              "seq:x")
+    led = add_record(env, FixRecord(fix.id, fix.kind, TRIAGE, "seq:x", "trial", NOW - age,
+                                    applied_at=NOW - age, baseline_cost=0.10,
+                                    live_from=NOW - age), fix)
+    vdir = led.version_dir(fix.id)
+    (vdir / "before.json").write_text(json.dumps(
+        {"prompt": "Triage the inbox.", "enabled_toolsets": ["google"]}))
+    (vdir / "after.json").write_text(json.dumps({"prompt": "p", "enabled_toolsets": ["google"]}))
+    js = jobs()
+    js[TRIAGE]["prompt"] = "p"
+    bridge = FakeBridge(jobs=js)
+    run_cycle(env, bridge, NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    if rolled:
+        assert rec.state == "rolled_back" and rec.reason == "no verdict in 21 days"
+        assert bridge.jobs[TRIAGE]["prompt"] == "Triage the inbox."
+    else:
+        assert rec.state == "trial" and bridge.jobs[TRIAGE]["prompt"] == "p"

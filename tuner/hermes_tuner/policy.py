@@ -99,6 +99,9 @@ DRAFT_EST_USD = 0.02  # ESTIMATE
 USD_PER_MTOK = 0.42  # ESTIMATE: spec §2 Sept median $0.123 / 293.3k tokens
 JOB_TRIAL_RUNS = 5
 GLOBAL_TRIAL_DAYS = 7
+# A trial with no verdict this long after live_from (or applied_at while it waits
+# for a restart) is rolled back.
+TRIAL_DEADLINE_DAYS = 21
 TRIAGE_AGREEMENT_MIN = 0.90
 SHADOW_LEAD_MIN = 20
 SHADOW_PREFIX = "tuner-shadow-"
