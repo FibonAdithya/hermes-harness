@@ -86,20 +86,49 @@ def _check_composed(fix: Fix, ctx: LimitContext) -> list[str]:
     return reasons
 
 
+def _frontmatter_name(text: str) -> str | None:
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    for line in lines[1:]:
+        if line.strip() == "---":
+            return None
+        key, sep, val = line.partition(":")
+        if sep and key.strip() == "name":
+            return val.strip().strip("\"'") or None
+    return None
+
+
 def _check_skill(fix: Fix, ctx: LimitContext) -> list[str]:
     path = fix.payload.get("path")
-    if not isinstance(path, str):
-        return ["skill payload needs a string path"]
-    root = ctx.skills_root.resolve()
-    resolved = (ctx.skills_root / path).resolve()
-    if not resolved.is_relative_to(root):
-        return [f"skill path {path!r} escapes the skills directory"]
-    if resolved.name != "SKILL.md":
-        return ["skill path must end in SKILL.md"]
-    if resolved.parent == root:
-        return ["skill must live in its own directory"]
-    if resolved.parent.name in ctx.bundled_skills:
-        return [f"skill {resolved.parent.name!r} is bundled with Hermes"]
+    text = fix.payload.get("text")
+    if not isinstance(path, str) or not isinstance(text, str):
+        return ["skill payload needs a string path and text"]
+    try:
+        root = ctx.skills_root.resolve()
+        resolved = (ctx.skills_root / path).resolve()
+        if not resolved.is_relative_to(root):
+            return [f"skill path {path!r} escapes the skills directory"]
+        if resolved.name != "SKILL.md":
+            return ["skill path must end in SKILL.md"]
+        if resolved.parent == root:
+            return ["skill must live in its own directory"]
+        if not resolved.is_file():
+            return ["skill fixes may only rewrite an existing skill file"]
+        old = resolved.read_text(encoding="utf-8", errors="replace")
+    except (ValueError, OSError):
+        return [f"skill path {path!r} cannot be resolved"]
+    parts = resolved.relative_to(root).parts[:-1]
+    hit = [p for p in parts if p in ctx.bundled_skills]
+    if hit:
+        return [f"skill {hit[0]!r} is bundled with Hermes"]
+    dirname = resolved.parent.name
+    old_name = _frontmatter_name(old) or dirname
+    new_name = _frontmatter_name(text) or dirname
+    if new_name in ctx.bundled_skills:
+        return [f"skill name {new_name!r} is bundled with Hermes"]
+    if new_name != old_name:
+        return [f"skill name changed from {old_name!r} to {new_name!r}"]
     return []
 
 
@@ -112,6 +141,10 @@ def _check_new_reach(fix: Fix) -> list[str]:
 
 
 def check_fix(fix: Fix, ctx: LimitContext) -> list[str]:
+    if not isinstance(fix.payload, dict):
+        return ["payload must be an object"]
+    if not isinstance(fix.target, str):
+        return ["target must be a string"]
     if fix.kind == "config":
         reasons = _check_config(fix.payload)
     elif fix.kind == "job_prompt":

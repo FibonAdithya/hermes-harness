@@ -122,15 +122,54 @@ def test_job_prompt_cannot_add_foreign_toolsets(tmp_path):
     assert check_fix(jp(add_toolsets=[policy.TOOLSET]), ctx(tmp_path)) == []
 
 
+def mk(tmp_path, rel, text="---\nname: mine\n---\nold"):
+    p = tmp_path / "skills" / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text)
+    return str(p)
+
+
 def test_bundled_skill_rejected(tmp_path):
     c = ctx(tmp_path)
-    root = tmp_path / "skills"
-    assert check_fix(skill(str(root / "research/arxiv/SKILL.md")), c)
-    assert check_fix(skill(str(root / "mine/SKILL.md")), c) == []
+    assert check_fix(skill(mk(tmp_path, "research/arxiv/SKILL.md")), c)
+    assert check_fix(skill(mk(tmp_path, "mine/SKILL.md", "old"), "new"), c) == []
     assert check_fix(skill("../../.env"), c)
-    assert check_fix(skill(str(root / "mine/other.md")), c)
+    mk(tmp_path, "mine/other.md")
+    assert check_fix(skill(str(tmp_path / "skills/mine/other.md")), c)
     assert check_fix(skill("/etc/passwd/SKILL.md"), c)
-    assert check_fix(skill(str(root / "SKILL.md")), c)
+    assert check_fix(skill(mk(tmp_path, "SKILL.md")), c)
+
+
+def test_nested_under_bundled_rejected(tmp_path):
+    p = mk(tmp_path, "research/arxiv/sub/SKILL.md", "old")
+    assert check_fix(skill(p, "new"), ctx(tmp_path))
+
+
+def test_new_skill_file_rejected(tmp_path):
+    assert check_fix(skill(str(tmp_path / "skills/fresh/SKILL.md")), ctx(tmp_path))
+
+
+def test_frontmatter_rename_rejected(tmp_path):
+    p = mk(tmp_path, "mine/SKILL.md")
+    c = ctx(tmp_path)
+    assert check_fix(skill(p, "---\nname: arxiv\n---\nx"), c)
+    assert check_fix(skill(p, "---\nname: other\n---\nx"), c)
+    assert check_fix(skill(p, "no frontmatter"), c) == []
+    assert check_fix(skill(p, "---\nname: mine\n---\nnew"), c) == []
+    assert check_fix(skill(p, "---\nname: 'mine'\n---\nnew"), c) == []
+
+
+def test_dirname_fallback_rewrite_ok(tmp_path):
+    p = mk(tmp_path, "mine/SKILL.md", "old text")
+    assert check_fix(skill(p, "new text"), ctx(tmp_path)) == []
+
+
+def test_bad_drafts_never_raise(tmp_path):
+    c = ctx(tmp_path)
+    assert check_fix(skill("a\x00b/SKILL.md"), c)
+    assert check_fix(Fix("f", "config", "x", ["a"], "k"), c)  # type: ignore[arg-type]
+    assert check_fix(Fix("f", "config", ["x"], {"key": "a", "value": 1}, "k"), c)  # type: ignore[arg-type]
+    assert check_fix(Fix("f", "skill", "x", {"path": 1, "text": 2}, "k"), c)
 
 
 def test_skill_symlink_escape_rejected(tmp_path):
@@ -138,6 +177,7 @@ def test_skill_symlink_escape_rejected(tmp_path):
     root.mkdir()
     outside = tmp_path / "elsewhere"
     outside.mkdir()
+    (outside / "SKILL.md").write_text("x")
     (root / "evil").symlink_to(outside)
     assert check_fix(skill(str(root / "evil/SKILL.md")), ctx(tmp_path))
 
@@ -197,3 +237,13 @@ def test_approval_cannot_admit_composed_tool_call(tmp_path):
 def test_never_touch_beats_editable(tmp_path, monkeypatch):
     monkeypatch.setitem(policy.EDITABLE_JOBS, "8da9a6857256", "x")
     assert check_fix(jp("8da9a6857256"), ctx(tmp_path))
+
+
+def test_existing_skill_already_shadowing_bundled_rejected(tmp_path):
+    p = mk(tmp_path, "mine/SKILL.md", "---\nname: arxiv\n---\nold")
+    assert check_fix(skill(p, "---\nname: arxiv\n---\nnew"), ctx(tmp_path))
+
+
+def test_unhashable_target_does_not_raise(tmp_path):
+    bad = Fix("f", "job_prompt", ["x"], {"prompt": "p", "add_toolsets": []}, "k")  # type: ignore[arg-type]
+    assert check_fix(bad, ctx(tmp_path))
