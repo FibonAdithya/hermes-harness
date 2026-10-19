@@ -209,3 +209,29 @@ def test_ngrams_counted_per_job():
     ss = [sess(f"a{i}", seq_sessions(1)[0].calls, job="ja", age_days=i + 1) for i in range(6)]
     ss += [sess(f"b{i}", seq_sessions(1)[0].calls, job="jb", age_days=i + 1) for i in range(6)]
     assert detect(ss, NOW) == []
+
+
+def _skill_run(chars_list, name="s"):
+    ss = [sess(f"sk{i}", [call(0, "skill_view", c)], job=None, age_days=i + 1)
+          for i, c in enumerate(chars_list)]
+    return ss, {s.id: [name] for s in ss}
+
+
+def test_skill_load_threshold_exact_with_float_roundoff():
+    chars = [18_181] * 10 + [18_190]  # 11 loads, sum exactly 200,000
+    assert sum(chars) == 200_000
+    ss, names = _skill_run(chars)
+    assert len([c for c in detect(ss, NOW, skill_names=names) if c.kind == "skill_load"]) == 1
+    chars[-1] -= 1
+    ss, names = _skill_run(chars)
+    assert [c for c in detect(ss, NOW, skill_names=names) if c.kind == "skill_load"] == []
+
+
+def test_skill_load_skips_mismatched_or_missing_sessions():
+    ok, names = _skill_run([30_000] * 7)
+    bad = sess("bad", [call(0, "skill_view", 900_000), call(1, "skill_view", 900_000)], age_days=1)
+    gone = sess("gone", [call(0, "skill_view", 900_000)], age_days=2)
+    names["bad"] = ["s"]  # one name, two views
+    c = [c for c in detect(ok + [bad, gone], NOW, skill_names=names) if c.kind == "skill_load"]
+    assert len(c) == 1 and c[0].sessions == 7 and c[0].occurrences == 7
+    assert c[0].result_chars == 210_000

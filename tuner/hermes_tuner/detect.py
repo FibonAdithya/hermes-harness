@@ -136,13 +136,16 @@ def _skill_loads(sessions: list[Session], by_id: Mapping[str, Session],
     loads: dict[str, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
     for s in sessions:
         views = [c for c in s.calls if c.name == SKILL_TOOL]
-        for c, name in zip(views, skill_names.get(s.id, ())):
+        names = skill_names.get(s.id)
+        if names is None or len(names) != len(views):
+            continue  # missing or misaligned names: skip rather than misattribute chars
+        for c, name in zip(views, names):
             loads[name][s.id].append(c.result_chars)
     out = []
     for name, per in loads.items():
         n = sum(len(v) for v in per.values())
         total = sum(sum(v) for v in per.values())
-        if n * (total / n) >= MIN_SKILL_CHARS:  # loads x average chars
+        if total >= MIN_SKILL_CHARS:  # loads x average chars == total chars
             out.append(Candidate(
                 kind="skill_load", key="skill_load:" + name, job_id=None, sessions=len(per),
                 occurrences=n, result_chars=total,
