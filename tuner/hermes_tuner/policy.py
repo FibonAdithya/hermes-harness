@@ -47,6 +47,24 @@ MUTATING_TOOLS = frozenset({
     "terminal",
 })
 
+# Shadow (dry-run trial) sessions: tools blocked by the plugin's pre_tool_call
+# guard (spec 4.5). execute_code is blocked because its relayed calls may not
+# pass through that hook. Gated compute tools are covered by shadow_blocked().
+SHADOW_BLOCK = MUTATING_TOOLS | frozenset({
+    "skill_manage",
+    "memory",
+    "cronjob",
+    "send_message",
+    "delegate_task",
+    "execute_code",
+})
+
+
+def shadow_blocked(name: str) -> bool:
+    """True when a shadow session must not run tool `name`."""
+    return name in SHADOW_BLOCK or (
+        name.startswith("mcp__compute__") and name not in COMPUTE_READ_TOOLS)
+
 # Untrusted tool results (spec 5.3).
 UNTRUSTED_PREFIXES = ("mcp__google__", "browser_")
 UNTRUSTED_TOOLS = frozenset({"web_search", "web_extract", "session_search"})
