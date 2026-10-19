@@ -138,41 +138,87 @@ def test_dropped_uses_same_hash_rule(tmp_path):
     assert proposals.dropped(root, tmp_path / "nowhere") == []
 
 
-def applied_setup(tmp_path, include):
-    root = tmp_path / "tuner"
-    proposals.write_proposal(reach_fix(), root)
-    entry = json.loads((root / "proposals" / "fix-reach-1.json").read_text())
-    bridge = FakeBridge(config={INC_KEY: include})
-    return root, entry, bridge, Ledger(root)
+def applied_setup(tmp_path, include, change=None):
+    change = change or VECTOR_CHANGE
+    root, state = setup(tmp_path, "fix-reach-1", change)
+    return root, state, FakeBridge(config={INC_KEY: include}), Ledger(root)
+
+
+def vers(ledger):
+    return ledger.version_dir("fix-reach-1")
 
 
 def test_apply_mcp_include_add_appends_exactly_one_tool(tmp_path):
-    root, entry, bridge, ledger = applied_setup(tmp_path, ["search_gmail_messages", "get_events"])
-    rec = proposals.apply_approved(entry, bridge, ledger, root, now=100.0)
+    root, state, bridge, ledger = applied_setup(tmp_path, ["search_gmail_messages", "get_events"])
+    rec = proposals.apply_approved("fix-reach-1", bridge, ledger, root, state, now=100.0)
     assert rec.state == "applied" and rec.needs_restart is True and rec.kind == "new_reach"
-    assert bridge.config[INC_KEY] == ["search_gmail_messages", "get_events", "modify_gmail_labels"]
-    writes = [c for c in bridge.calls if c[0] in FakeBridge.MUTATING]
-    assert writes == [("config_set_json", (INC_KEY, ["search_gmail_messages", "get_events",
-                                                     "modify_gmail_labels"]))]
-    vdir = ledger.version_dir("fix-reach-1")
-    assert json.loads((vdir / "before.json").read_text()) == {
+    want = ["search_gmail_messages", "get_events", "modify_gmail_labels"]
+    assert bridge.config[INC_KEY] == want
+    assert [c for c in bridge.calls if c[0] in FakeBridge.MUTATING] == [("config_set_json", (INC_KEY, want))]
+    assert json.loads((vers(ledger) / "before.json").read_text()) == {
         "key": INC_KEY, "value": ["search_gmail_messages", "get_events"]}
-    assert json.loads((vdir / "after.json").read_text())["value"][-1] == "modify_gmail_labels"
+    assert json.loads((vers(ledger) / "after.json").read_text())["value"][-1] == "modify_gmail_labels"
     assert Ledger.load(root).get("fix-reach-1").state == "applied"
 
 
+def test_unapproved_proposal_is_not_applied(tmp_path):
+    """Catches writing an mcp_servers key for a well-formed but unapproved proposal."""
+    root, state, bridge, ledger = applied_setup(tmp_path, ["a"])
+    (state / "approved_proposals.json").write_text("[]")
+    assert proposals.apply_approved("fix-reach-1", bridge, ledger, root, state, now=1.0) is None
+    assert proposals.apply_approved("nope", bridge, ledger, root, state, now=1.0) is None
+    assert bridge.calls == [] and ledger.records == []
+
+
+def test_approved_then_edited_proposal_is_not_applied(tmp_path):
+    root, state, bridge, ledger = applied_setup(tmp_path, ["a"])
+    path = root / "proposals" / "fix-reach-1.json"
+    doc = json.loads(path.read_text())
+    doc["change"]["tool"] = "terminal"
+    doc["hash"] = proposals.change_hash(doc["change"])
+    path.write_text(json.dumps(doc))
+    assert proposals.apply_approved("fix-reach-1", bridge, ledger, root, state, now=1.0) is None
+    assert bridge.calls == []
+
+
 def test_apply_is_idempotent(tmp_path):
-    root, entry, bridge, ledger = applied_setup(tmp_path, ["a"])
-    proposals.apply_approved(entry, bridge, ledger, root, now=100.0)
+    root, state, bridge, ledger = applied_setup(tmp_path, ["a"])
+    proposals.apply_approved("fix-reach-1", bridge, ledger, root, state, now=100.0)
     n = len(bridge.calls)
-    rec = proposals.apply_approved(entry, bridge, Ledger.load(root), root, now=200.0)
+    rec = proposals.apply_approved("fix-reach-1", bridge, Ledger.load(root), root, state, now=200.0)
     assert rec.state == "applied" and rec.applied_at == 100.0
     assert len(bridge.calls) == n
 
 
+@pytest.mark.parametrize("state_name", ["applied", "trial", "kept", "rolled_back", "owner_changed",
+                                        "dropped", "rejected", "shadow_pending", "shadow_failed"])
+def test_other_states_are_never_reapplied(tmp_path, state_name):
+    """Approvals persist forever; a rolled-back or kept fix must not be re-applied."""
+    from hermes_tuner.ledger import FixRecord
+    root, state, bridge, ledger = applied_setup(tmp_path, ["a"])
+    rec = FixRecord("fix-reach-1", "new_reach", "modify_gmail_labels", "k", state_name, 1.0,
+                    applied_at=5.0, needs_restart=False)
+    ledger.add(rec, reach_fix())
+    before_file = vers(ledger) / "before.json"
+    before_file.write_text('{"keep": "me"}')
+    out = proposals.apply_approved("fix-reach-1", bridge, ledger, root, state, now=99.0)
+    assert out.state == state_name and out.applied_at == 5.0 and out.needs_restart is False
+    assert bridge.calls == [] and before_file.read_text() == '{"keep": "me"}'
+
+
+def test_bridge_error_record_is_retried_and_keeps_before_json(tmp_path):
+    from hermes_tuner.ledger import FixRecord
+    root, state, bridge, ledger = applied_setup(tmp_path, ["a"])
+    ledger.add(FixRecord("fix-reach-1", "new_reach", "t", "k", "bridge_error", 1.0), reach_fix())
+    (vers(ledger) / "before.json").write_text('{"key": "orig", "value": ["a"]}')
+    rec = proposals.apply_approved("fix-reach-1", bridge, ledger, root, state, now=9.0)
+    assert rec.state == "applied"
+    assert json.loads((vers(ledger) / "before.json").read_text())["key"] == "orig"
+
+
 def test_apply_tool_already_included_makes_no_write(tmp_path):
-    root, entry, bridge, ledger = applied_setup(tmp_path, ["modify_gmail_labels", "a"])
-    rec = proposals.apply_approved(entry, bridge, ledger, root, now=1.0)
+    root, state, bridge, ledger = applied_setup(tmp_path, ["modify_gmail_labels", "a"])
+    rec = proposals.apply_approved("fix-reach-1", bridge, ledger, root, state, now=1.0)
     assert rec.state == "applied"
     assert bridge.config[INC_KEY] == ["modify_gmail_labels", "a"]
     assert not [c for c in bridge.calls if c[0] in FakeBridge.MUTATING]
@@ -180,35 +226,32 @@ def test_apply_tool_already_included_makes_no_write(tmp_path):
 
 @pytest.mark.parametrize("current", [None, "a", ["a", 3], {"a": 1}])
 def test_apply_refuses_an_include_that_is_not_a_list_of_str(tmp_path, current):
-    root, entry, bridge, ledger = applied_setup(tmp_path, current)
-    rec = proposals.apply_approved(entry, bridge, ledger, root, now=1.0)
+    root, state, bridge, ledger = applied_setup(tmp_path, current)
+    rec = proposals.apply_approved("fix-reach-1", bridge, ledger, root, state, now=1.0)
     assert rec.state == "bridge_error"
     assert not [c for c in bridge.calls if c[0] in FakeBridge.MUTATING]
 
 
 def test_apply_bridge_failure_is_recorded(tmp_path):
-    root, entry, _b, ledger = applied_setup(tmp_path, ["a"])
+    root, state, _b, ledger = applied_setup(tmp_path, ["a"])
     bridge = FakeBridge(config={INC_KEY: ["a"]}, fail={"config_set_json"})
-    rec = proposals.apply_approved(entry, bridge, ledger, root, now=1.0)
+    rec = proposals.apply_approved("fix-reach-1", bridge, ledger, root, state, now=1.0)
     assert rec.state == "bridge_error" and bridge.config[INC_KEY] == ["a"]
 
 
 def test_apply_touches_only_the_approved_server_key(tmp_path):
     change = {"type": "mcp_include_add", "server": "g/../x", "tool": "t"}
-    root = tmp_path / "tuner"
-    entry = {"id": "p9", "change": change, "why": "", "hash": proposals.change_hash(change)}
+    root, state = setup(tmp_path, "fix-reach-1", change)
     bridge = FakeBridge()
     with pytest.raises(ValueError):
-        proposals.apply_approved(entry, bridge, Ledger(root), root, now=1.0)
+        proposals.apply_approved("fix-reach-1", bridge, Ledger(root), root, state, now=1.0)
     assert bridge.calls == []
 
 
 def test_apply_callable_add_is_ledger_only(tmp_path):
-    change = {"type": "callable_add", "tool": "web_fetch"}
-    root = tmp_path / "tuner"
-    entry = {"id": "p2", "change": change, "why": "w", "hash": proposals.change_hash(change)}
+    root, state = setup(tmp_path, "p2", {"type": "callable_add", "tool": "web_fetch"})
     bridge = FakeBridge()
-    rec = proposals.apply_approved(entry, bridge, Ledger(root), root, now=5.0)
+    rec = proposals.apply_approved("p2", bridge, Ledger(root), root, state, now=5.0)
     assert rec.state == "applied" and rec.needs_restart is False
     assert bridge.calls == []
 

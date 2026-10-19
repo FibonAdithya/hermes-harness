@@ -98,6 +98,7 @@ def approved_callables(root: Path, broker_state: Path) -> frozenset[str]:
 
 # --- applying an approved change ---------------------------------------------------
 
+_APPLICABLE = frozenset({"proposed", "approved", "bridge_error"})
 _NAME = re.compile(r"[A-Za-z0-9_-]+")
 
 
@@ -107,17 +108,22 @@ def _name(value: object, what: str) -> str:
     return value
 
 
-def apply_approved(entry: dict, bridge: Bridge, ledger: Ledger, root: Path,
-                   now: float) -> FixRecord:
-    """Apply exactly the change in `entry` (a proposal doc returned by `approved`).
+def apply_approved(proposal_id: str, bridge: Bridge, ledger: Ledger, root: Path,
+                   broker_state: Path, now: float) -> FixRecord | None:
+    """Apply exactly the change the owner approved for `proposal_id`.
 
-    The only code path allowed to write an `mcp_servers.` key (policy forbids it
-    for ordinary config fixes). Re-applying an applied proposal does nothing.
-    Raises ValueError for a malformed entry before anything is touched.
+    The change comes from `approved(root, broker_state)`, so it is applied only
+    while the hash of the proposal file's current change equals the approved hash.
+    Returns None, with no bridge call and no file written, when the id is not
+    approved. This is the only code path allowed to write an `mcp_servers.` key.
+    A record in any state other than proposed, approved or bridge_error is returned
+    unchanged: approvals persist, so a rolled-back or kept fix is never re-applied.
+    Raises ValueError for an approved but malformed change.
     """
-    pid, change = entry.get("id"), entry.get("change")
-    if not _safe_id(pid) or not isinstance(change, dict):
-        raise ValueError("malformed proposal entry")
+    entry = next((d for d in approved(root, broker_state) if d.get("id") == proposal_id), None)
+    if entry is None:
+        return None
+    change = entry["change"]
     kind = change.get("type")
     tool = _name(change.get("tool"), "tool")
     if kind == "mcp_include_add":
@@ -126,8 +132,9 @@ def apply_approved(entry: dict, bridge: Bridge, ledger: Ledger, root: Path,
         key = None
     else:
         raise ValueError(f"unsupported change type {kind!r}")
+    pid = proposal_id
     rec = ledger.get(pid)
-    if rec is not None and rec.state == "applied":
+    if rec is not None and rec.state not in _APPLICABLE:
         return rec
     if rec is None:
         fix = Fix(pid, "new_reach", tool, {"change": change, "why": entry.get("why", "")},
@@ -143,7 +150,8 @@ def apply_approved(entry: dict, bridge: Bridge, ledger: Ledger, root: Path,
         if not isinstance(old, list) or not all(isinstance(t, str) for t in old):
             raise ValueError(f"{key} is not a list of strings: refusing to change it")
         new = old if tool in old else old + [tool]
-        _write_json(vdir / "before.json", {"key": key, "value": old})
+        if not (vdir / "before.json").exists():
+            _write_json(vdir / "before.json", {"key": key, "value": old})
         _write_json(vdir / "after.json", {"key": key, "value": new})
         if new is not old:
             bridge.config_set_json(key, new)
