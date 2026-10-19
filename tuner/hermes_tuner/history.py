@@ -71,7 +71,9 @@ class History:
     @classmethod
     def open(cls, db_path: Path) -> History:
         try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+            # as_uri() percent-escapes '?', '#' and '%', so mode=ro always applies.
+            uri = Path(db_path).absolute().as_uri() + "?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=5)
         except sqlite3.Error as e:
             raise HistoryUnavailable(str(e)) from e
         conn.row_factory = sqlite3.Row
@@ -162,8 +164,22 @@ class History:
         for i in range(0, len(ids), _CHUNK):
             for sid, call, args, text in self._calls(ids[i:i + _CHUNK]):
                 per_session[sid].append((call, args, text))
-        return {root: [x for sid in sorted(sids, key=order.get) for x in per_session[sid]]
-                for root, sids in chains.items()}
+        out: dict[str, list] = {}
+        for root, sids in chains.items():
+            # Hermes copies the compressed tail (tool rows and their ids included)
+            # into the continuation: count each tool call once per run.
+            seen: set[str] = set()
+            merged = []
+            for sid in sorted(sids, key=order.get):
+                for x in per_session[sid]:
+                    cid = x[0].call_id
+                    if cid and cid in seen:
+                        continue
+                    if cid:
+                        seen.add(cid)
+                    merged.append(x)
+            out[root] = merged
+        return out
 
     def sessions(self, since: float, until: float | None = None) -> list[Session]:
         """One Session per run: a compression chain is merged into its root.

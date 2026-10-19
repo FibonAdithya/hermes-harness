@@ -55,7 +55,8 @@ def cfg(key, value="x"):
 
 
 def skill(path, text="guidance"):
-    return Fix("f4", "skill", path, {"path": path, "text": text}, "k")
+    return Fix("f4", "skill", path, {"path": path, "text": text},
+               "skill_load:" + Path(path).parent.name)
 
 
 def reach(change, why="needed"):
@@ -338,3 +339,17 @@ def test_hub_installed_skill_fix_is_refused(tmp_path):
     reasons = check_fix(skill("research/web-recon/SKILL.md",
                               "---\nname: web-recon\n---\nshort\n"), c)
     assert any("bundled" in r for r in reasons)
+
+
+def test_skill_fix_must_rewrite_the_candidates_skill(tmp_path):
+    """Catches: a skill_load:foo candidate whose draft rewrites bar, a skill the
+    model was never shown, which goes live at once (global fixes skip the shadow)."""
+    c = ctx(tmp_path)
+    mk(tmp_path, "foo/SKILL.md", "old")
+    bar = mk(tmp_path, "bar/SKILL.md", "old")
+    wrong = Fix("f", "skill", bar, {"path": bar, "text": "new"}, "skill_load:foo")
+    assert any("candidate" in r for r in check_fix(wrong, c))
+    not_skill = Fix("f", "skill", bar, {"path": bar, "text": "new"}, "schema_lookup")
+    assert check_fix(not_skill, c)
+    right = Fix("f", "skill", bar, {"path": bar, "text": "new"}, "skill_load:bar")
+    assert check_fix(right, c) == []

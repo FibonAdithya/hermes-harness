@@ -131,6 +131,10 @@ def _check_skill(fix: Fix, ctx: LimitContext) -> list[str]:
         old = resolved.read_text(encoding="utf-8", errors="replace")
     except (ValueError, OSError):
         return [f"skill path {path!r} cannot be resolved"]
+    # Only the skill the candidate is about, whose text the model was shown.
+    cand_kind, _, cand_name = fix.candidate_key.partition(":")
+    if cand_kind != "skill_load" or resolved.parent.name != cand_name:
+        return [f"skill fix must rewrite the candidate's skill, not {path!r}"]
     parts = resolved.relative_to(root).parts[:-1]
     hit = [p for p in parts if p in ctx.bundled_skills]
     if hit:

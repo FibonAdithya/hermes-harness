@@ -257,18 +257,24 @@ def triage_decisions(calls: list[tuple[str, dict]], intents: list[dict]) -> dict
 def compare_triage(old: dict, new: dict) -> Verdict:
     """Compare decisions over the message ids both versions saw.
 
-    A flip is an id KEEP in `old` and TRASH/ARCHIVE in `new`. ok = agreement >=
-    TRIAGE_AGREEMENT_MIN and no flips. With no ids in common: when `old` decided
-    anything the comparison is inconclusive (ok False, reason "no common
-    messages"); when `old` decided nothing there is nothing to disagree with (ok).
+    A flip is an id KEEP in `old` and TRASH/ARCHIVE in `new`, or an id `old`
+    never touched (so left in place: kept) that `new` trashes or archives
+    (spec 4.5). ok = agreement >= TRIAGE_AGREEMENT_MIN and no flips; agreement
+    is over the common ids. With no ids in common: any flip fails; else when
+    `old` decided anything the comparison is inconclusive (ok False, reason "no
+    common messages"); when `old` decided nothing there is nothing to disagree
+    with (ok).
     """
     common = sorted(old.keys() & new.keys())
+    flips = sorted([m for m in common if old[m] == "KEEP" and new[m] in ("TRASH", "ARCHIVE")]
+                   + [m for m in new.keys() - old.keys() if new[m] in ("TRASH", "ARCHIVE")])
     if not common:
+        if flips:
+            return Verdict(False, 0.0, flips)
         if old:
             return Verdict(False, 0.0, [], "no common messages")
         return Verdict(True, 1.0, [])
     agreement = sum(old[m] == new[m] for m in common) / len(common)
-    flips = [m for m in common if old[m] == "KEEP" and new[m] in ("TRASH", "ARCHIVE")]
     return Verdict(agreement >= policy.TRIAGE_AGREEMENT_MIN and not flips, agreement, flips)
 
 

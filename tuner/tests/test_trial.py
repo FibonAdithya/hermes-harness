@@ -97,13 +97,15 @@ def test_messages_only_new_version_saw_are_ignored():
     old = {"a": "KEEP", "b": "KEEP", "c": "TRASH"}
     new = {"a": "KEEP", "b": "KEEP"}  # new skipped c (already checked)
     assert compare_triage(old, new) == Verdict(True, 1.0, [])
-    # and ids only the new version saw cannot count either way
-    assert compare_triage({"a": "KEEP"}, {"a": "KEEP", "x": "TRASH"}).ok
+    # an id only the new version saw counts only if it trashes or archives it: the
+    # shadow runs before the live run, so the old version had that mail and kept it
+    assert compare_triage({"a": "KEEP"}, {"a": "KEEP", "x": "KEEP"}).ok
+    assert compare_triage({"a": "KEEP"}, {"a": "KEEP", "x": "TRASH"}).flips == ["x"]
 
 
 def test_no_common_messages_after_old_decided_is_inconclusive():
     """F5: the old run decided something and the shadow saw none of it: not a pass."""
-    v = compare_triage({"a": "KEEP"}, {"b": "TRASH"})
+    v = compare_triage({"a": "KEEP"}, {"b": "KEEP"})
     assert v.ok is False and v.reason == "no common messages" and v.flips == []
     assert compare_triage({"a": "KEEP"}, {}).ok is False
 
@@ -512,3 +514,14 @@ def test_corrupt_shadow_file_is_not_overwritten(tmp_path):
     with pytest.raises(ValueError):
         cleanup_shadows(bridge, tmp_path, NOW)
     assert bad.read_text() == "{not json"
+
+
+def test_new_version_trashing_a_message_old_left_alone_is_a_flip():
+    """Catches: comparing only common ids, so mail the old version kept by not
+    touching it can be trashed or archived by the new version unnoticed."""
+    old = {"m1": "KEEP", "m2": "KEEP"}
+    v = compare_triage(old, {"m1": "KEEP", "m2": "KEEP", "m3": "TRASH", "m4": "ARCHIVE"})
+    assert not v.ok and v.flips == ["m3", "m4"]
+    assert compare_triage(old, {"m1": "KEEP", "m2": "KEEP", "m3": "KEEP"}).ok
+    v = compare_triage({}, {"m9": "TRASH"})  # old decided nothing at all
+    assert not v.ok and v.flips == ["m9"]

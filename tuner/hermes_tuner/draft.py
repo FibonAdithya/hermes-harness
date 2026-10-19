@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -99,16 +100,35 @@ _CLEANERS = {"composed_tool": _clean_composed, "job_prompt": _clean_job_prompt,
              "config": _clean_config, "skill": _clean_skill, "new_reach": _clean_new_reach}
 
 
+# Tool names and argument keys come from the agent's tool calls, which its model
+# writes, so mail can steer them. Only identifier-shaped strings reach the prompt.
+_NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+_ARG_KEY = re.compile(r"[A-Za-z0-9_]{1,40}")
+MAX_SHAPE_CALLS = 200
+
+
+def _safe(value: Any, pattern: re.Pattern) -> str:
+    return value if isinstance(value, str) and pattern.fullmatch(value) else "?"
+
+
+def _safe_key(key: str) -> str:
+    """A candidate key ("seq:a>b", "skill_load:name") with each name made safe."""
+    kind, sep, rest = key.partition(":")
+    return kind + sep + ">".join(_safe(n, _NAME) for n in rest.split(">")) if sep else kind
+
+
 def build_request(candidate: Candidate, job: dict | None, skill_text: str | None,
                   tool_schemas: dict[str, dict],
                   call_shape: list[tuple[str, tuple[str, ...]]]) -> tuple[str, str]:
     doc: dict[str, Any] = {"candidate": {f: getattr(candidate, f) for f in CANDIDATE_FIELDS}}
+    doc["candidate"]["key"] = _safe_key(candidate.key)
     if job is not None:
         doc["job"] = {f: job[f] for f in JOB_FIELDS if f in job}
     if skill_text is not None:
         doc["skill_text"] = skill_text
     doc["tool_schemas"] = tool_schemas
-    doc["call_shape"] = [[name, list(keys)] for name, keys in call_shape]
+    doc["call_shape"] = [[_safe(name, _NAME), [_safe(k, _ARG_KEY) for k in keys]]
+                         for name, keys in call_shape[:MAX_SHAPE_CALLS]]
     return INSTRUCTIONS, json.dumps(doc, sort_keys=True)
 
 
@@ -135,6 +155,14 @@ def _parse_draft(text: str, candidate: Candidate, now: float) -> Fix | None:
     clean = _CLEANERS[kind](payload)
     if clean is None:
         return None
+    # A global fix's target is what it changes, never the model's choice: a target
+    # equal to a job id would make ledger.active_for(job) block that job.
+    if kind == "config":
+        target = clean["key"]
+    elif kind == "skill":
+        target = clean["path"]
+    elif kind == "new_reach":
+        target = clean["change"]["tool"]
     day = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y%m%d")
     digest = hashlib.sha256((candidate.key + json.dumps(clean, sort_keys=True)).encode()).hexdigest()
     return Fix(id=f"{day}-{digest[:8]}", kind=kind, target=target, payload=clean,

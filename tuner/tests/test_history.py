@@ -261,3 +261,39 @@ def test_sessions_read_result_lengths_without_fetching_content(tmp_path):
     seen.clear()
     assert list(h.untrusted_texts(0)) == ["é" * 300]
     assert any("content" in q.replace("length(content)", "") for q in seen)
+
+
+@pytest.mark.parametrize("name", ["q?x.db", "a#b.db", "pct%20.db"])
+def test_open_is_read_only_whatever_the_path(tmp_path, name):
+    """Catches: an unescaped file: URI, where '?' or '#' in the path cuts it short,
+    drops mode=ro, and opens (or creates) another file writable."""
+    import sqlite3
+    db = tmp_path / name
+    sqlite3.connect(db).execute("create table t (x)").connection.commit()
+    before = sorted(p.name for p in tmp_path.iterdir())
+    h = History.open(db)
+    with pytest.raises(sqlite3.OperationalError):
+        h._conn.execute("create table pwned (x)")
+    assert sorted(p.name for p in tmp_path.iterdir()) == before
+
+
+def test_tool_rows_copied_into_a_continuation_are_counted_once(tmp_path):
+    """Catches: counting twice the tail Hermes copies into the compression child
+    (publish_compression_child inserts the handoff, tool rows and ids included)."""
+    root, child = "cron_3bc4e11d29b1_20261001_070000", "20261001_070500_abcdef"
+    db = make_db(tmp_path / "s.db", [
+        {"id": root, "source": "cron", "started_at": 1000.0, "end_reason": "compression",
+         "calls": [("read_file", {"path": "/a"}, "x" * 100), ("web_search", {"q": 1}, "y" * 50)]},
+        {"id": child, "source": "cron", "started_at": 2000.0, "parent": root,
+         "calls": [("search_files", {"pattern": "p"}, "z" * 10)]},
+    ])
+    conn = sqlite3.connect(db)
+    conn.execute(  # the handoff: the root's assistant turn and tool rows, ids kept
+        "insert into messages(session_id, role, content, tool_call_id, tool_calls, tool_name,"
+        " timestamp) select ?, role, content, tool_call_id, tool_calls, tool_name, 1999.0"
+        " from messages where session_id = ? order by id", (child, root))
+    conn.commit()
+    conn.close()
+    (s,) = History.open(db).sessions(0.0)
+    assert [c.name for c in s.calls] == ["read_file", "web_search", "search_files"]
+    assert sum(c.result_chars for c in s.calls) == 160
