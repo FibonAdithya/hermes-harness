@@ -274,8 +274,9 @@ class _Cycle(DraftSteps):
             if verdict is None:
                 self._shadow_failed(rec, f"no quality check for job {live}")
             elif not verdict.ok:
-                self._shadow_failed(rec, f"shadow disagreed: agreement {verdict.agreement:.2f}, "
-                                         f"{len(verdict.flips)} flips")
+                self._shadow_failed(rec, verdict.reason or (
+                    f"shadow disagreed: agreement {verdict.agreement:.2f}, "
+                    f"{len(verdict.flips)} flips"))
             else:
                 self._go_live(rec)
 

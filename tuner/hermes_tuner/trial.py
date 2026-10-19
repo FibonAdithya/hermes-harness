@@ -46,6 +46,7 @@ class Verdict:
     ok: bool
     agreement: float
     flips: list[str]
+    reason: str = ""  # set when the comparison is inconclusive
 
 
 # --- shadow jobs ---------------------------------------------------------------
@@ -250,11 +251,14 @@ def compare_triage(old: dict, new: dict) -> Verdict:
     """Compare decisions over the message ids both versions saw.
 
     A flip is an id KEEP in `old` and TRASH/ARCHIVE in `new`. ok = agreement >=
-    TRIAGE_AGREEMENT_MIN and no flips. With no ids in common agreement is 1.0
-    and ok is True (there are no flips either): nothing disagrees.
+    TRIAGE_AGREEMENT_MIN and no flips. With no ids in common: when `old` decided
+    anything the comparison is inconclusive (ok False, reason "no common
+    messages"); when `old` decided nothing there is nothing to disagree with (ok).
     """
     common = sorted(old.keys() & new.keys())
     if not common:
+        if old:
+            return Verdict(False, 0.0, [], "no common messages")
         return Verdict(True, 1.0, [])
     agreement = sum(old[m] == new[m] for m in common) / len(common)
     flips = [m for m in common if old[m] == "KEEP" and new[m] in ("TRASH", "ARCHIVE")]

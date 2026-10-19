@@ -100,10 +100,16 @@ def test_messages_only_new_version_saw_are_ignored():
     assert compare_triage({"a": "KEEP"}, {"a": "KEEP", "x": "TRASH"}).ok
 
 
-def test_no_common_messages_is_ok_with_agreement_one():
+def test_no_common_messages_after_old_decided_is_inconclusive():
+    """F5: the old run decided something and the shadow saw none of it: not a pass."""
     v = compare_triage({"a": "KEEP"}, {"b": "TRASH"})
-    assert v == Verdict(True, 1.0, [])
+    assert v.ok is False and v.reason == "no common messages" and v.flips == []
+    assert compare_triage({"a": "KEEP"}, {}).ok is False
+
+
+def test_no_decisions_by_the_old_run_is_ok():
     assert compare_triage({}, {}) == Verdict(True, 1.0, [])
+    assert compare_triage({}, {"b": "KEEP"}) == Verdict(True, 1.0, [])
 
 
 # --- calendar -----------------------------------------------------------------

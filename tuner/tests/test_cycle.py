@@ -420,7 +420,8 @@ TOOL = {"name": "tuned_triage", "description": "search and read in one step",
 SETUP_SESSIONS: dict = {}  # env.root -> the sessions shadow_setup built
 
 
-def shadow_setup(env, old_mod, new_mod, composed=False, live=True, base_runs=None):
+def shadow_setup(env, old_mod, new_mod, composed=False, live=True, base_runs=None,
+                 shadow_ids=("m1", "m2")):
     """A shadow-pending triage fix whose shadow ran at 06:40 yesterday and (if `live`)
     a live run at 07:00. `composed`: a composed_tool fix needing a restart, with the
     tool dir written as at shadow scheduling."""
@@ -429,7 +430,7 @@ def shadow_setup(env, old_mod, new_mod, composed=False, live=True, base_runs=Non
     sessions = triage_runs(range(2, 30)) if base_runs is None else list(base_runs)
     sessions.append({"id": sid(SHADOW_JOB, shadow_t), "source": "cron", "started_at": shadow_t,
                      "cost": 0.08, "in": 80_000, "out": 800,
-                     "calls": [(GET, {"message_id": "m1"}, "b"), (GET, {"message_id": "m2"}, "b")]})
+                     "calls": [(GET, {"message_id": m}, "b") for m in shadow_ids]})
     if live:
         sessions.append({"id": sid(TRIAGE, live_t), "source": "cron", "started_at": live_t,
                          "cost": 0.10, "in": 100_000, "out": 1000,
@@ -485,6 +486,16 @@ def test_billing_change_rolls_back_a_fix_that_costs_more_tokens(env):
     report = run_cycle(env, bridge, NOW + 6 * DAY)
     rec = Ledger.load(env.root).get(fix.id)
     assert rec.state == "rolled_back" and fix.id in report.rolled_back
+    assert bridge.jobs[TRIAGE]["prompt"] == "Triage the inbox."
+
+
+def test_shadow_with_no_common_messages_fails(env):
+    """F5: the shadow read other messages than the live run decided on: inconclusive."""
+    fix = shadow_setup(env, old_mod=[], new_mod=[], shadow_ids=("m7", "m8"))
+    bridge = FakeBridge(jobs=jobs())
+    run_cycle(env, bridge, NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert rec.state == "shadow_failed" and rec.reason == "no common messages"
     assert bridge.jobs[TRIAGE]["prompt"] == "Triage the inbox."
 
 
