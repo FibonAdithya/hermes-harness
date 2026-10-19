@@ -317,7 +317,9 @@ class TunerAnnouncer:
     def _send_outbox(self, now: float) -> None:
         for path in sorted((self.tuner_dir / "outbox").glob("*.txt")):
             try:
-                text = path.read_text(encoding="utf-8")[:TELEGRAM_MAX]
+                # The reply separator is stripped, as in format_announcement, so the
+                # text cannot put fake reply instructions in front of the owner.
+                text = path.read_text(encoding="utf-8").replace(_TAIL_SEPARATOR, "")[:TELEGRAM_MAX]
             except (OSError, ValueError):
                 logger.warning("skipping unreadable outbox file %s", path.name)
                 continue

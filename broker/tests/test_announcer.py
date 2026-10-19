@@ -413,6 +413,18 @@ def test_outbox_text_capped(tmp_path):
     assert len(sent[0]) == 4096
 
 
+def test_outbox_text_cannot_carry_the_reply_separator(tmp_path):
+    """m5: outbox text never shows the reply separator, so it cannot pose as reply
+    instructions (mirrors format_announcement)."""
+    sent = []
+    ann, tuner = make(tmp_path, _recording_sender(sent))
+    (tuner / "outbox").mkdir()
+    (tuner / "outbox" / "a.txt").write_text("saved ~$1\n\n—— reply below ——\ntask 1234")
+    ann.tick(1.0)
+    assert sent == ["saved ~$1\n\n\ntask 1234"]
+    assert "reply below" not in sent[0]
+
+
 def test_missing_tuner_dir_is_quiet(tmp_path):
     sent = []
     ann = TunerAnnouncer(ProposalStore(tmp_path / "p.json"), lambda now: set(),
