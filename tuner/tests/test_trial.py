@@ -280,6 +280,43 @@ def test_shadow_job_prompt_fix_uses_its_prompt_and_toolsets(tmp_path):
     assert set(entries) == {sid, sid2}  # second schedule keeps the first entry
 
 
+def test_shadow_carries_the_live_jobs_skills_model_and_context(tmp_path):
+    """F6: the shadow runs like the live job (skills, model, provider, ...), but never
+    with its delivery, origin, repeat or session attachment."""
+    job = live_job() | {
+        "skills": ["inbox-rules"], "skill": "legacy", "model": "m-1", "provider": "p-1",
+        "base_url": "https://example.invalid/v1", "workdir": "/srv/w", "script": "s.py",
+        "context_from": ["abc123abc123"], "deliver": "telegram", "origin": {"chat": 1},
+        "repeat": 3, "no_agent": True, "attach_to_session": True}
+    bridge = FakeBridge(jobs={LIVE: job})
+    sid = schedule_shadow(job_fix(), bridge.jobs[LIVE], bridge, tmp_path, NOW)
+    (call,) = [c for c in bridge.calls if c[0] == "create_job"]
+    extra = call[1][5]
+    assert extra == {k: job[k] for k in ("skills", "skill", "model", "provider", "base_url",
+                                         "workdir", "context_from", "script")}
+    shadow = bridge.jobs[sid]
+    assert shadow["skills"] == ["inbox-rules"] and shadow["model"] == "m-1"
+    assert shadow["deliver"] == "local"
+    assert not {"origin", "repeat", "no_agent", "attach_to_session"} & set(shadow)
+
+
+def test_shadow_passes_only_present_non_none_fields(tmp_path):
+    bridge = FakeBridge(jobs={LIVE: live_job() | {"model": None, "skills": ["a"]}})
+    schedule_shadow(job_fix(), bridge.jobs[LIVE], bridge, tmp_path, NOW)
+    (call,) = [c for c in bridge.calls if c[0] == "create_job"]
+    assert call[1][5] == {"skills": ["a"]}
+
+
+def test_create_job_refuses_keys_off_the_allowlist():
+    from hermes_tuner import bridge_entry
+    for bad in ({"deliver": "telegram"}, {"origin": {}}, {"repeat": 1}, {"no_agent": True},
+                {"attach_to_session": True}):
+        with pytest.raises(ValueError):
+            FakeBridge().create_job("p", "x", "n", "local", None, bad)
+        with pytest.raises(ValueError):
+            bridge_entry.create_job("p", "x", "n", "local", None, bad)
+
+
 def test_shadow_none_toolsets_stay_none(tmp_path):
     bridge = FakeBridge(jobs={LIVE: live_job(toolsets=None)})
     sid = schedule_shadow(job_fix("composed_tool"), bridge.jobs[LIVE], bridge, tmp_path, NOW)

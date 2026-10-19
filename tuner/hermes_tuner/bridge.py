@@ -18,6 +18,10 @@ ENTRY = Path(__file__).with_name("bridge_entry.py")
 CALL_TIMEOUT_S = 120
 RESTART_TIMEOUT_S = 60
 STDERR_TAIL = 500
+# Live-job fields a shadow job copies so it runs like the live one (spec 4.5).
+# Never origin, deliver, repeat, no_agent or attach_to_session.
+CREATE_JOB_EXTRA_KEYS = ("skills", "skill", "model", "provider", "base_url", "workdir",
+                         "context_from", "script")
 
 
 class BridgeError(Exception):
@@ -41,13 +45,25 @@ def encode_config_value(value: Any) -> str:
     raise ValueError(f"config value of type {type(value).__name__} cannot be set")
 
 
+def check_create_job_extra(extra: dict | None) -> dict:
+    """`extra` as a dict, or ValueError if it has a key off CREATE_JOB_EXTRA_KEYS."""
+    if extra is None:
+        return {}
+    if not isinstance(extra, dict):
+        raise ValueError("create_job extra must be an object")
+    bad = sorted(set(extra) - set(CREATE_JOB_EXTRA_KEYS))
+    if bad:
+        raise ValueError(f"create_job extra keys not allowed: {bad}")
+    return dict(extra)
+
+
 class Bridge(Protocol):
     def scan(self, text: str) -> list[str]: ...
     def get_job(self, job_id: str) -> dict | None: ...
     def list_jobs(self) -> list[dict]: ...
     def update_job(self, job_id: str, updates: dict) -> dict: ...
     def create_job(self, prompt: str, schedule: str, name: str, deliver: str,
-                   enabled_toolsets: list[str] | None) -> dict: ...
+                   enabled_toolsets: list[str] | None, extra: dict | None = None) -> dict: ...
     def remove_job(self, job_id: str) -> bool: ...
     def config_get(self, key: str) -> Any: ...
     def config_set(self, key: str, value: Any) -> None: ...
@@ -99,9 +115,10 @@ class HermesBridge:
     def update_job(self, job_id, updates):
         return self._call("update_job", job_id=job_id, updates=updates)
 
-    def create_job(self, prompt, schedule, name, deliver, enabled_toolsets):
+    def create_job(self, prompt, schedule, name, deliver, enabled_toolsets, extra=None):
         return self._call("create_job", prompt=prompt, schedule=schedule, name=name,
-                          deliver=deliver, enabled_toolsets=enabled_toolsets)
+                          deliver=deliver, enabled_toolsets=enabled_toolsets,
+                          extra=check_create_job_extra(extra))
 
     def remove_job(self, job_id):
         return self._call("remove_job", job_id=job_id)
@@ -173,14 +190,17 @@ class FakeBridge:
         self.jobs[job_id].update(copy.deepcopy(updates))
         return copy.deepcopy(self.jobs[job_id])
 
-    def create_job(self, prompt, schedule, name, deliver, enabled_toolsets):
-        self._enter("create_job", prompt, schedule, name, deliver, enabled_toolsets)
+    def create_job(self, prompt, schedule, name, deliver, enabled_toolsets, extra=None):
+        self._enter("create_job", prompt, schedule, name, deliver, enabled_toolsets,
+                    copy.deepcopy(extra))
+        extra = check_create_job_extra(extra)
         # Monotonic: len(self.jobs) would reuse an id after remove_job.
         self._next_id += 1
         job_id = f"{self._next_id:012x}"  # 12 lowercase hex, like Hermes job ids
         self.jobs[job_id] = {"id": job_id, "prompt": prompt, "schedule": schedule,
                              "next_run_at": schedule, "name": name, "deliver": deliver,
-                             "enabled_toolsets": copy.deepcopy(enabled_toolsets)}
+                             "enabled_toolsets": copy.deepcopy(enabled_toolsets),
+                             **copy.deepcopy(extra)}
         return copy.deepcopy(self.jobs[job_id])
 
     def remove_job(self, job_id):

@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Literal
 
 from . import policy
-from .bridge import Bridge, BridgeError
+from .bridge import CREATE_JOB_EXTRA_KEYS, Bridge, BridgeError
 from .ledger import FixRecord, atomic_write, job_after_for
 from .measure import JobStats, job_stats
 from .model import Fix, Session
@@ -101,7 +101,8 @@ def schedule_shadow(fix: Fix, job: dict, bridge: Bridge, root: Path, now: float)
     """Create the one-shot shadow job and record it; returns its id.
 
     Runs at the live job's `next_run_at` minus SHADOW_LEAD_MIN minutes, with the
-    fix's new prompt, delivering locally. Raises ValueError (nothing created) when
+    fix's new prompt, delivering locally, carrying the live job's skills, model,
+    provider, base_url, workdir, context_from and script. Raises ValueError (nothing created) when
     the fix has no prompt, `next_run_at` is missing, unparseable or has no UTC
     offset, or the shadow time is not after `now`.
     """
@@ -117,8 +118,10 @@ def schedule_shadow(fix: Fix, job: dict, bridge: Bridge, root: Path, now: float)
         raise ValueError("fix does not change the job prompt")
     toolsets = after["enabled_toolsets"]
     schedule = datetime.fromtimestamp(run_at, timezone.utc).isoformat()
+    # run like the live job: its skills, model, provider, workdir, context, script
+    extra = {k: job[k] for k in CREATE_JOB_EXTRA_KEYS if job.get(k) is not None}
     created = bridge.create_job(prompt, schedule, policy.SHADOW_PREFIX + fix.id,
-                                "local", toolsets)
+                                "local", toolsets, extra or None)
     shadow_id = created["id"]
     try:
         entries = _read_entries(root)

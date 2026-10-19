@@ -37,10 +37,20 @@ def update_job(job_id, updates):
     return job
 
 
-def create_job(prompt, schedule, name, deliver, enabled_toolsets):
+# Same list as bridge.CREATE_JOB_EXTRA_KEYS (this file cannot import the tuner).
+CREATE_JOB_EXTRA_KEYS = ("skills", "skill", "model", "provider", "base_url", "workdir",
+                         "context_from", "script")
+
+
+def create_job(prompt, schedule, name, deliver, enabled_toolsets, extra=None):
+    """`extra`: live-job fields for a shadow; only CREATE_JOB_EXTRA_KEYS, never
+    origin/deliver/repeat/no_agent/attach_to_session."""
+    extra = extra or {}
+    if not isinstance(extra, dict) or set(extra) - set(CREATE_JOB_EXTRA_KEYS):
+        raise ValueError("create_job extra has keys off the allowlist")
     from cron.jobs import create_job as hermes_create_job
     return hermes_create_job(prompt, schedule, name=name, deliver=deliver,
-                             enabled_toolsets=enabled_toolsets)
+                             enabled_toolsets=enabled_toolsets, **extra)
 
 
 def remove_job(job_id):

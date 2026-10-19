@@ -477,6 +477,31 @@ def test_hermes_bridge_sends_op_and_args(tmp_path):
     assert json.loads(payload) == {"key": "compression.threshold", "value": "0.5"}
 
 
+def test_hermes_bridge_create_job_sends_extra(tmp_path):
+    log = tmp_path / "log"
+    py = fake_python(tmp_path, f'echo "$2" > {log}; cat >> {log}; echo \'{{"result": {{}}}}\'\n')
+    HermesBridge(hermes_py=py).create_job("p", "s", "n", "local", ["web"], {"skills": ["a"]})
+    op, payload = log.read_text().splitlines()
+    assert op == "create_job"
+    assert json.loads(payload)["extra"] == {"skills": ["a"]}
+    with pytest.raises(ValueError):
+        HermesBridge(hermes_py=py).create_job("p", "s", "n", "local", None, {"deliver": "x"})
+
+
+def test_bridge_entry_create_job_passes_extra_to_hermes(monkeypatch):
+    import sys
+    import types
+    seen = {}
+    jobs_mod = types.ModuleType("cron.jobs")
+    jobs_mod.create_job = lambda prompt, schedule, **kw: seen.update(kw, prompt=prompt) or {"id": "x"}
+    monkeypatch.setitem(sys.modules, "cron", types.ModuleType("cron"))
+    monkeypatch.setitem(sys.modules, "cron.jobs", jobs_mod)
+    bridge_entry.create_job("p", "s", "n", "local", ["web"], {"skills": ["a"], "model": "m"})
+    assert seen == {"prompt": "p", "name": "n", "deliver": "local", "enabled_toolsets": ["web"],
+                    "skills": ["a"], "model": "m"}
+    assert bridge_entry.CREATE_JOB_EXTRA_KEYS == bridge_mod.CREATE_JOB_EXTRA_KEYS
+
+
 def test_config_value_encoding():
     enc = bridge_mod.encode_config_value
     assert enc(True) == "true" and enc(False) == "false"
