@@ -15,7 +15,7 @@ JOB_SESSION_RE = re.compile(r"^cron_([0-9a-f]{12})_\d{8}_\d{6}$")
 MAX_CHAIN_HOPS = 100
 _CHUNK = 500
 _SESSION_COLS = ("s.id, s.source, s.started_at, s.input_tokens, s.output_tokens, "
-                 "s.cache_read_tokens, s.estimated_cost_usd")
+                 "s.cache_read_tokens, s.cache_write_tokens, s.estimated_cost_usd")
 
 
 class HistoryUnavailable(Exception):
@@ -195,16 +195,24 @@ class History:
         for r in roots:
             members = [member_rows[sid] for sid in chains[r["id"]]]
             m = JOB_SESSION_RE.match(r["id"])
+
+            def total(col: str, members=members) -> int:
+                return sum(x[col] or 0 for x in members)  # NULL counts 0
+            # input_tokens is FRESH input (Hermes writes canonical_usage.input_tokens)
+            fresh, read, write = (total("input_tokens"), total("cache_read_tokens"),
+                                  total("cache_write_tokens"))
             out.append(Session(
                 id=r["id"],
                 source=r["source"],
                 job_id=m.group(1) if m else None,
                 started_at=r["started_at"],
                 est_cost=sum(x["estimated_cost_usd"] or 0.0 for x in members),
-                prompt_tokens=sum((x["input_tokens"] or 0) + (x["cache_read_tokens"] or 0)
-                                  for x in members),
-                output_tokens=sum(x["output_tokens"] or 0 for x in members),
+                prompt_tokens=fresh + read + write,  # Hermes's CanonicalUsage.prompt_tokens
+                output_tokens=total("output_tokens"),
                 calls=tuple(c for c, _a, _t in calls[r["id"]]),
+                input_tokens=fresh,
+                cache_read_tokens=read,
+                cache_write_tokens=write,
             ))
         return out
 

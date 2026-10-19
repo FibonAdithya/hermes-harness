@@ -34,7 +34,7 @@ from .fingerprint import CopyIndex
 from .history import History, HistoryUnavailable
 from .ledger import (APPLIED_STATES, FixRecord, Ledger, _tool_files, apply, atomic_write,
                      is_shadow_tool, rollback)
-from .measure import priced_cost
+from .measure import INTERIM_FLAT_PRICING, priced_cost
 from .model import Fix, Session
 from .proposals import apply_approved, approved, dropped
 from .restart import restart_allowed
@@ -441,7 +441,8 @@ class _Cycle(DraftSteps):
         before = runs(applied_at - 28 * DAY, applied_at)
         if not after or not before:
             return "rollback"
-        ca, cb = median(map(priced_cost, after)), median(map(priced_cost, before))
+        ca = median(priced_cost(s, INTERIM_FLAT_PRICING) for s in after)
+        cb = median(priced_cost(s, INTERIM_FLAT_PRICING) for s in before)
         if ca == 0 and cb == 0:
             better = (median(s.prompt_tokens for s in after)
                       < median(s.prompt_tokens for s in before))

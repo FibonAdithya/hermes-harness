@@ -4,7 +4,7 @@ import pytest
 
 from hermes_tuner import policy
 from hermes_tuner.detect import Candidate, detect
-from hermes_tuner.measure import priced_cost
+from hermes_tuner.measure import INTERIM_FLAT_PRICING, priced_cost
 from hermes_tuner.model import Session, ToolCall
 
 DAY = 86400.0
@@ -21,9 +21,10 @@ def call(i, name, chars=10, ref=None):
 def sess(sid, calls, job=None, age_days=1.0, cost=0.1, source="cron", raw=0.0):
     """`cost` sets the priced cost through the token count; `raw` is the billing figure
     (subscription billing reads $0), which the detector must ignore."""
+    tokens = round(cost * 1e6 / policy.USD_PER_MTOK)  # fresh input
     return Session(id=sid, source=source, job_id=job, started_at=NOW - age_days * DAY,
-                   est_cost=raw, prompt_tokens=round(cost * 1e6 / policy.USD_PER_MTOK),
-                   output_tokens=0, calls=tuple(calls))
+                   est_cost=raw, prompt_tokens=tokens, output_tokens=0, calls=tuple(calls),
+                   input_tokens=tokens)
 
 
 def briefing_runs(n=12, job="3bc4e11d29b1"):
@@ -78,7 +79,7 @@ def test_sequence_money_uses_session_share_scaled_to_30_days():
     c = detect(briefing_runs(), NOW)[0]
     total = 500 + 20 * 10_000 + 20 * 20
     share = 20 * 10_000 / total
-    expected = 12 * priced_cost(briefing_runs()[0]) * share * 30 / 28
+    expected = 12 * priced_cost(briefing_runs()[0], INTERIM_FLAT_PRICING) * share * 30 / 28
     assert abs(c.est_monthly_usd - expected) < 1e-9
     assert c.est_monthly_usd == pytest.approx(12 * 0.12 * share * 30 / 28, rel=1e-5)
 

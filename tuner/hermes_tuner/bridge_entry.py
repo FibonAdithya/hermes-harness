@@ -107,11 +107,8 @@ def config_set_json(key, value):
     atomic_yaml_write(config_path, user_config, sort_keys=False)
 
 
-def oneshot(instructions, user_input, max_tokens):
-    """One LLM call on the main provider/model from config. Subscription billing
-    reports $0 ("included"), so the raw token counts are returned too."""
-    from agent.auxiliary_client import call_llm
-    from agent.usage_pricing import estimate_usage_cost, normalize_usage
+def _main_model():
+    """(model, provider, base_url) of the main model from Hermes's config."""
     from hermes_cli.config import load_config
     cfg = load_config().get("model")
     cfg = cfg if isinstance(cfg, dict) else {"default": cfg}
@@ -119,19 +116,102 @@ def oneshot(instructions, user_input, max_tokens):
     provider, base_url = cfg.get("provider") or None, cfg.get("base_url") or None
     if not isinstance(model, str) or not model:
         raise RuntimeError("no main model configured")
+    return model, provider, base_url
+
+
+def oneshot(instructions, user_input, max_tokens):
+    """One LLM call on the main provider/model from config. Subscription billing
+    reports $0 ("included"), so the raw token counts are returned too, split as
+    Hermes's CanonicalUsage splits them: input_tokens is FRESH input (not the
+    prompt total), cache reads and writes are separate."""
+    from agent.auxiliary_client import call_llm
+    from agent.usage_pricing import estimate_usage_cost, normalize_usage
+    model, provider, base_url = _main_model()
     resp = call_llm(provider=provider, model=model, max_tokens=max_tokens,
                     messages=[{"role": "system", "content": instructions},
                               {"role": "user", "content": user_input}])
     usage = normalize_usage(getattr(resp, "usage", None), provider=provider)
     cost = estimate_usage_cost(model, usage, provider=provider, base_url=base_url)
     return {"text": resp.choices[0].message.content or "",
-            "input_tokens": usage.prompt_tokens, "output_tokens": usage.output_tokens,
+            "input_tokens": usage.input_tokens, "cache_read_tokens": usage.cache_read_tokens,
+            "cache_write_tokens": usage.cache_write_tokens,
+            "output_tokens": usage.output_tokens,
             "estimated_cost_usd": None if cost.amount_usd is None else float(cost.amount_usd),
             "cost_status": cost.status}
 
 
+def _num(v):
+    return None if v is None else float(v)
+
+
+def _usable(entry):
+    """A real price list: input and output both known and not both zero. Hermes's
+    `included-route` entry (all zero) and an all-None entry are not."""
+    if entry is None:
+        return False
+    inp, out = entry.input_cost_per_million, entry.output_cost_per_million
+    return inp is not None and out is not None and (inp > 0 or out > 0)
+
+
+def lookup_pricing(model, provider, base_url, api_key, get_entry, vendors):
+    """The main model's price list. `get_entry` is Hermes's get_pricing_entry and
+    `vendors` the providers Hermes has docs snapshots for (both injected so this
+    runs without Hermes in tests).
+
+    1. get_entry(model, provider=, base_url=, api_key=) - the billing route's list
+       (provider /models API, else a docs snapshot);
+    2. not usable (None, or no real rates) -> the model's vendor: the part of
+       `model` before "/" (looked up with the part after), else `provider` if it is
+       in `vendors`; get_entry(bare, provider=vendor);
+    3. still nothing usable -> LookupError("no pricing for <model>")."""
+    entry = get_entry(model, provider=provider, base_url=base_url, api_key=api_key)
+    if not _usable(entry):
+        entry = None
+        if "/" in model:
+            vendor, bare = model.split("/", 1)
+        else:
+            vendor, bare = (provider if provider in vendors else None), model
+        if vendor:
+            retry = get_entry(bare, provider=vendor)
+            entry = retry if _usable(retry) else None
+    if entry is None:
+        raise LookupError(f"no pricing for {model}")
+    return {"model": model,
+            "input_per_m": _num(entry.input_cost_per_million),
+            "output_per_m": _num(entry.output_cost_per_million),
+            "cache_read_per_m": _num(entry.cache_read_cost_per_million),
+            "cache_write_per_m": _num(entry.cache_write_cost_per_million),
+            "source": entry.source, "source_url": entry.source_url,
+            "pricing_version": entry.pricing_version}
+
+
+def _main_api_key(provider, model):
+    """The main provider's credential, resolved by Hermes's auxiliary client the way
+    call_llm resolves it. Best effort: "" when it cannot be resolved (the /models
+    lookup then fails or comes back empty and the vendor retry decides)."""
+    try:
+        from agent.auxiliary_client import resolve_provider_client
+        client, _model = resolve_provider_client(provider or "auto", model)
+        key = getattr(client, "api_key", "") if client is not None else ""
+        return key if isinstance(key, str) else ""
+    except Exception:  # noqa: BLE001 - best effort by design
+        return ""
+
+
+def pricing():
+    """The configured main model's list prices in USD per million tokens, from
+    Hermes's get_pricing_entry (lookup_pricing gives the order). Never scrapes a
+    web page: Hermes's dated docs snapshot is the fallback."""
+    from agent.usage_pricing import _OFFICIAL_DOCS_PRICING, get_pricing_entry
+    model, provider, base_url = _main_model()
+    vendors = {p for p, _m in _OFFICIAL_DOCS_PRICING}
+    return lookup_pricing(model, provider, base_url, _main_api_key(provider, model),
+                          get_pricing_entry, vendors)
+
+
 OPS = {f.__name__: f for f in (scan, get_job, list_jobs, update_job, create_job,
-                               remove_job, config_get, config_set, config_set_json, oneshot)}
+                               remove_job, config_get, config_set, config_set_json, oneshot,
+                               pricing)}
 
 
 def load_hermes_env():

@@ -639,3 +639,136 @@ def test_skill_write_failure_leaves_original_and_no_temp_file(tmp_path, monkeypa
     assert rec.state == "bridge_error"
     assert p.read_bytes() == original
     assert [x.name for x in p.parent.iterdir()] == ["SKILL.md"]
+
+
+# --- pricing ----------------------------------------------------------------
+
+class _Entry:
+    """Stand-in for Hermes's PricingEntry (Decimals in Hermes; any number works)."""
+    def __init__(self, inp, out, read=None, write=None, source="provider_models_api",
+                 url="https://example.invalid/models", version="v1"):
+        from decimal import Decimal
+        d = lambda x: None if x is None else Decimal(str(x))  # noqa: E731
+        self.input_cost_per_million, self.output_cost_per_million = d(inp), d(out)
+        self.cache_read_cost_per_million, self.cache_write_cost_per_million = d(read), d(write)
+        self.source, self.source_url, self.pricing_version = source, url, version
+
+
+def _lookup(table):
+    """get_pricing_entry stand-in: (model, provider) -> entry; records each call."""
+    calls = []
+
+    def get(model, provider=None, base_url=None, api_key=None):
+        calls.append((model, provider, base_url, api_key))
+        return table.get((model, provider))
+    return get, calls
+
+
+V4 = _Entry(0.435, 0.87, read=0.003625, source="official_docs_snapshot",
+            url="https://api-docs.deepseek.com/quick_start/pricing",
+            version="deepseek-pricing-2026-07")
+
+
+def test_bridge_entry_pricing_lookup_order():
+    # 1. the route's own list, when usable, is used as is
+    route = _Entry(0.5, 1.0, read=0.05)
+    get, calls = _lookup({("deepseek/deepseek-v4-pro", "nous"): route,
+                          ("deepseek-v4-pro", "deepseek"): V4})
+    got = bridge_entry.lookup_pricing("deepseek/deepseek-v4-pro", "nous", "https://n.invalid",
+                                      "k", get, {"deepseek"})
+    assert calls == [("deepseek/deepseek-v4-pro", "nous", "https://n.invalid", "k")]
+    assert got == {"model": "deepseek/deepseek-v4-pro", "input_per_m": 0.5, "output_per_m": 1.0,
+                   "cache_read_per_m": 0.05, "cache_write_per_m": None,
+                   "source": "provider_models_api", "source_url": "https://example.invalid/models",
+                   "pricing_version": "v1"}
+    assert all(type(v) is float for k, v in got.items() if k.endswith("_per_m") and v is not None)
+    v4_dict = {"model": "deepseek/deepseek-v4-pro", "input_per_m": 0.435, "output_per_m": 0.87,
+               "cache_read_per_m": 0.003625, "cache_write_per_m": None,
+               "source": "official_docs_snapshot",
+               "source_url": "https://api-docs.deepseek.com/quick_start/pricing",
+               "pricing_version": "deepseek-pricing-2026-07"}
+    # 2a. route has no list -> the vendor named in the model id
+    get, calls = _lookup({("deepseek-v4-pro", "deepseek"): V4})
+    assert bridge_entry.lookup_pricing("deepseek/deepseek-v4-pro", "nous", None, "", get,
+                                       {"deepseek"}) == v4_dict
+    assert calls[1] == ("deepseek-v4-pro", "deepseek", None, None)
+    # 2b. an all-zero entry (Hermes's included-route) is not a price list
+    for zero in (_Entry(0, 0, 0, 0, source="none", version="included-route"),
+                 _Entry(None, None)):
+        get, _ = _lookup({("deepseek/deepseek-v4-pro", "nous"): zero,
+                          ("deepseek-v4-pro", "deepseek"): V4})
+        assert bridge_entry.lookup_pricing("deepseek/deepseek-v4-pro", "nous", None, "", get,
+                                           {"deepseek"}) == v4_dict
+    # 2c. a bare model id: the provider is the vendor only if Hermes has a snapshot for it
+    get, calls = _lookup({("deepseek-v4-pro", "deepseek"): V4})
+    got = bridge_entry.lookup_pricing("deepseek-v4-pro", "deepseek", None, "", get, {"deepseek"})
+    assert got["input_per_m"] == 0.435 and got["model"] == "deepseek-v4-pro"
+    get, calls = _lookup({("deepseek-v4-pro", "deepseek"): V4})
+    with pytest.raises(LookupError, match="no pricing for deepseek-v4-pro"):
+        bridge_entry.lookup_pricing("deepseek-v4-pro", "nous", None, "", get, {"deepseek"})
+    assert len(calls) == 1  # "nous" is not a snapshot vendor: no retry
+    # 3. both fail -> error
+    get, calls = _lookup({("deepseek-v4-pro", "deepseek"): _Entry(0, 0)})
+    with pytest.raises(LookupError, match="no pricing for deepseek/deepseek-v4-pro"):
+        bridge_entry.lookup_pricing("deepseek/deepseek-v4-pro", "nous", None, "", get,
+                                    {"deepseek"})
+    assert len(calls) == 2
+
+
+def test_fake_bridge_pricing_is_settable_and_not_mutating():
+    assert "pricing" not in FakeBridge.MUTATING
+    b = FakeBridge()
+    assert b.pricing() == bridge_mod.FAKE_PRICE
+    b.price = {"model": "m", "input_per_m": 1.0, "output_per_m": 2.0}
+    got = b.pricing()
+    got["input_per_m"] = 9.0  # a copy: the caller cannot change the fake's list
+    assert b.pricing()["input_per_m"] == 1.0
+    assert b.calls == [("pricing", ())] * 3
+    b.fail.add("pricing")
+    with pytest.raises(BridgeError):
+        b.pricing()
+
+
+def test_hermes_bridge_pricing_sends_op(tmp_path):
+    log = tmp_path / "log"
+    py = fake_python(tmp_path, f'echo "$2" > {log}; cat >/dev/null; '
+                               'echo \'{"result": {"model": "m"}}\'\n')
+    assert HermesBridge(hermes_py=py).pricing() == {"model": "m"}
+    assert log.read_text().strip() == "pricing"
+
+
+def test_bridge_entry_oneshot_returns_token_breakdown(monkeypatch):
+    """input_tokens stays Hermes's fresh input; cache reads and writes come separately."""
+    import sys
+    import types
+    from dataclasses import dataclass
+
+    @dataclass(frozen=True)
+    class Usage:  # the fields and property of Hermes's CanonicalUsage
+        input_tokens: int = 0
+        output_tokens: int = 0
+        cache_read_tokens: int = 0
+        cache_write_tokens: int = 0
+
+        @property
+        def prompt_tokens(self):
+            return self.input_tokens + self.cache_read_tokens + self.cache_write_tokens
+
+    resp = types.SimpleNamespace(usage=object(), choices=[types.SimpleNamespace(
+        message=types.SimpleNamespace(content="hi"))])
+    aux = types.ModuleType("agent.auxiliary_client")
+    aux.call_llm = lambda **kw: resp
+    up = types.ModuleType("agent.usage_pricing")
+    up.normalize_usage = lambda u, provider=None: Usage(5, 7, 300, 20)
+    up.estimate_usage_cost = lambda *a, **k: types.SimpleNamespace(amount_usd=None,
+                                                                   status="included")
+    cfg = types.ModuleType("hermes_cli.config")
+    cfg.load_config = lambda: {"model": {"default": "m", "provider": "p"}}
+    for name, mod in (("agent", types.ModuleType("agent")), ("agent.auxiliary_client", aux),
+                      ("agent.usage_pricing", up), ("hermes_cli", types.ModuleType("hermes_cli")),
+                      ("hermes_cli.config", cfg)):
+        monkeypatch.setitem(sys.modules, name, mod)
+    got = bridge_entry.oneshot("i", "u", 10)
+    assert (got["input_tokens"], got["cache_read_tokens"], got["cache_write_tokens"],
+            got["output_tokens"]) == (5, 300, 20, 7)
+    assert got["text"] == "hi"

@@ -20,7 +20,7 @@ from .draft import draft
 from .fingerprint import CopyIndex
 from .ledger import FixRecord, _Failed, apply, needs_restart, write_shadow_tool
 from .limits import LimitContext, check_fix
-from .measure import priced_cost
+from .measure import INTERIM_FLAT_PRICING, priced_cost
 from .model import Fix, Session
 from .proposals import approved_callables, write_proposal
 
@@ -74,7 +74,7 @@ class DraftSteps:
     # 5-7. budget, detect, draft ----------------------------------------------------------
 
     def _job_cost(self, job_id: str) -> float:
-        costs = [priced_cost(s) for s in job_runs(self.sessions, job_id)
+        costs = [priced_cost(s, INTERIM_FLAT_PRICING) for s in job_runs(self.sessions, job_id)
                  if s.started_at >= self.now - 28 * DAY]
         return median(costs) if costs else 0.0
 

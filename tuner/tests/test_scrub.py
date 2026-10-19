@@ -3,6 +3,8 @@ from __future__ import annotations
 import gzip
 import json
 
+import pytest
+
 from hermes_tuner import scrub
 from hermes_tuner.detect import detect
 from hermes_tuner.model import Session, ToolCall
@@ -88,3 +90,23 @@ def test_dump_is_deterministic(tmp_path):
     scrub.dump(_sessions(), tmp_path / "a.gz", SALT)
     scrub.dump(_sessions(), tmp_path / "b.gz", SALT)
     assert (tmp_path / "a.gz").read_bytes() == (tmp_path / "b.gz").read_bytes()
+
+
+def test_scrub_round_trips_breakdown(tmp_path):
+    ss = [Session("s1", "cron", "j", 1.0, 0.0, 111, 9, (), input_tokens=1,
+                  cache_read_tokens=100, cache_write_tokens=10)]
+    scrub.dump(ss, tmp_path / "f.json.gz", SALT)
+    (b,) = scrub.load(tmp_path / "f.json.gz")
+    assert (b.input_tokens, b.cache_read_tokens, b.cache_write_tokens, b.output_tokens,
+            b.prompt_tokens) == (1, 100, 10, 9, 111)
+
+
+@pytest.mark.parametrize("field", ["input_tokens", "cache_read_tokens", "cache_write_tokens"])
+def test_scrub_load_refuses_a_dump_without_the_breakdown(tmp_path, field):
+    """Loading zeros would price every run at its output tokens only."""
+    scrub.dump(_sessions()[:1], tmp_path / "f.json.gz", SALT)
+    doc = json.loads(gzip.decompress((tmp_path / "f.json.gz").read_bytes()))
+    del doc["sessions"][0][field]
+    (tmp_path / "old.json.gz").write_bytes(gzip.compress(json.dumps(doc).encode()))
+    with pytest.raises(ValueError, match="fixture predates token breakdown"):
+        scrub.load(tmp_path / "old.json.gz")

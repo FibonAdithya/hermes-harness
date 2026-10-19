@@ -147,7 +147,8 @@ def _count(v: Any) -> int:
 def _spend(reply: dict) -> float:
     """Priced from the reply's token counts at USD_PER_MTOK, like every run
     (measure.priced_cost); the reply's estimated_cost_usd is ignored."""
-    tokens = _count(reply.get("input_tokens")) + _count(reply.get("output_tokens"))
+    tokens = sum(_count(reply.get(k)) for k in ("input_tokens", "cache_read_tokens",
+                                                 "cache_write_tokens", "output_tokens"))
     return tokens * policy.USD_PER_MTOK / 1e6
 
 

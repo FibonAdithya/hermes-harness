@@ -32,9 +32,27 @@ def test_calls_carry_names_keys_ref_and_lengths(tmp_path):
     assert call.result_chars == 500
 
 
-def test_prompt_tokens_include_cache_reads(tmp_path):
-    db = make_db(tmp_path / "s.db", [_sess("a", **{"in": 100, "cache": 900})])
-    assert History.open(db).sessions(0)[0].prompt_tokens == 1000
+def test_prompt_tokens_include_cache_reads_and_writes(tmp_path):
+    db = make_db(tmp_path / "s.db", [_sess("a", **{"in": 100, "cache": 900, "cw": 50})])
+    assert History.open(db).sessions(0)[0].prompt_tokens == 1050
+
+
+def test_history_keeps_token_breakdown_and_chain_sums(tmp_path):
+    """Each token kind is summed over the compression chain (NULL counts 0), and
+    prompt_tokens is Hermes's CanonicalUsage.prompt_tokens: input + cache read + write."""
+    root, child, grand = ROOT, CHILD, GRAND
+    db = make_db(tmp_path / "s.db", [
+        _sess(root, [("a", {}, "r")], started_at=1000.0, end_reason="compression",
+              **{"in": 1, "cache": 10, "cw": 100, "out": 1000}),
+        _sess(child, started_at=2000.0, parent=root, end_reason="compression",
+              **{"in": 2, "cache": 20, "cw": 200, "out": 2000}),
+        _sess(grand, started_at=3000.0, parent=child,
+              **{"in": 4, "cache": None, "cw": 400, "out": 4000}),
+    ])
+    (s,) = History.open(db).sessions(0)
+    assert (s.input_tokens, s.cache_read_tokens, s.cache_write_tokens, s.output_tokens) == \
+        (7, 30, 700, 7000)
+    assert s.prompt_tokens == 7 + 30 + 700
 
 
 def test_untrusted_texts_excludes_skill_view_and_wiki_reads(tmp_path):

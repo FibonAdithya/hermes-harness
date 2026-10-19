@@ -186,7 +186,8 @@ def sess(i, t, cost=0.1, job=LIVE, ncalls=2, tokens=None, raw=0.0):
     """`cost` sets the priced cost (prompt tokens; output 0); `raw` is the billing figure."""
     prompt = round(cost * 1e6 / policy.USD_PER_MTOK) if tokens is None else tokens
     return Session(f"s{i}", "cron", job, t, raw, prompt, 0,
-                   tuple(ToolCall(f"c{j}", "web_search", (), None, 5) for j in range(ncalls)))
+                   tuple(ToolCall(f"c{j}", "web_search", (), None, 5) for j in range(ncalls)),
+                   input_tokens=prompt)
 
 
 def test_runs_before_applied_at_not_counted():

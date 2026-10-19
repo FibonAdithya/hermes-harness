@@ -79,6 +79,7 @@ class Bridge(Protocol):
     def config_set(self, key: str, value: Any) -> None: ...
     def config_set_json(self, key: str, value: Any) -> None: ...
     def oneshot(self, instructions: str, user_input: str, max_tokens: int) -> dict: ...
+    def pricing(self) -> dict: ...
     def restart_gateway(self) -> None: ...
 
 
@@ -150,6 +151,10 @@ class HermesBridge:
         return self._call("oneshot", instructions=instructions, user_input=user_input,
                           max_tokens=max_tokens)
 
+    def pricing(self):
+        """The configured main model's list prices (see bridge_entry.pricing)."""
+        return self._call("pricing")
+
     def restart_gateway(self):
         try:
             p = self._run(["systemctl", "--user", "restart", "hermes-gateway"],
@@ -160,16 +165,26 @@ class HermesBridge:
             raise BridgeError(f"restart_gateway failed (exit {p.returncode}): {_tail(p.stderr)}")
 
 
+# FakeBridge's default price list: one flat rate for every token kind, so test
+# arithmetic stays simple. Tests that need a real list set `price`.
+FAKE_PRICE = {"model": "fake-model", "input_per_m": 0.42, "output_per_m": 0.42,
+              "cache_read_per_m": None, "cache_write_per_m": None, "source": "fake",
+              "source_url": None, "pricing_version": "fake-flat"}
+
+
 class FakeBridge:
     """In-memory Bridge. `calls` records (method, args) for every call, including
-    ones told to fail via `fail` (a set of method names)."""
+    ones told to fail via `fail` (a set of method names). `price` is what
+    `pricing()` returns (a copy)."""
 
     MUTATING = frozenset({"update_job", "create_job", "remove_job", "config_set",
                           "config_set_json", "restart_gateway", "oneshot"})
 
     def __init__(self, jobs: dict[str, dict] | None = None, config: dict | None = None,
                  oneshot_script: list[dict] | None = None, fail: set[str] | None = None,
-                 scan: Callable[[str], list[str]] | None = None):
+                 scan: Callable[[str], list[str]] | None = None,
+                 price: dict | None = None):
+        self.price = copy.deepcopy(FAKE_PRICE if price is None else price)
         self.jobs = copy.deepcopy(jobs or {})
         self.config = copy.deepcopy(config or {})
         self.oneshot_script = list(oneshot_script or [])
@@ -238,6 +253,10 @@ class FakeBridge:
         if not self.oneshot_script:
             raise BridgeError("oneshot script exhausted")
         return self.oneshot_script.pop(0)
+
+    def pricing(self):
+        self._enter("pricing")
+        return copy.deepcopy(self.price)
 
     def restart_gateway(self):
         self._enter("restart_gateway")

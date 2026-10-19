@@ -10,7 +10,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from .measure import priced_cost
+from .measure import INTERIM_FLAT_PRICING, priced_cost
 from .model import Session
 
 DAY = 86400.0
@@ -47,7 +47,7 @@ def _money(per_session: Mapping[str, int], by_id: Mapping[str, Session]) -> floa
     for sid, chars in per_session.items():
         total = _total_chars(by_id[sid])
         if total > 0:
-            usd += priced_cost(by_id[sid]) * chars / total
+            usd += priced_cost(by_id[sid], INTERIM_FLAT_PRICING) * chars / total
     return usd * MONTH_DAYS / WINDOW_DAYS
 
 

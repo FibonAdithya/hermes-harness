@@ -27,7 +27,7 @@ from typing import Literal
 from . import policy
 from .bridge import CREATE_JOB_EXTRA_KEYS, Bridge, BridgeError
 from .ledger import FixRecord, atomic_write, job_after_for
-from .measure import JobStats, job_stats
+from .measure import INTERIM_FLAT_PRICING, JobStats, job_stats
 from .model import Fix, Session
 
 SHADOW_FILE = "shadow_jobs.json"
@@ -295,13 +295,15 @@ def compare_calendar(old: set, new: set) -> Verdict:
 
 def trial_stats(sessions: list[Session], job_id: str, applied_at: float) -> JobStats | None:
     """job_stats over the runs that started after `applied_at` (the new version's)."""
-    return job_stats([s for s in sessions if s.started_at > applied_at], job_id)
+    return job_stats([s for s in sessions if s.started_at > applied_at], job_id,
+                     INTERIM_FLAT_PRICING)
 
 
 def baseline_stats(sessions: list[Session], job_id: str, applied_at: float) -> JobStats | None:
     """job_stats over runs in [applied_at - 28 days, applied_at): the old version's."""
     start = applied_at - BASELINE_DAYS * 86400
-    return job_stats([s for s in sessions if start <= s.started_at < applied_at], job_id)
+    return job_stats([s for s in sessions if start <= s.started_at < applied_at], job_id,
+                     INTERIM_FLAT_PRICING)
 
 
 def trial_verdict(record: FixRecord, stats_now: JobStats | None,

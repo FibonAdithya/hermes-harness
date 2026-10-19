@@ -340,7 +340,7 @@ def run_session(job, t, cost, n_calls=1):
     return Session(id=sid(job, t), source="cron", job_id=job, started_at=t, est_cost=0.0,
                    prompt_tokens=tok(cost), output_tokens=0,
                    calls=tuple(ToolCall(f"c{i}", GET, ("message_id",), None, 10)
-                               for i in range(n_calls)))
+                               for i in range(n_calls)), input_tokens=tok(cost))
 
 
 @pytest.mark.parametrize("live_days_ago, saved", [(10, "0.21"), (2.5, "0.14")])
@@ -374,7 +374,7 @@ def test_tuner_spend_prices_shadow_runs_from_tokens(tmp_path):
                                  NOW - DAY, spend_usd=0.03))
     shadow = Session(id=sid(SHADOW_JOB, NOW - DAY), source="cron", job_id=SHADOW_JOB,
                      started_at=NOW - DAY, est_cost=0.0, prompt_tokens=tok(0.05),
-                     output_tokens=0, calls=())
+                     output_tokens=0, calls=(), input_tokens=tok(0.05))
     line = weekly_line(led, [shadow], NOW, shadow_ids={SHADOW_JOB})
     assert line.endswith("; tuner spent $0.08")  # 0.03 drafting + 0.05 shadow (billed $0)
 

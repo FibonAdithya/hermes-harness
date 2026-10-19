@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from .ledger import Ledger
-from .measure import priced_cost
+from .measure import INTERIM_FLAT_PRICING, priced_cost
 from .model import Session
 
 DAY = 86400.0
@@ -42,7 +42,7 @@ def tuner_spend(ledger: Ledger, sessions: Iterable[Session], shadow_ids: Iterabl
         return t > since and (until is None or t <= until)
 
     drafting = sum(r.spend_usd for r in ledger.records if inside(r.created_at))
-    shadow = sum(priced_cost(s) for s in sessions if s.job_id in shadows and inside(s.started_at))
+    shadow = sum(priced_cost(s, INTERIM_FLAT_PRICING) for s in sessions if s.job_id in shadows and inside(s.started_at))
     return drafting + shadow
 
 
@@ -67,7 +67,7 @@ def savings(ledger: Ledger, sessions: list[Session], since: float, until: float)
     for job, (_applied_at, live_from, base) in first.items():
         if base is None:
             continue
-        total += sum(base - priced_cost(s) for s in job_runs(sessions, job)
+        total += sum(base - priced_cost(s, INTERIM_FLAT_PRICING) for s in job_runs(sessions, job)
                      if since < s.started_at <= until and s.started_at > live_from)
     return total
 
