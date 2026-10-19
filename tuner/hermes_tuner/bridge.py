@@ -141,6 +141,7 @@ class FakeBridge:
         self.fail = set(fail or ())
         self._scan = scan or (lambda text: [])
         self.calls: list[tuple[str, tuple]] = []
+        self._next_id = 0
 
     def _enter(self, method: str, *args: Any) -> None:
         self.calls.append((method, args))
@@ -168,9 +169,11 @@ class FakeBridge:
 
     def create_job(self, prompt, schedule, name, deliver, enabled_toolsets):
         self._enter("create_job", prompt, schedule, name, deliver, enabled_toolsets)
-        job_id = f"fake{len(self.jobs):08x}"
+        # Monotonic: len(self.jobs) would reuse an id after remove_job.
+        self._next_id += 1
+        job_id = f"fake{self._next_id:08x}"
         self.jobs[job_id] = {"id": job_id, "prompt": prompt, "schedule": schedule,
-                             "name": name, "deliver": deliver,
+                             "next_run_at": schedule, "name": name, "deliver": deliver,
                              "enabled_toolsets": copy.deepcopy(enabled_toolsets)}
         return copy.deepcopy(self.jobs[job_id])
 
