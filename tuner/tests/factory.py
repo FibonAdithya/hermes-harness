@@ -14,6 +14,12 @@ V4_PRO = Pricing(model="deepseek-v4-pro", input_per_m=0.435, output_per_m=0.87,
                  source="official_docs_snapshot",
                  source_url="https://api-docs.deepseek.com/quick_start/pricing",
                  version="deepseek-pricing-2026-07", fetched_at=0.0)
+# The v4-pro list as the Nous models API serves it (MEASURED on the droplet, 2026-10-19:
+# `python -m hermes_tuner pricing`). The droplet runs v4-pro through Nous.
+NOUS_V4_PRO = Pricing(model="deepseek/deepseek-v4-pro", input_per_m=0.94, output_per_m=1.89,
+                      cache_read_per_m=0.08, cache_write_per_m=None,
+                      source="provider_models_api", source_url=None, version="nous",
+                      fetched_at=0.0)
 # One rate for every token kind (FakeBridge's default list): test arithmetic stays simple.
 FLAT_RATE = 0.42
 FLAT = Pricing(model="fake-model", input_per_m=FLAT_RATE, output_per_m=FLAT_RATE,

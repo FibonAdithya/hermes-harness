@@ -91,6 +91,43 @@ def _sequences(sessions: list[Session], by_id: Mapping[str, Session],
     return out
 
 
+def _loop_signature(seq: tuple[str, ...]) -> tuple[str, ...]:
+    """Rotation-invariant loop identity: the minimal rotation of the shortest root whose
+    whole repetition is `seq`. get x3 and get x5 -> (get); s,s,e / s,e,s / e,s,s -> (e,s,s).
+    The root must tile `seq` exactly (its length divides len(seq)): a partial tile such as
+    s,e,s would otherwise read as the loop (s,e) and not match its rotations of s,s,e."""
+    n = len(seq)
+    root = next(seq[:p] for p in range(1, n + 1)
+                if n % p == 0 and seq == seq[:p] * (n // p))
+    return min(root[i:] + root[:i] for i in range(len(root)))
+
+
+def _contains(big: tuple[str, ...], small: tuple[str, ...]) -> bool:
+    n = len(small)
+    return any(big[i:i + n] == small for i in range(len(big) - n + 1))
+
+
+def _one_sequence_per_loop(cands: list[Candidate]) -> list[Candidate]:
+    """Windows of one repeated loop (x3/x4/x5, rotations, a loop plus one more call) are
+    one waste, not several. Per job, keep the costliest sequence candidate and drop any
+    later one with the same loop signature or nested in a kept one (either direction).
+    `cands` is already sorted; other kinds pass through."""
+    kept: dict[str | None, list[tuple[str, ...]]] = defaultdict(list)
+    out = []
+    for c in cands:
+        if c.kind != "sequence":
+            out.append(c)
+            continue
+        g = tuple(c.key.removeprefix("seq:").split(">"))
+        sig = _loop_signature(g)
+        if any(_loop_signature(k) == sig or _contains(k, g) or _contains(g, k)
+               for k in kept[c.job_id]):
+            continue
+        kept[c.job_id].append(g)
+        out.append(c)
+    return out
+
+
 def _rereads(sessions: list[Session], by_id: Mapping[str, Session],
              pricing: Pricing) -> list[Candidate]:
     jobs: dict[str, list[Session]] = defaultdict(list)
@@ -172,4 +209,4 @@ def detect(sessions: list[Session], now: float, pricing: Pricing,
         cands += _skill_loads(window, by_id, skill_names, pricing)
     cands = [c for c in cands if c.est_monthly_usd > 0]  # worth nothing: not a candidate
     cands.sort(key=lambda c: (-c.est_monthly_usd, c.kind, c.key, c.job_id or ""))
-    return cands
+    return _one_sequence_per_loop(cands)

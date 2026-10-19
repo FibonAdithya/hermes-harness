@@ -275,3 +275,70 @@ def test_detector_ranks_by_list_price():
     assert listed == ["bbbbbbbbbbbb", "aaaaaaaaaaaa"]
     flat = [c.job_id for c in detect(ss, NOW, FLAT) if c.kind == "sequence"]
     assert flat == ["aaaaaaaaaaaa", "bbbbbbbbbbbb"]  # the control: a flat rate inverts it
+
+
+# --- one sequence candidate per repeated loop (Task 3c) -----------------------------
+
+def _varied_runs(job, prefix="v", gets=(3, 4, 5), per=12):
+    """Runs that are only a get loop of varying length k, so get x3, get x4 and get x5
+    occur in different session sets (36, 24 and 12 sessions) as in the real calendar job."""
+    out = []
+    for j, k in enumerate(gets):
+        for r in range(per):
+            cs = [call(i, GET, 10_000, ref=f"{prefix}{j}{r}-{i}") for i in range(k)]
+            out.append(sess(f"{prefix}{j}-{r}", cs, job=job, age_days=1 + (j * per + r) * 0.5))
+    return out
+
+
+def _seqs(cands, job, needle=None):
+    return [c for c in cands if c.kind == "sequence" and c.job_id == job
+            and (needle is None or needle in c.key)]
+
+
+def test_windows_of_one_loop_collapse():
+    cands = detect(_varied_runs("ja"), NOW, FLAT)
+    assert len(_seqs(cands, "ja", GET)) == 1
+
+
+def test_rotations_collapse():
+    # chat sessions that each hold one rotation of the (search, search, extract) cycle:
+    # three candidates in three session sets, one loop
+    def chats(tag, names, n, age0):
+        return [sess(f"{tag}{r}", [call(i, x, 1000) for i, x in enumerate(names)], job=None,
+                     age_days=age0 + r, cost=0.05, source="telegram") for r in range(n)]
+    s, e = "web_search", "web_extract"
+    ss = chats("a", [s, s, e], 12, 1) + chats("b", [s, e, s], 11, 1) + chats("c", [e, s, s], 10, 1)
+    seq = _seqs(detect(ss, NOW, FLAT), None)
+    assert len(seq) == 1, [c.key for c in seq]
+
+
+def test_superstring_with_tail_dropped():
+    # get x3 occurs in all 12 runs; get x4 > get_events in 10 of them (a different session set)
+    ss = [sess(f"p{r}", [call(i, GET, 1000, ref=f"p{r}-{i}") for i in range(4)]
+               + [call(4, "get_events", 1000)], job="ja", age_days=1 + r) for r in range(10)]
+    ss += [sess(f"q{r}", [call(i, GET, 1000, ref=f"q{r}-{i}") for i in range(3)]
+                + [call(3, MODIFY, 1000), call(4, MODIFY, 1000)], job="ja", age_days=11 + r, cost=5.0)
+           for r in range(2)]
+    keys = [c.key for c in _seqs(detect(ss, NOW, FLAT), "ja")]
+    assert "seq:" + ">".join([GET] * 3) in keys
+    assert not any("get_events" in k for k in keys), keys
+
+
+def test_different_jobs_not_merged():
+    cands = detect(_varied_runs("ja", "a") + _varied_runs("jb", "b"), NOW, FLAT)
+    assert len(_seqs(cands, "ja", GET)) == 1
+    assert len(_seqs(cands, "jb", GET)) == 1
+
+
+def test_distinct_loops_kept():
+    abc = [sess(f"u{r}", [call(0, "A"), call(1, "B"), call(2, "C")], job="ja",
+                age_days=1 + r) for r in range(12)]
+    dfe = [sess(f"w{r}", [call(0, "D"), call(1, "E"), call(2, "F")], job="ja",
+                age_days=1 + r) for r in range(11)]
+    keys = sorted(c.key for c in _seqs(detect(abc + dfe, NOW, FLAT), "ja"))
+    assert keys == ["seq:A>B>C", "seq:D>E>F"]
+
+
+def test_briefing_loop_is_one_candidate():
+    cands = detect(briefing_runs(), NOW, FLAT)
+    assert len(_seqs(cands, "3bc4e11d29b1", GET)) == 1

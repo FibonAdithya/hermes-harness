@@ -1,7 +1,8 @@
 """Answer key (plan Task 11, Step 2): on the scrubbed 2026-09/10 history, with the
 window anchored at 2026-10-04 (before the credit outage), the top 5 candidates
-include the three known wastes. The fixture is produced on the droplet; until it is
-committed the real-fixture tests skip. The helper logic is tested unskipped against
+include the three known wastes. The fixture is produced on the droplet (`scrub --since 2026-09-01`) and committed;
+the droplet resolves the Nous models-API list, so that is the primary price list, and
+the DeepSeek-page list is checked too. The helper logic is tested unskipped against
 a small synthetic fixture."""
 from __future__ import annotations
 
@@ -12,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from factory import V4_PRO  # the answer key is judged at the v4-pro list prices
+from factory import NOUS_V4_PRO, V4_PRO  # judged at v4-pro list prices, both lists
 from hermes_tuner import scrub
 from hermes_tuner.detect import Candidate, detect
 from tests.test_detect import DAY, GET, briefing_runs, call, schema_sessions, sess
@@ -61,6 +62,12 @@ def long_strings(path: Path) -> list[str]:
 
 @needs_fixture
 def test_answer_key_in_top_five():
+    cands = detect(scrub.load(FIXTURE), now=ANCHOR, pricing=NOUS_V4_PRO)
+    assert missing_from_top5(cands) == [], [(c.kind, c.key, c.job_id) for c in cands[:5]]
+
+
+@needs_fixture
+def test_answer_key_in_top_five_at_deepseek_page_prices():
     cands = detect(scrub.load(FIXTURE), now=ANCHOR, pricing=V4_PRO)
     assert missing_from_top5(cands) == [], [(c.kind, c.key, c.job_id) for c in cands[:5]]
 
