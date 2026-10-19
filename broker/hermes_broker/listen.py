@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import sys
 from pathlib import Path
+from typing import TextIO
 
 from . import box
 from .approvals import Call, run_listener
@@ -14,6 +17,28 @@ from .proposals import ProposalStore
 from .tasks import TaskStore
 
 logger = logging.getLogger(__name__)
+
+# Telegram puts the bot token in the request path: /bot<id>:<secret>/method.
+_BOT_TOKEN = re.compile(r"bot\d+:[A-Za-z0-9_-]+")
+
+
+class _RedactingFormatter(logging.Formatter):
+    """Removes bot tokens from the whole formatted line, tracebacks included."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return _BOT_TOKEN.sub("bot<redacted>", super().format(record))
+
+
+def configure_logging(stream: TextIO = sys.stderr) -> None:
+    """INFO logging to `stream`, with httpx/httpcore request lines silenced (they
+    log every URL, token included) and any token left in a message redacted."""
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(_RedactingFormatter("%(asctime)s %(levelname)s %(message)s"))
+    root = logging.getLogger()
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def _task_wiring(cfg: BrokerConfig) -> tuple[TaskStore | None, Call | None]:
@@ -38,7 +63,7 @@ def _proposal_wiring(cfg: BrokerConfig) -> tuple[ProposalStore, Path]:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    configure_logging()
     cfg = load_config(Path(os.environ["HERMES_BROKER_CONFIG"]))
     tasks, call = _task_wiring(cfg)
     proposals, tuner_dir = _proposal_wiring(cfg)
