@@ -83,6 +83,8 @@ class Pricing:
         fetched = d.get("fetched_at", 0.0)
         if isinstance(fetched, bool) or not isinstance(fetched, (int, float)):
             raise ValueError("pricing fetched_at must be a number")
+        if not math.isfinite(fetched):
+            raise ValueError("pricing fetched_at must be finite")
         return cls(model=model,
                    input_per_m=_rate(d, "input_per_m", False),  # type: ignore[arg-type]
                    output_per_m=_rate(d, "output_per_m", False),  # type: ignore[arg-type]

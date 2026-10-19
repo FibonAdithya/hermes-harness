@@ -715,6 +715,37 @@ def test_bridge_entry_pricing_lookup_order():
     assert len(calls) == 2
 
 
+def test_bridge_entry_pricing_infers_maker_for_bare_ids():
+    fireworks = _Entry(9.0, 9.0)
+    table = {("deepseek-v4-pro", "deepseek"): V4, ("deepseek-v4-pro", "fireworks"): fireworks}
+    vendors = {"deepseek", "fireworks"}
+    # route has no list, or an all-zero one -> Hermes's own maker inference
+    for route in (None, _Entry(0, 0, 0, 0, source="none", version="included-route")):
+        get, calls = _lookup(table | {("deepseek-v4-pro", "nous"): route})
+        got = bridge_entry.lookup_pricing("deepseek-v4-pro", "nous", None, "", get, vendors,
+                                          detect_vendor=lambda m: "deepseek")
+        assert got["input_per_m"] == 0.435 and got["model"] == "deepseek-v4-pro"
+        assert calls[-1][:2] == ("deepseek-v4-pro", "deepseek") and len(calls) == 2
+    # a maker with no docs snapshot is not accepted, and no other vendor is tried
+    get, calls = _lookup(table)
+    with pytest.raises(LookupError, match="no pricing for deepseek-v4-pro"):
+        bridge_entry.lookup_pricing("deepseek-v4-pro", "nous", None, "", get, vendors,
+                                    detect_vendor=lambda m: "someone-else")
+    assert len(calls) == 1
+    # no inference result -> error
+    get, calls = _lookup(table)
+    with pytest.raises(LookupError):
+        bridge_entry.lookup_pricing("deepseek-v4-pro", "nous", None, "", get, vendors,
+                                    detect_vendor=lambda m: None)
+    # a prefixed id never asks detect_vendor
+    def boom(m):
+        raise AssertionError("detect_vendor called for a prefixed id")
+    get, _ = _lookup({("deepseek-v4-pro", "deepseek"): V4})
+    got = bridge_entry.lookup_pricing("deepseek/deepseek-v4-pro", "nous", None, "", get, vendors,
+                                      detect_vendor=boom)
+    assert got["input_per_m"] == 0.435
+
+
 def test_fake_bridge_pricing_is_settable_and_not_mutating():
     assert "pricing" not in FakeBridge.MUTATING
     b = FakeBridge()

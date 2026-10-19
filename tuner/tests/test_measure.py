@@ -100,3 +100,9 @@ def test_chat_stats_uses_telegram_source_and_excludes_zero_calls():
     assert chat_stats(ss, FLAT).runs == 1
     assert chat_stats(ss, FLAT).median_priced_cost == pytest.approx(3000 * PER_TOKEN)
     assert chat_stats([_s("c", source="cron")], FLAT) is None
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan")])
+def test_pricing_from_dict_rejects_non_finite_fetched_at(bad):
+    with pytest.raises(ValueError, match="fetched_at"):
+        Pricing.from_dict(V4_PRO.to_dict() | {"fetched_at": bad})

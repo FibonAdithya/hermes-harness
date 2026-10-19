@@ -153,16 +153,18 @@ def _usable(entry):
     return inp is not None and out is not None and (inp > 0 or out > 0)
 
 
-def lookup_pricing(model, provider, base_url, api_key, get_entry, vendors):
+def lookup_pricing(model, provider, base_url, api_key, get_entry, vendors, detect_vendor=None):
     """The main model's price list. `get_entry` is Hermes's get_pricing_entry and
-    `vendors` the providers Hermes has docs snapshots for (both injected so this
-    runs without Hermes in tests).
+    `vendors` the providers Hermes has docs snapshots for, `detect_vendor` Hermes's
+    model_normalize.detect_vendor (all injected so this runs without Hermes in tests).
 
     1. get_entry(model, provider=, base_url=, api_key=) - the billing route's list
        (provider /models API, else a docs snapshot);
     2. not usable (None, or no real rates) -> the model's vendor: the part of
-       `model` before "/" (looked up with the part after), else `provider` if it is
-       in `vendors`; get_entry(bare, provider=vendor);
+       `model` before "/" (looked up with the part after); for an id without "/",
+       `provider` if it is in `vendors`, else the maker `detect_vendor(model)` names
+       if that is in `vendors` (never a search over vendors: the same model id has
+       different prices at different vendors); get_entry(bare, provider=vendor);
     3. still nothing usable -> LookupError("no pricing for <model>")."""
     entry = get_entry(model, provider=provider, base_url=base_url, api_key=api_key)
     if not _usable(entry):
@@ -170,7 +172,11 @@ def lookup_pricing(model, provider, base_url, api_key, get_entry, vendors):
         if "/" in model:
             vendor, bare = model.split("/", 1)
         else:
-            vendor, bare = (provider if provider in vendors else None), model
+            bare = model
+            vendor = provider if provider in vendors else None
+            if vendor is None and detect_vendor is not None:
+                maker = detect_vendor(model)
+                vendor = maker if maker in vendors else None
         if vendor:
             retry = get_entry(bare, provider=vendor)
             entry = retry if _usable(retry) else None
@@ -203,10 +209,11 @@ def pricing():
     Hermes's get_pricing_entry (lookup_pricing gives the order). Never scrapes a
     web page: Hermes's dated docs snapshot is the fallback."""
     from agent.usage_pricing import _OFFICIAL_DOCS_PRICING, get_pricing_entry
+    from hermes_cli.model_normalize import detect_vendor
     model, provider, base_url = _main_model()
     vendors = {p for p, _m in _OFFICIAL_DOCS_PRICING}
     return lookup_pricing(model, provider, base_url, _main_api_key(provider, model),
-                          get_pricing_entry, vendors)
+                          get_pricing_entry, vendors, detect_vendor)
 
 
 OPS = {f.__name__: f for f in (scan, get_job, list_jobs, update_job, create_job,

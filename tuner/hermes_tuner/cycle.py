@@ -263,7 +263,7 @@ class _Cycle(DraftSteps):
             if cached is not None:
                 self.pricing = cached
                 day = datetime.fromtimestamp(cached.fetched_at, timezone.utc).strftime("%Y-%m-%d")
-                self.err(f"pricing lookup failed; using cached list from {day}")
+                self.err(f"pricing lookup failed; using cached list from {day}: {exc}")
             else:
                 self.err(f"pricing lookup failed: {exc}")
         if self.pricing is None:

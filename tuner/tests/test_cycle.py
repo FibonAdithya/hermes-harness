@@ -1018,7 +1018,9 @@ def test_cached_pricing_used_within_max_age_not_after(env, extra, used):
     day = datetime.fromtimestamp(fetched, timezone.utc).strftime("%Y-%m-%d")
     if used:
         assert len(oneshots(bridge)) == 1
-        assert f"pricing lookup failed; using cached list from {day}" in report.errors
+        assert any(e.startswith(f"pricing lookup failed; using cached list from {day}: ")
+                   and len(e) > len(f"pricing lookup failed; using cached list from {day}: ")
+                   for e in report.errors)
         assert "no model pricing" not in report.errors
     else:
         assert oneshots(bridge) == [] and "no model pricing" in report.errors
