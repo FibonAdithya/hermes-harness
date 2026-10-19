@@ -259,5 +259,5 @@ def test_apply_callable_add_is_ledger_only(tmp_path):
 def test_config_set_json_is_mutating_in_fake_bridge():
     assert "config_set_json" in FakeBridge.MUTATING
     b = FakeBridge()
-    b.config_set_json("k.v", ["x"])
-    assert b.config["k.v"] == ["x"] and b.calls == [("config_set_json", ("k.v", ["x"]))]
+    b.config_set_json(INC_KEY, ["x"])
+    assert b.config[INC_KEY] == ["x"] and b.calls == [("config_set_json", (INC_KEY, ["x"]))]

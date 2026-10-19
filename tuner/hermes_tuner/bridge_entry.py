@@ -11,7 +11,11 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import re
 import sys
+
+# Same pattern as bridge.CONFIG_JSON_KEY (this file cannot import the tuner).
+CONFIG_JSON_KEY = re.compile(r"mcp_servers\.[A-Za-z0-9_-]+\.tools\.include")
 
 
 def scan(text):
@@ -83,7 +87,9 @@ def config_set_json(key, value):
     """Set `key` to a JSON value (a list or dict). `config_set` only takes strings,
     so this repeats set_config_value's write path for config.yaml: read the raw user
     config, set the nested key, write it back atomically. Only the approved new-reach
-    change (tuner/proposals.py) calls it."""
+    change (tuner/proposals.py) calls it, and only for an MCP tools.include key."""
+    if not isinstance(key, str) or not CONFIG_JSON_KEY.fullmatch(key):
+        raise ValueError(f"config_set_json refuses key {key!r}")
     from hermes_cli.config import (
         _set_nested, ensure_hermes_home, get_config_path, is_managed,
         require_readable_config_before_write)
@@ -128,6 +134,15 @@ OPS = {f.__name__: f for f in (scan, get_job, list_jobs, update_job, create_job,
                                remove_job, config_get, config_set, config_set_json, oneshot)}
 
 
+def load_hermes_env():
+    """Load Hermes's .env (provider keys, secret sources) the way its own entry points
+    do (run_agent.py, cron/scheduler.py): load_hermes_dotenv for the Hermes home.
+    Imports inside the function so this file compiles without Hermes."""
+    from hermes_cli.env_loader import load_hermes_dotenv
+    from hermes_constants import get_hermes_home
+    load_hermes_dotenv(hermes_home=get_hermes_home())
+
+
 def main(argv, stdin, stdout, stderr):
     try:
         op = argv[1] if len(argv) > 1 else ""
@@ -135,6 +150,7 @@ def main(argv, stdin, stdout, stderr):
             raise ValueError(f"unknown op {op!r}")
         args = json.loads(stdin.read() or "{}")
         with contextlib.redirect_stdout(stderr):  # Hermes prints; keep stdout for JSON
+            load_hermes_env()
             result = OPS[op](**args)
         stdout.write(json.dumps({"result": result}, default=str))
         return 0

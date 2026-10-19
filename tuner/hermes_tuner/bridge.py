@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -43,6 +44,15 @@ def encode_config_value(value: Any) -> str:
     if isinstance(value, str):
         return value
     raise ValueError(f"config value of type {type(value).__name__} cannot be set")
+
+
+# The only keys config_set_json may write: an MCP server's tools.include list (spec 4.6).
+CONFIG_JSON_KEY = re.compile(r"mcp_servers\.[A-Za-z0-9_-]+\.tools\.include")
+
+
+def check_config_json_key(key: object) -> None:
+    if not isinstance(key, str) or not CONFIG_JSON_KEY.fullmatch(key):
+        raise ValueError(f"config_set_json refuses key {key!r}")
 
 
 def check_create_job_extra(extra: dict | None) -> dict:
@@ -131,7 +141,9 @@ class HermesBridge:
 
     def config_set_json(self, key, value):
         """Set `key` to a JSON value (a list or dict that `config_set` cannot carry).
-        Used only for owner-approved new-reach changes (spec 4.6)."""
+        Used only for owner-approved new-reach changes (spec 4.6); any key but
+        mcp_servers.<server>.tools.include raises ValueError before Hermes runs."""
+        check_config_json_key(key)
         self._call("config_set_json", key=key, value=value)
 
     def oneshot(self, instructions, user_input, max_tokens):
@@ -218,6 +230,7 @@ class FakeBridge:
 
     def config_set_json(self, key, value):
         self._enter("config_set_json", key, value)
+        check_config_json_key(key)
         self.config[key] = copy.deepcopy(value)
 
     def oneshot(self, instructions, user_input, max_tokens):

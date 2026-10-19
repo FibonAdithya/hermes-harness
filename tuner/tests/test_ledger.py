@@ -502,6 +502,64 @@ def test_bridge_entry_create_job_passes_extra_to_hermes(monkeypatch):
     assert bridge_entry.CREATE_JOB_EXTRA_KEYS == bridge_mod.CREATE_JOB_EXTRA_KEYS
 
 
+def _fake_hermes_env(monkeypatch, tmp_path, calls):
+    import sys
+    import types
+    loader = types.ModuleType("hermes_cli.env_loader")
+
+    def load_hermes_dotenv(*, hermes_home=None, project_env=None):
+        calls.append(("dotenv", hermes_home))
+        os.environ["TUNER_TEST_DOTENV"] = "loaded"
+        return []
+    loader.load_hermes_dotenv = load_hermes_dotenv
+    consts = types.ModuleType("hermes_constants")
+    consts.get_hermes_home = lambda: tmp_path
+    monkeypatch.setitem(sys.modules, "hermes_cli", types.ModuleType("hermes_cli"))
+    monkeypatch.setitem(sys.modules, "hermes_cli.env_loader", loader)
+    monkeypatch.setitem(sys.modules, "hermes_constants", consts)
+    monkeypatch.delenv("TUNER_TEST_DOTENV", raising=False)
+
+
+def test_bridge_entry_loads_hermes_dotenv_before_the_op(monkeypatch, tmp_path):
+    """F9: Hermes's .env (provider keys) is loaded as Hermes entry points do, before
+    any op runs."""
+    import io
+    calls = []
+    _fake_hermes_env(monkeypatch, tmp_path, calls)
+
+    def op(text):
+        calls.append(("op", os.environ.get("TUNER_TEST_DOTENV")))
+        return []
+    monkeypatch.setitem(bridge_entry.OPS, "scan", op)
+    out = io.StringIO()
+    rc = bridge_entry.main(["entry", "scan"], io.StringIO('{"text": "x"}'), out, io.StringIO())
+    assert rc == 0 and json.loads(out.getvalue()) == {"result": []}
+    assert calls == [("dotenv", tmp_path), ("op", "loaded")]
+
+
+@pytest.mark.parametrize("key", ["mcp_servers.google.tools.include", "mcp_servers.a-b_9.tools.include"])
+def test_config_set_json_accepts_only_mcp_include_keys(key):
+    FakeBridge().config_set_json(key, ["x"])
+
+
+@pytest.mark.parametrize("key", ["mcp_servers.google.tools.exclude", "model",
+                                 "mcp_servers.google.command", "mcp_servers..tools.include",
+                                 "mcp_servers.a.b.tools.include", "plugins.enabled",
+                                 "mcp_servers.google.tools.include\n"])
+def test_config_set_json_refuses_other_keys(tmp_path, key):
+    """m4: the JSON setter is for the approved MCP include change only."""
+    with pytest.raises(ValueError):
+        FakeBridge().config_set_json(key, ["x"])
+    log = tmp_path / "log"
+    py = fake_python(tmp_path, f'echo called > {log}; echo \'{{"result": null}}\'\n')
+    with pytest.raises(ValueError):
+        HermesBridge(hermes_py=py).config_set_json(key, ["x"])
+    assert not log.exists()
+    with pytest.raises(ValueError):
+        bridge_entry.config_set_json(key, ["x"])
+    assert bridge_entry.CONFIG_JSON_KEY.pattern == bridge_mod.CONFIG_JSON_KEY.pattern
+
+
 def test_config_value_encoding():
     enc = bridge_mod.encode_config_value
     assert enc(True) == "true" and enc(False) == "false"
