@@ -136,16 +136,37 @@ def test_rollback_config_skips_owner_edit(tmp_path):
     assert bridge.config["compression.threshold"] == 0.9
 
 
-def test_config_coercion_does_not_look_like_owner_edit(tmp_path):
-    # The live value read back as its string form ("false") is the value written
-    # (False), not an owner edit.
-    root, skills, bridge, ledger = make(tmp_path)
-    bridge.config["compression.enabled"] = True
-    f = Fix("c1", "config", "k", {"key": "compression.enabled", "value": False}, "k")
-    rec = do_apply(f, ledger, bridge, root, skills)
-    bridge.config["compression.enabled"] = "false"
-    assert do_rollback(rec, ledger, bridge, root, skills).state == "rolled_back"
-    assert bridge.config["compression.enabled"] is True
+def test_rollback_compares_read_backs_strictly_after_value(tmp_path):
+    """Catches: a normalising compare treating the owner's YAML `off` (False) as the
+    tuner's "off"."""
+    root, skills, bridge, ledger = make(tmp_path, string_default_keys={TS})
+    rec = do_apply(cfg_fix(TS, "off"), ledger, bridge, root, skills)
+    bridge.config[TS] = False  # owner hand-edits `enabled: off`
+    out = do_rollback(rec, ledger, bridge, root, skills)
+    assert out.state == "owner_changed" and bridge.config[TS] is False
+    assert not [c for c in bridge.calls if c[0] == "config_set"][1:]
+
+
+def test_rollback_compares_read_backs_strictly_before_value(tmp_path):
+    """Catches: the already-restored branch matching the owner's True against "on"."""
+    root, skills, bridge, ledger = make(tmp_path, string_default_keys={TS})
+    bridge.config[TS] = "on"
+    rec = do_apply(cfg_fix(TS, "auto"), ledger, bridge, root, skills)
+    bridge.config[TS] = True
+    out = do_rollback(rec, ledger, bridge, root, skills)
+    assert out.state == "owner_changed" and bridge.config[TS] is True
+
+
+def test_owner_edit_checked_before_restorability_after_default_type_change(tmp_path):
+    """Catches: reporting "rollback failed" for an owner-edited key when Hermes's
+    default type changed after apply."""
+    root, skills, bridge, ledger = make(tmp_path, string_default_keys={TS})
+    bridge.config[TS] = "on"
+    rec = do_apply(cfg_fix(TS, "auto"), ledger, bridge, root, skills)
+    bridge.string_default_keys.clear()  # Hermes upgrade: "on" no longer restorable
+    bridge.config[TS] = "owner value"
+    out = do_rollback(rec, ledger, bridge, root, skills)
+    assert out.state == "owner_changed" and bridge.config[TS] == "owner value"
 
 
 def test_config_without_previous_value_is_refused(tmp_path):

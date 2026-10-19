@@ -485,20 +485,20 @@ def rollback(record: FixRecord, ledger: Ledger, bridge: Bridge, root: Path, now:
         elif record.kind == "config":
             key = before["key"]
             default_is_str = bridge.config_default_is_str(key)
-            if not _round_trips(before["value"], default_is_str):
-                raise _Failed(f"config {key} old value cannot be restored through "
-                              "`hermes config set`")
             cur = bridge.config_get(key)
-            if _same_config(cur, before["value"]):
+            if _strict_equal(cur, before["value"]):
                 pass  # already restored (a retry)
-            elif _same_config(cur, after["value"]):
+            elif _strict_equal(cur, after["value"]):
+                if not _round_trips(before["value"], default_is_str):
+                    raise _Failed(f"config {key} old value cannot be restored through "
+                                  "`hermes config set`")
                 bridge.config_set(key, before["value"])
                 back = bridge.config_get(key)
                 if not _strict_equal(back, before["value"]):
                     raise _Failed(f"config {key} did not restore: reads {back!r}, "
                                   f"expected {before['value']!r}")
             else:
-                changed.append(f"config {before['key']}")
+                changed.append(f"config {key}")
         elif record.kind == "skill":
             path = _resolve_skill(skills_root, after["file"])  # absolute path; re-checked
             original = base64.b64decode(before["b64"])
