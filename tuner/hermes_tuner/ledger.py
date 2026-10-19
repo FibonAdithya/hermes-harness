@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from . import policy
-from .bridge import Bridge, BridgeError, encode_config_value
+from .bridge import Bridge, BridgeError, encode_config_value, hermes_coerce
 from .model import Fix
 
 State = Literal["rejected", "shadow_pending", "shadow_failed", "trial", "kept",
@@ -182,29 +182,26 @@ def _norm(v: Any) -> Any:
     return v
 
 
-def _hermes_coerce(s: str) -> Any:
-    """What set_config_value does to a string for a non-string setting."""
-    low = s.lower()
-    if low in ("true", "yes", "on"):
-        return True
-    if low in ("false", "no", "off"):
-        return False
-    if s.isdigit():
-        return int(s)
-    if s.replace(".", "", 1).isdigit():
-        return float(s)
-    return s
+def _hermes_coerce(value_str: str, default_is_str: bool) -> Any:
+    """What `hermes config set` stores for `value_str` (see bridge.hermes_coerce)."""
+    return hermes_coerce(value_str, default_is_str)
 
 
-def _round_trips(old: Any) -> bool:
-    """True when `old` is a scalar that setting it back via its string form restores."""
-    if not isinstance(old, (bool, int, float, str)):
+def _round_trips(value: Any, default_is_str: bool) -> bool:
+    """True when `value` is a scalar that setting it via its string form stores
+    unchanged, for a key whose default is (or is not) a string."""
+    if not isinstance(value, (bool, int, float, str)):
         return False
     try:
-        back = _hermes_coerce(encode_config_value(old))
+        back = _hermes_coerce(encode_config_value(value), default_is_str)
     except ValueError:
         return False
-    return type(back) is type(old) and back == old
+    return type(back) is type(value) and back == value
+
+
+def _strict_equal(a: Any, b: Any) -> bool:
+    """Same type and value, no normalising: "off" is not False."""
+    return type(a) is type(b) and a == b
 
 
 def _same_config(a: Any, b: Any) -> bool:
@@ -360,9 +357,15 @@ def apply(fix: Fix, ledger: Ledger, bridge: Bridge, root: Path, now: float,
         if not isinstance(p.get("key"), str) or "value" not in p:
             raise ValueError("config payload needs a key and a value")
         encode_config_value(p["value"])  # ValueError for None/list/dict, before any write
-        if not _round_trips(p["value"]):  # -1, NaN, inf, 1e-05, "on": Hermes would change it
-            raise ValueError(f"config value {p['value']!r} does not survive "
-                             "`hermes config set` unchanged")
+        try:
+            default_is_str = bridge.config_default_is_str(p["key"])
+        except BridgeError as exc:  # fail closed: recorded as bridge_error below
+            lookup_error, default_is_str = exc, False
+        else:
+            lookup_error = None
+            if not _round_trips(p["value"], default_is_str):  # -1, NaN, 1e-05, "on" on a bool key
+                raise ValueError(f"config value {p['value']!r} does not survive "
+                                 "`hermes config set` unchanged")
     elif fix.kind == "composed_tool":
         spec, program = _tool_files(p)
         job_prompt = p.get("job_prompt")
@@ -390,15 +393,19 @@ def apply(fix: Fix, ledger: Ledger, bridge: Bridge, root: Path, now: float,
             bridge.update_job(fix.target, _job_updates(before, after))
         elif fix.kind == "config":
             key = p["key"]
+            if lookup_error is not None:
+                raise lookup_error
             old = bridge.config_get(key)
             if old is None:
                 raise _Failed(f"config key {key!r} has no current value to roll back to")
-            if not _round_trips(old):
+            if not _round_trips(old, default_is_str):
                 raise _Failed(f"config key {key!r} current value cannot be restored "
                               "through `hermes config set`")
             _write_json(vdir / "before.json", {"key": key, "value": old})
             _write_json(after_path, {"key": key, "value": p["value"]})
             bridge.config_set(key, p["value"])
+            stored = _verify_config_write(bridge, key, p["value"], old)
+            _write_json(after_path, {"key": key, "value": stored})  # what Hermes stored
         elif fix.kind == "skill":
             path = _resolve_skill(skills_root, p.get("path"))
             text = p.get("text")
@@ -439,6 +446,21 @@ def apply(fix: Fix, ledger: Ledger, bridge: Bridge, root: Path, now: float,
     return _set_state(ledger, rec, "trial")
 
 
+def _verify_config_write(bridge: Bridge, key: str, value: Any, old: Any) -> Any:
+    """Read `key` back after a write of `value` and return what was read, which is
+    exactly `value` (same type, no normalising). Otherwise put `old` back, check
+    that, and raise _Failed."""
+    stored = bridge.config_get(key)
+    if _strict_equal(stored, value):
+        return stored
+    bridge.config_set(key, old)
+    left = bridge.config_get(key)
+    if _strict_equal(left, old):
+        raise _Failed(f"config {key} did not store as written")
+    raise _Failed(f"config {key} did not store as written, and the restore of the old value "
+                  f"did not stick: {left!r} is left in place")
+
+
 def _job_updates(before: dict, after: dict) -> dict:
     """Only the job fields this fix changes."""
     return {k: after[k] for k in ("prompt", "enabled_toolsets") if after[k] != before[k]}
@@ -461,11 +483,20 @@ def rollback(record: FixRecord, ledger: Ledger, bridge: Bridge, root: Path, now:
         if record.kind == "job_prompt":
             _rollback_job(bridge, record.target, before, after, changed)
         elif record.kind == "config":
-            cur = bridge.config_get(before["key"])
+            key = before["key"]
+            default_is_str = bridge.config_default_is_str(key)
+            if not _round_trips(before["value"], default_is_str):
+                raise _Failed(f"config {key} old value cannot be restored through "
+                              "`hermes config set`")
+            cur = bridge.config_get(key)
             if _same_config(cur, before["value"]):
                 pass  # already restored (a retry)
             elif _same_config(cur, after["value"]):
-                bridge.config_set(before["key"], before["value"])
+                bridge.config_set(key, before["value"])
+                back = bridge.config_get(key)
+                if not _strict_equal(back, before["value"]):
+                    raise _Failed(f"config {key} did not restore: reads {back!r}, "
+                                  f"expected {before['value']!r}")
             else:
                 changed.append(f"config {before['key']}")
         elif record.kind == "skill":

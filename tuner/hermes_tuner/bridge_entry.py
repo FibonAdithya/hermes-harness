@@ -75,6 +75,14 @@ def config_get(key):
     return json.loads(buf.getvalue())
 
 
+def config_default_is_str(key):
+    """True when Hermes's default for `key` (a DEFAULT_CONFIG leaf) is a string, so
+    `config set` stores strings for it unchanged. Read-only. An import failure
+    propagates (exit 1): the caller refuses the change rather than guess."""
+    from hermes_cli.config import _default_value_for_key
+    return isinstance(_default_value_for_key(key), str)
+
+
 def config_set(key, value):
     """`value` is a string (see bridge.encode_config_value); Hermes coerces it."""
     from hermes_cli.config import set_config_value
@@ -217,7 +225,8 @@ def pricing():
 
 
 OPS = {f.__name__: f for f in (scan, get_job, list_jobs, update_job, create_job,
-                               remove_job, config_get, config_set, config_set_json, oneshot,
+                               remove_job, config_get, config_default_is_str,
+                               config_set, config_set_json, oneshot,
                                pricing)}
 
 

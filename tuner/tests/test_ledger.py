@@ -445,6 +445,190 @@ def test_ledger_writes_leave_no_temp_files(tmp_path):
     assert names == ["after.json", "before.json", "fix.json", "ledger.json"]
 
 
+# --- per-key coercion model and read-back verification ----------------------------
+
+TS = "tools.tool_search.enabled"
+
+
+def cfg_fix(key, value, fid="c1"):
+    return Fix(fid, "config", "k", {"key": key, "value": value}, "k")
+
+
+def test_string_default_key_accepts_on_off(tmp_path):
+    """Catches: coercion applied regardless of the key's default type (the M2 bug)."""
+    root, skills, bridge, ledger = make(tmp_path, string_default_keys={TS})
+    rec = do_apply(cfg_fix(TS, "off"), ledger, bridge, root, skills)
+    assert rec.state == "trial", rec.reason
+    assert bridge.config[TS] == "off" and type(bridge.config[TS]) is str
+    assert vfile(root, "c1", "after.json") == {"key": TS, "value": "off"}
+    out = do_rollback(rec, ledger, bridge, root, skills)
+    assert out.state == "rolled_back"
+    assert bridge.config[TS] == "auto" and type(bridge.config[TS]) is str
+
+
+def test_string_default_key_accepts_restorable_on_old_value(tmp_path):
+    """Catches: the old-value check ignoring the key's default type."""
+    root, skills, bridge, ledger = make(tmp_path, string_default_keys={TS})
+    bridge.config[TS] = "on"
+    rec = do_apply(cfg_fix(TS, "auto"), ledger, bridge, root, skills)
+    assert rec.state == "trial", rec.reason
+    assert do_rollback(rec, ledger, bridge, root, skills).state == "rolled_back"
+    assert bridge.config[TS] == "on" and type(bridge.config[TS]) is str
+
+
+def test_non_string_default_key_still_refuses_coercible_string(tmp_path):
+    """Catches: dropping the coercion model entirely."""
+    root, skills, bridge, ledger = make(tmp_path)
+    bridge.config["compression.x"] = 0.5
+    with pytest.raises(ValueError):
+        do_apply(cfg_fix("compression.x", "on"), ledger, bridge, root, skills, add=False)
+    assert ledger.records == [] and bridge.config["compression.x"] == 0.5
+    assert not [c for c in bridge.calls if c[0] in FakeBridge.MUTATING]
+    assert ("config_default_is_str", ("compression.x",)) in bridge.calls
+
+
+def test_non_string_default_key_refuses_unrestorable_old(tmp_path):
+    """Catches: the old-value check removed."""
+    root, skills, bridge, ledger = make(tmp_path)
+    bridge.config["compression.x"] = -1
+    rec = do_apply(cfg_fix("compression.x", 0.5), ledger, bridge, root, skills)
+    assert rec.state == "bridge_error" and "restored" in rec.reason
+    assert bridge.config["compression.x"] == -1
+    assert not [c for c in bridge.calls if c[0] == "config_set"]
+
+
+def test_default_lookup_failure_refuses(tmp_path):
+    """Catches: guessing a type when Hermes cannot be asked."""
+    root, skills, bridge, ledger = make(tmp_path, fail={"config_default_is_str"})
+    rec = do_apply(cfg_fix(TS, "off"), ledger, bridge, root, skills)
+    assert rec.state == "bridge_error" and "config_default_is_str" in rec.reason
+    assert bridge.config[TS] == "auto"
+    assert not [c for c in bridge.calls if c[0] == "config_set"]
+    assert not (root / "versions" / "c1" / "after.json").exists()
+
+
+class Writes(FakeBridge):
+    """A bridge whose config_set stores `store(key, value)` instead of the value."""
+
+    def __init__(self, store, **kw):
+        super().__init__(**kw)
+        self.store = store
+
+    def config_set(self, key, value):
+        self._enter("config_set", key, value)
+        self.config[key] = self.store(key, value)
+
+
+@pytest.mark.parametrize("key,old,new,stored", [
+    ("compression.x", 0.5, 0.7, 0.9),    # a different value
+    (TS, "auto", "off", False),          # "off" read back False: only a strict compare sees it
+    ("compression.x", 1, 2, 2.0),        # same number, different type
+    ("compression.x", 1, 2, "2"),  # string where a number was written
+])
+def test_readback_mismatch_restores_and_fails(tmp_path, key, old, new, stored):
+    """Catches: trusting the write without reading back (or comparing normalised)."""
+    root, skills, _, ledger = make(tmp_path)
+    calls = []
+
+    def store(k, v):
+        calls.append(v)
+        return stored if v == new else v  # the restore of the old value sticks
+
+    bridge = Writes(store, config={key: old}, string_default_keys={TS})
+    rec = do_apply(cfg_fix(key, new), ledger, bridge, root, skills)
+    assert rec.state == "bridge_error"
+    assert f"config {key} did not store as written" in rec.reason
+    assert calls == [new, old]
+    assert bridge.config[key] == old and type(bridge.config[key]) is type(old)
+    assert not (root / "versions" / "c1" / "after.json").exists()
+    assert ledger.active_for("k") is None
+
+
+def test_readback_mismatch_with_failed_restore_names_value_left(tmp_path):
+    """Catches: reporting a clean restore when the restore did not stick (managed no-op)."""
+    root, skills, _, ledger = make(tmp_path)
+    bridge = Writes(lambda k, v: 0.9, config={"compression.x": 0.5})  # nothing sticks
+    rec = do_apply(cfg_fix("compression.x", 0.7), ledger, bridge, root, skills)
+    assert rec.state == "bridge_error"
+    assert "did not store as written" in rec.reason
+    assert "restore" in rec.reason and "0.9" in rec.reason
+
+
+def test_rollback_readback_mismatch_keeps_trial(tmp_path):
+    """Catches: reporting rolled_back on a restore that did not stick."""
+    root, skills, bridge, ledger = make(tmp_path, string_default_keys={TS})
+    rec = do_apply(cfg_fix(TS, "off"), ledger, bridge, root, skills)
+    assert rec.state == "trial"
+    stuck = Writes(lambda k, v: "off", config=dict(bridge.config), string_default_keys={TS})
+    out = do_rollback(rec, ledger, stuck, root, skills)
+    assert out.state == "trial" and out.reason.startswith("rollback failed")
+    assert Ledger.load(root).records[0].state == "trial"
+    assert ledger.active_for("k") is out
+    good = FakeBridge(config=dict(stuck.config), string_default_keys={TS})  # retry works
+    assert do_rollback(out, ledger, good, root, skills).state == "rolled_back"
+    assert good.config[TS] == "auto"
+
+
+def test_rollback_default_lookup_failure_keeps_trial(tmp_path):
+    """Catches: rolling back a config key without asking Hermes about its type."""
+    root, skills, bridge, ledger = make(tmp_path, string_default_keys={TS})
+    rec = do_apply(cfg_fix(TS, "off"), ledger, bridge, root, skills)
+    bridge.fail.add("config_default_is_str")
+    out = do_rollback(rec, ledger, bridge, root, skills)
+    assert out.state == "trial" and out.reason.startswith("rollback failed")
+    assert bridge.config[TS] == "off"
+
+
+def test_hermes_coerce_mirrors_set_config_value():
+    """Catches: the coercion model drifting from config.py:9277-9286."""
+    from hermes_tuner.ledger import _hermes_coerce
+    for s, want in [("on", True), ("YES", True), ("true", True), ("off", False), ("No", False),
+                    ("5", 5), ("0.5", 0.5), ("-1", "-1"), ("1e-05", "1e-05"), ("auto", "auto")]:
+        got = _hermes_coerce(s, False)
+        assert got == want and type(got) is type(want), s
+        assert _hermes_coerce(s, True) == s and type(_hermes_coerce(s, True)) is str
+
+
+def test_config_default_is_str_op_is_read_only_everywhere():
+    assert "config_default_is_str" not in FakeBridge.MUTATING
+    b = FakeBridge(string_default_keys={TS})
+    assert b.config_default_is_str(TS) is True and b.config_default_is_str("x") is False
+    assert b.calls == [("config_default_is_str", (TS,)), ("config_default_is_str", ("x",))]
+    assert "config_default_is_str" in bridge_entry.OPS
+
+
+def test_hermes_bridge_default_is_str_sends_op(tmp_path):
+    py = tmp_path / "py"
+    py.write_text('#!/bin/sh\ncat > "$0.in"\necho "$2" > "$0.op"\necho \'{"result": true}\'\n')
+    py.chmod(0o755)
+    b = HermesBridge(hermes_py=str(py))
+    assert b.config_default_is_str(TS) is True
+    assert (tmp_path / "py.op").read_text().strip() == "config_default_is_str"
+    assert json.loads((tmp_path / "py.in").read_text()) == {"key": TS}
+
+
+def test_bridge_entry_default_is_str_uses_hermes_default_lookup(monkeypatch):
+    import sys
+    import types
+    cfg = types.ModuleType("hermes_cli.config")
+    cfg._default_value_for_key = lambda k: {"s": "auto", "b": True, "n": None}.get(k)
+    pkg = types.ModuleType("hermes_cli")
+    monkeypatch.setitem(sys.modules, "hermes_cli", pkg)
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", cfg)
+    assert bridge_entry.config_default_is_str("s") is True
+    assert bridge_entry.config_default_is_str("b") is False
+    assert bridge_entry.config_default_is_str("n") is False
+
+
+def test_bridge_entry_default_is_str_fails_closed_without_hermes(monkeypatch):
+    import io
+    import sys
+    monkeypatch.setitem(sys.modules, "hermes_cli", None)  # import raises ImportError
+    out = io.StringIO()
+    rc = bridge_entry.main(["x", "config_default_is_str"], io.StringIO('{"key": "k"}'), out,
+                           io.StringIO())
+    assert rc == 1 and "error" in json.loads(out.getvalue())
+
 # --- bridge ---------------------------------------------------------------
 
 def test_bridge_entry_compiles_and_op_table_matches_protocol():

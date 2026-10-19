@@ -46,6 +46,25 @@ def encode_config_value(value: Any) -> str:
     raise ValueError(f"config value of type {type(value).__name__} cannot be set")
 
 
+def hermes_coerce(value_str: str, default_is_str: bool) -> Any:
+    """What Hermes's `set_config_value` (config.py) stores for the string `value_str`.
+
+    The coercion applies only when the key's default in DEFAULT_CONFIG is not a
+    string (unknown keys included); string-default keys store the string as is."""
+    if default_is_str:
+        return value_str
+    low = value_str.lower()
+    if low in ("true", "yes", "on"):
+        return True
+    if low in ("false", "no", "off"):
+        return False
+    if value_str.isdigit():
+        return int(value_str)
+    if value_str.replace(".", "", 1).isdigit():
+        return float(value_str)
+    return value_str
+
+
 # The only keys config_set_json may write: an MCP server's tools.include list (spec 4.6).
 CONFIG_JSON_KEY = re.compile(r"mcp_servers\.[A-Za-z0-9_-]+\.tools\.include")
 
@@ -76,6 +95,7 @@ class Bridge(Protocol):
                    enabled_toolsets: list[str] | None, extra: dict | None = None) -> dict: ...
     def remove_job(self, job_id: str) -> bool: ...
     def config_get(self, key: str) -> Any: ...
+    def config_default_is_str(self, key: str) -> bool: ...
     def config_set(self, key: str, value: Any) -> None: ...
     def config_set_json(self, key: str, value: Any) -> None: ...
     def oneshot(self, instructions: str, user_input: str, max_tokens: int) -> dict: ...
@@ -137,6 +157,11 @@ class HermesBridge:
     def config_get(self, key):
         return self._call("config_get", key=key)
 
+    def config_default_is_str(self, key):
+        """True when Hermes's default for `key` is a string, so `config set` stores
+        strings for it unchanged. Raises BridgeError when Hermes cannot say."""
+        return self._call("config_default_is_str", key=key)
+
     def config_set(self, key, value):
         self._call("config_set", key=key, value=encode_config_value(value))
 
@@ -175,7 +200,8 @@ FAKE_PRICE = {"model": "fake-model", "input_per_m": 0.42, "output_per_m": 0.42,
 class FakeBridge:
     """In-memory Bridge. `calls` records (method, args) for every call, including
     ones told to fail via `fail` (a set of method names). `price` is what
-    `pricing()` returns (a copy)."""
+    `pricing()` returns (a copy). `string_default_keys` are the config keys whose
+    Hermes default is a string; `config_set` coerces like Hermes for the others."""
 
     MUTATING = frozenset({"update_job", "create_job", "remove_job", "config_set",
                           "config_set_json", "restart_gateway", "oneshot"})
@@ -183,7 +209,9 @@ class FakeBridge:
     def __init__(self, jobs: dict[str, dict] | None = None, config: dict | None = None,
                  oneshot_script: list[dict] | None = None, fail: set[str] | None = None,
                  scan: Callable[[str], list[str]] | None = None,
-                 price: dict | None = None):
+                 price: dict | None = None,
+                 string_default_keys: set[str] | None = None):
+        self.string_default_keys = set(string_default_keys or ())
         self.price = copy.deepcopy(FAKE_PRICE if price is None else price)
         self.jobs = copy.deepcopy(jobs or {})
         self.config = copy.deepcopy(config or {})
@@ -238,10 +266,15 @@ class FakeBridge:
         self._enter("config_get", key)
         return copy.deepcopy(self.config.get(key))
 
+    def config_default_is_str(self, key):
+        self._enter("config_default_is_str", key)
+        return key in self.string_default_keys
+
     def config_set(self, key, value):
         self._enter("config_set", key, value)
-        encode_config_value(value)  # same type limits as the real bridge
-        self.config[key] = copy.deepcopy(value)
+        # Same type limits and the same per-key coercion as Hermes.
+        self.config[key] = hermes_coerce(encode_config_value(value),
+                                         key in self.string_default_keys)
 
     def config_set_json(self, key, value):
         self._enter("config_set_json", key, value)
