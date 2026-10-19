@@ -1,0 +1,403 @@
+"""Versioned fix ledger: apply a fix, remember how to undo it, undo it exactly
+unless the owner has since changed the value (spec 4.5).
+
+Layout under `root` (the tuner directory):
+    ledger.json                      all FixRecords
+    versions/<id>/fix.json           the full Fix
+    versions/<id>/before.json        the live values before apply
+    versions/<id>/after.json         the values as written
+    tools/<name>/{tool.json,program.py}   composed tools (read by the plugin)
+Every write is atomic (temp file in the same directory + os.replace), files 0600,
+directories 0700.
+"""
+from __future__ import annotations
+
+import base64
+import json
+import os
+import re
+import shutil
+import tempfile
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Literal
+
+from . import policy
+from .bridge import Bridge, BridgeError
+from .model import Fix
+
+State = Literal["rejected", "shadow_pending", "shadow_failed", "trial", "kept",
+                "rolled_back", "owner_changed", "proposed", "approved", "applied",
+                "dropped", "bridge_error"]
+ACTIVE_STATES = frozenset({"shadow_pending", "trial", "applied"})
+APPLIED_STATES = frozenset({"trial", "applied", "kept"})
+_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,100}")
+_TOOL_NAME = re.compile(re.escape(policy.TOOL_PREFIX) + r"[A-Za-z0-9_]{1,58}")
+
+
+@dataclass
+class FixRecord:
+    id: str
+    kind: str
+    target: str
+    candidate_key: str
+    state: State
+    created_at: float
+    applied_at: float | None = None
+    trial_runs: int = 0
+    baseline_cost: float | None = None
+    reason: str = ""
+    spend_usd: float = 0.0
+    needs_restart: bool = False
+
+
+# --- atomic file helpers ------------------------------------------------------
+
+def _mkdirs(path: Path) -> None:
+    """mkdir -p with mode 0700 on every directory created."""
+    missing = []
+    p = path
+    while not p.exists():
+        missing.append(p)
+        p = p.parent
+    for d in reversed(missing):
+        d.mkdir(mode=0o700, exist_ok=True)
+        d.chmod(0o700)
+
+
+def _atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
+    _mkdirs(path.parent)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            os.fchmod(f.fileno(), mode)
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def _write_json(path: Path, obj: Any) -> None:
+    _atomic_write(path, json.dumps(obj, indent=2, sort_keys=True).encode("utf-8"))
+
+
+def _read_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+# --- ledger ---------------------------------------------------------------------
+
+def _check_id(fix_id: str) -> None:
+    if not isinstance(fix_id, str) or not _ID.fullmatch(fix_id) or ".." in fix_id:
+        raise ValueError(f"unsafe fix id {fix_id!r}")
+
+
+class Ledger:
+    def __init__(self, root: Path, records: list[FixRecord] | None = None):
+        self.root = Path(root)
+        self.records: list[FixRecord] = records if records is not None else []
+
+    @classmethod
+    def load(cls, root: Path) -> Ledger:
+        path = Path(root) / "ledger.json"
+        if not path.exists():
+            return cls(root)
+        return cls(root, [FixRecord(**r) for r in _read_json(path)["records"]])
+
+    def save(self) -> None:
+        _write_json(self.root / "ledger.json", {"records": [asdict(r) for r in self.records]})
+
+    def version_dir(self, fix_id: str) -> Path:
+        _check_id(fix_id)
+        return self.root / "versions" / fix_id
+
+    def get(self, fix_id: str) -> FixRecord | None:
+        return next((r for r in self.records if r.id == fix_id), None)
+
+    def add(self, record: FixRecord, fix: Fix) -> None:
+        if self.get(record.id) is not None:
+            raise ValueError(f"fix {record.id} is already in the ledger")
+        _write_json(self.version_dir(record.id) / "fix.json", asdict(fix))
+        self.records.append(record)
+        self.save()
+
+    def fix(self, fix_id: str) -> Fix:
+        return Fix(**_read_json(self.version_dir(fix_id) / "fix.json"))
+
+    def active_for(self, target: str) -> FixRecord | None:
+        return next((r for r in self.records
+                     if r.target == target and r.state in ACTIVE_STATES), None)
+
+
+# --- helpers shared by apply and rollback -----------------------------------------
+
+class _Failed(Exception):
+    """Apply/rollback could not complete; the message becomes the record's reason."""
+
+
+def needs_restart(fix: Fix) -> bool:
+    if fix.kind == "config":
+        return True
+    if fix.kind == "new_reach":
+        change = fix.payload.get("change")
+        return isinstance(change, dict) and change.get("type") == "mcp_include_add"
+    if fix.kind == "composed_tool":
+        return policy.COMPOSED_TOOL_NEEDS_RESTART
+    return False
+
+
+def _norm(v: Any) -> Any:
+    """Hermes coerces config strings (on/off/true/false/digits); compare after the same."""
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "yes", "on"):
+            return True
+        if s in ("false", "no", "off"):
+            return False
+        if s.isdigit():
+            return int(s)
+        if s.replace(".", "", 1).isdigit():
+            return float(s)
+    return v
+
+
+def _same_config(a: Any, b: Any) -> bool:
+    return type(_norm(a)) is type(_norm(b)) and _norm(a) == _norm(b)
+
+
+def _job_after(live: dict, prompt: str, add: list[str]) -> dict:
+    """The prompt and toolsets to write. A None toolsets list means all tools and
+    stays None: adding a list would narrow the job."""
+    cur = live.get("enabled_toolsets")
+    toolsets = cur
+    if add and isinstance(cur, list):
+        toolsets = list(cur) + [t for t in dict.fromkeys(add) if t not in cur]
+    return {"prompt": prompt, "enabled_toolsets": toolsets}
+
+
+def _add_toolsets(payload: dict, default: list[str]) -> list[str]:
+    add = payload.get("add_toolsets", default)
+    if not isinstance(add, list) or any(t != policy.TOOLSET for t in add):
+        raise ValueError(f"add_toolsets may only contain {policy.TOOLSET!r}")
+    return add
+
+
+def _read_job(bridge: Bridge, job_id: str) -> dict:
+    job = bridge.get_job(job_id)
+    if job is None:
+        raise _Failed(f"job {job_id} not found")
+    return job
+
+
+def _resolve_skill(skills_root: Path, rel: Any) -> Path:
+    if not isinstance(rel, str):
+        raise _Failed("skill payload needs a string path")
+    root = Path(skills_root).resolve()
+    p = (root / rel).resolve()
+    if not p.is_relative_to(root) or p.name != "SKILL.md" or p.parent == root:
+        raise _Failed(f"skill path {rel!r} is not a skill file under the skills directory")
+    return p
+
+
+def _tool_files(p: dict) -> tuple[dict, str]:
+    spec = {k: p.get(k) for k in ("name", "description", "parameters", "calls", "mutating")}
+    program = p.get("program")
+    name = spec["name"]
+    if not isinstance(name, str) or not _TOOL_NAME.fullmatch(name):
+        raise ValueError(f"tool name must match {_TOOL_NAME.pattern}")
+    if not isinstance(program, str):
+        raise ValueError("composed_tool payload needs a program string")
+    return spec, program
+
+
+def _write_tool_dir(tools: Path, name: str, spec: dict, program: str) -> None:
+    final = tools / name
+    if final.exists():
+        raise _Failed(f"tool {name} already exists")
+    _mkdirs(tools)
+    tmp = Path(tempfile.mkdtemp(dir=tools, prefix=".tmp-"))
+    try:
+        tmp.chmod(0o700)
+        _atomic_write(tmp / "tool.json", json.dumps(spec, indent=2).encode())
+        _atomic_write(tmp / "program.py", program.encode("utf-8"))
+        os.rename(tmp, final)  # same filesystem; fails rather than replacing a dir
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+
+
+def _tool_matches(tools: Path, after: dict) -> bool:
+    d = tools / after["spec"]["name"]
+    try:
+        return (_read_json(d / "tool.json") == after["spec"]
+                and (d / "program.py").read_text(encoding="utf-8") == after["program"])
+    except (OSError, ValueError):
+        return False
+
+
+def _set_state(ledger: Ledger, rec: FixRecord, state: State, reason: str = "") -> FixRecord:
+    rec.state, rec.reason = state, reason
+    ledger.save()
+    return rec
+
+
+# --- apply ------------------------------------------------------------------------
+
+def apply(fix: Fix, ledger: Ledger, bridge: Bridge, root: Path, now: float,
+          skills_root: Path | None = None) -> FixRecord:
+    """Apply `fix`, saving before.json first and after.json. Returns the record
+    (state `trial`, or `bridge_error` with the reason). `skills_root` defaults to
+    `root.parent / "skills"`. `new_reach` is applied elsewhere and raises ValueError."""
+    root = Path(root)
+    skills_root = Path(skills_root) if skills_root is not None else root.parent / "skills"
+    if fix.kind not in ("job_prompt", "config", "skill", "composed_tool"):
+        raise ValueError(f"apply does not handle {fix.kind!r} fixes")
+    if not isinstance(fix.payload, dict):
+        raise ValueError("payload must be an object")
+    p = fix.payload
+    # Validate everything that can be validated before any state changes.
+    if fix.kind == "job_prompt":
+        if not isinstance(p.get("prompt"), str):
+            raise ValueError("job_prompt payload needs a prompt string")
+        add = _add_toolsets(p, [])
+    elif fix.kind == "config":
+        if not isinstance(p.get("key"), str) or "value" not in p:
+            raise ValueError("config payload needs a key and a value")
+    elif fix.kind == "composed_tool":
+        spec, program = _tool_files(p)
+        job_prompt = p.get("job_prompt")
+        if job_prompt is not None and not isinstance(job_prompt, str):
+            raise ValueError("job_prompt must be a string or null")
+        add = _add_toolsets(p, [policy.TOOLSET]) if job_prompt is not None else []
+    rec = ledger.get(fix.id)
+    if rec is None:
+        rec = FixRecord(fix.id, fix.kind, fix.target, fix.candidate_key,
+                        "shadow_pending", now)
+        ledger.add(rec, fix)
+    elif rec.state in APPLIED_STATES:
+        raise ValueError(f"fix {fix.id} is already applied")
+    vdir = ledger.version_dir(fix.id)
+    after_path = vdir / "after.json"
+    undo = None  # called to revert partial work on failure
+    try:
+        if fix.kind == "job_prompt":
+            live = _read_job(bridge, fix.target)
+            before = {"prompt": live.get("prompt"),
+                      "enabled_toolsets": live.get("enabled_toolsets")}
+            after = _job_after(live, p["prompt"], add)
+            _write_json(vdir / "before.json", before)
+            _write_json(after_path, after)
+            bridge.update_job(fix.target, _job_updates(before, after))
+        elif fix.kind == "config":
+            key = p["key"]
+            old = bridge.config_get(key)
+            if old is None:
+                raise _Failed(f"config key {key!r} has no current value to roll back to")
+            _write_json(vdir / "before.json", {"key": key, "value": old})
+            _write_json(after_path, {"key": key, "value": p["value"]})
+            bridge.config_set(key, p["value"])
+        elif fix.kind == "skill":
+            path = _resolve_skill(skills_root, p.get("path"))
+            text = p.get("text")
+            if not isinstance(text, str):
+                raise _Failed("skill payload needs a text string")
+            old_bytes = path.read_bytes()
+            mode = path.stat().st_mode & 0o777
+            _write_json(vdir / "before.json", {
+                "file": str(path), "b64": base64.b64encode(old_bytes).decode(), "mode": mode})
+            _write_json(after_path, {"file": str(path), "text": text})
+            _atomic_write(path, text.encode("utf-8"), mode)
+        else:
+            tools = root / "tools"
+            before: dict = {"tool": None, "job": None}
+            after = {"spec": spec, "program": program, "job": None}
+            if job_prompt is not None:
+                live = _read_job(bridge, fix.target)
+                before["job"] = {"prompt": live.get("prompt"),
+                                 "enabled_toolsets": live.get("enabled_toolsets")}
+                after["job"] = _job_after(live, job_prompt, add)
+            _write_json(vdir / "before.json", before)
+            _write_json(after_path, after)
+            _write_tool_dir(tools, spec["name"], spec, program)
+            undo = lambda: shutil.rmtree(tools / spec["name"], ignore_errors=True)  # noqa: E731
+            if job_prompt is not None:
+                bridge.update_job(fix.target, _job_updates(before["job"], after["job"]))
+    except (BridgeError, _Failed, OSError) as exc:
+        if undo:
+            undo()
+        after_path.unlink(missing_ok=True)
+        return _set_state(ledger, rec, "bridge_error", f"{type(exc).__name__}: {exc}")
+    rec.applied_at, rec.needs_restart = now, needs_restart(fix)
+    return _set_state(ledger, rec, "trial")
+
+
+def _job_updates(before: dict, after: dict) -> dict:
+    """Only the job fields this fix changes."""
+    return {k: after[k] for k in ("prompt", "enabled_toolsets") if after[k] != before[k]}
+
+
+# --- rollback -----------------------------------------------------------------------
+
+def rollback(record: FixRecord, ledger: Ledger, bridge: Bridge, root: Path, now: float,
+             skills_root: Path | None = None) -> FixRecord:
+    """Undo an applied fix. Anything the owner changed since apply is left alone
+    (state `owner_changed`); otherwise before.json is restored exactly (`rolled_back`)."""
+    root = Path(root)
+    skills_root = Path(skills_root) if skills_root is not None else root.parent / "skills"
+    if record.state not in APPLIED_STATES:
+        raise ValueError(f"fix {record.id} is {record.state}, not applied")
+    vdir = ledger.version_dir(record.id)
+    before, after = _read_json(vdir / "before.json"), _read_json(vdir / "after.json")
+    changed: list[str] = []  # parts left alone because the owner changed them
+    try:
+        if record.kind == "job_prompt":
+            _rollback_job(bridge, record.target, before, after, changed)
+        elif record.kind == "config":
+            cur = bridge.config_get(before["key"])
+            if _same_config(cur, after["value"]):
+                bridge.config_set(before["key"], before["value"])
+            else:
+                changed.append(f"config {before['key']}")
+        elif record.kind == "skill":
+            path = _resolve_skill(skills_root, after["file"])  # absolute path; re-checked
+            try:
+                same = path.read_bytes() == after["text"].encode("utf-8")
+            except OSError:
+                same = False
+            if same:
+                _atomic_write(path, base64.b64decode(before["b64"]), before["mode"])
+            else:
+                changed.append("skill file")
+        elif record.kind == "composed_tool":
+            tools = root / "tools"
+            d = tools / after["spec"]["name"]
+            if not d.exists():
+                pass
+            elif _tool_matches(tools, after):
+                shutil.rmtree(d)
+            else:
+                changed.append("tool dir")
+            if after["job"] is not None:
+                _rollback_job(bridge, record.target, before["job"], after["job"], changed)
+        else:
+            raise ValueError(f"cannot roll back {record.kind!r}")
+    except (BridgeError, _Failed, OSError) as exc:
+        return _set_state(ledger, record, "bridge_error",
+                          f"rollback: {type(exc).__name__}: {exc}")
+    if changed:
+        return _set_state(ledger, record, "owner_changed",
+                          "owner changed since apply, left alone: " + ", ".join(changed))
+    return _set_state(ledger, record, "rolled_back")
+
+
+def _rollback_job(bridge: Bridge, job_id: str, before: dict, after: dict,
+                  changed: list[str]) -> None:
+    mine = _job_updates(before, after)  # the fields apply wrote
+    live = _read_job(bridge, job_id)
+    if any(live.get(k) != after[k] for k in mine):
+        changed.append(f"job {job_id}")
+    elif mine:
+        bridge.update_job(job_id, {k: before[k] for k in mine})

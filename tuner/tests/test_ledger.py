@@ -1,0 +1,453 @@
+from __future__ import annotations
+
+import base64
+import inspect
+import json
+import os
+import py_compile
+import stat
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from hermes_tuner import bridge as bridge_mod
+from hermes_tuner import bridge_entry, policy
+from hermes_tuner.bridge import Bridge, BridgeError, FakeBridge, HermesBridge
+from hermes_tuner.ledger import FixRecord, Ledger, apply, rollback
+from hermes_tuner.model import Fix
+
+JOB = "3bc4e11d29b1"
+OLD = "old prompt"
+NEW = "new prompt"
+
+
+def make(tmp_path, **bridge_kw):
+    root = tmp_path / "tuner"
+    skills = tmp_path / "skills"
+    skills.mkdir(exist_ok=True)
+    bridge = FakeBridge(jobs={JOB: {"id": JOB, "prompt": OLD, "enabled_toolsets": ["web"]}},
+                        config={"tools.tool_search.enabled": "auto"}, **bridge_kw)
+    return root, skills, bridge, Ledger.load(root)
+
+
+def record(fix, state="shadow_pending", **kw):
+    return FixRecord(id=fix.id, kind=fix.kind, target=fix.target,
+                     candidate_key=fix.candidate_key, state=state, created_at=1.0, **kw)
+
+
+def do_apply(fix, ledger, bridge, root, skills, now=100.0, add=True):
+    if add:
+        ledger.add(record(fix), fix)
+    return apply(fix, ledger, bridge, root, now, skills_root=skills)
+
+
+def do_rollback(rec, ledger, bridge, root, skills, now=200.0):
+    return rollback(rec, ledger, bridge, root, now, skills_root=skills)
+
+
+def vfile(root, fix_id, name):
+    return json.loads((root / "versions" / fix_id / name).read_text())
+
+
+def job_fix(fid="f1", prompt=NEW, add=()):
+    return Fix(fid, "job_prompt", JOB, {"prompt": prompt, "add_toolsets": list(add)}, "k")
+
+
+def tool_payload(**kw):
+    p = {"name": "tuned_x", "description": "d", "parameters": {"type": "object"},
+         "calls": ["web_search"], "mutating": False, "program": "print(1)\n",
+         "job_prompt": None}
+    p.update(kw)
+    return p
+
+
+def test_apply_job_prompt_saves_before_and_after(tmp_path):
+    root, skills, bridge, ledger = make(tmp_path)
+    rec = do_apply(job_fix(), ledger, bridge, root, skills)
+    assert vfile(root, "f1", "before.json") == {"prompt": OLD, "enabled_toolsets": ["web"]}
+    assert vfile(root, "f1", "after.json")["prompt"] == NEW
+    assert bridge.get_job(JOB)["prompt"] == NEW
+    assert rec.state == "trial" and rec.applied_at == 100.0 and rec.baseline_cost is None
+    assert rec.needs_restart is False
+    assert Ledger.load(root).records[0].state == "trial"  # persisted
+
+
+def test_job_prompt_adds_toolset_only_to_list(tmp_path):
+    root, skills, bridge, ledger = make(tmp_path)
+    do_apply(job_fix(add=["tuner"]), ledger, bridge, root, skills)
+    assert bridge.get_job(JOB)["enabled_toolsets"] == ["web", "tuner"]
+    # None toolsets (all tools) must stay None: a list would narrow the job.
+    bridge.jobs["morning"] = {"id": "morning", "prompt": OLD, "enabled_toolsets": None}
+    f = Fix("f2", "job_prompt", "morning", {"prompt": NEW, "add_toolsets": ["tuner"]}, "k2")
+    do_apply(f, ledger, bridge, root, skills)
+    assert bridge.get_job("morning")["enabled_toolsets"] is None
+    assert vfile(root, "f2", "before.json")["enabled_toolsets"] is None
+
+
+def test_unknown_payload_keys_are_ignored(tmp_path):
+    root, skills, bridge, ledger = make(tmp_path)
+    f = Fix("f1", "job_prompt", JOB,
+            {"prompt": NEW, "add_toolsets": [], "enabled": False, "schedule": "x"}, "k")
+    do_apply(f, ledger, bridge, root, skills)
+    (_, args), = [c for c in bridge.calls if c[0] == "update_job"]
+    assert args == (JOB, {"prompt": NEW})
+
+
+def test_rollback_restores_exact_previous_value(tmp_path):
+    root, skills, bridge, ledger = make(tmp_path)
+    f = Fix("c1", "config", "tools.tool_search.enabled",
+            {"key": "tools.tool_search.enabled", "value": "off"}, "k")
+    rec = do_apply(f, ledger, bridge, root, skills)
+    assert rec.needs_restart is True
+    assert bridge.config_get("tools.tool_search.enabled") == "off"
+    out = do_rollback(rec, ledger, bridge, root, skills)
+    assert out.state == "rolled_back"
+    assert bridge.config_get("tools.tool_search.enabled") == "auto"
+
+
+def test_rollback_job_prompt_restores_prompt_and_toolsets(tmp_path):
+    root, skills, bridge, ledger = make(tmp_path)
+    rec = do_apply(job_fix(add=["tuner"]), ledger, bridge, root, skills)
+    out = do_rollback(rec, ledger, bridge, root, skills)
+    assert out.state == "rolled_back"
+    job = bridge.get_job(JOB)
+    assert job["prompt"] == OLD and job["enabled_toolsets"] == ["web"]
+
+
+def test_rollback_skips_owner_edit(tmp_path):
+    root, skills, bridge, ledger = make(tmp_path)
+    rec = do_apply(job_fix(), ledger, bridge, root, skills)
+    bridge.jobs[JOB]["prompt"] = "owner text"
+    out = do_rollback(rec, ledger, bridge, root, skills)
+    assert out.state == "owner_changed"
+    assert bridge.get_job(JOB)["prompt"] == "owner text"
+    assert not [c for c in bridge.calls if c[0] == "update_job"][1:]  # only the apply call
+
+
+def test_rollback_config_skips_owner_edit(tmp_path):
+    root, skills, bridge, ledger = make(tmp_path)
+    f = Fix("c1", "config", "k", {"key": "compression.threshold", "value": "0.5"}, "k")
+    bridge.config["compression.threshold"] = "0.8"
+    rec = do_apply(f, ledger, bridge, root, skills)
+    bridge.config["compression.threshold"] = "0.9"
+    assert do_rollback(rec, ledger, bridge, root, skills).state == "owner_changed"
+    assert bridge.config["compression.threshold"] == "0.9"
+
+
+def test_config_coercion_does_not_look_like_owner_edit(tmp_path):
+    # Hermes coerces "off" to False for non-string settings; that is not an owner edit.
+    root, skills, bridge, ledger = make(tmp_path)
+    bridge.config["compression.enabled"] = True
+    f = Fix("c1", "config", "k", {"key": "compression.enabled", "value": "off"}, "k")
+    rec = do_apply(f, ledger, bridge, root, skills)
+    bridge.config["compression.enabled"] = False  # what Hermes stores for "off"
+    assert do_rollback(rec, ledger, bridge, root, skills).state == "rolled_back"
+    assert bridge.config["compression.enabled"] is True
+
+
+def test_config_without_previous_value_is_refused(tmp_path):
+    root, skills, bridge, ledger = make(tmp_path)
+    f = Fix("c1", "config", "k", {"key": "compression.new_key", "value": "1"}, "k")
+    rec = do_apply(f, ledger, bridge, root, skills)
+    assert rec.state == "bridge_error" and "roll" in rec.reason
+    assert "compression.new_key" not in bridge.config
+
+
+def make_skill(skills, text="---\nname: mine\n---\nbody\n"):
+    p = skills / "mine" / "SKILL.md"
+    p.parent.mkdir()
+    p.write_bytes(text.encode())
+    p.chmod(0o640)
+    return p
+
+
+def test_skill_apply_writes_file_atomically_and_rolls_back(tmp_path):
+    root, skills, bridge, ledger = make(tmp_path)
+    original = b"---\nname: mine\n---\nline\r\nbody \xff\xfe\n"  # CRLF and invalid utf-8
+    p = skills / "mine" / "SKILL.md"
+    p.parent.mkdir()
+    p.write_bytes(original)
+    p.chmod(0o640)
+    f = Fix("s1", "skill", "mine", {"path": "mine/SKILL.md",
+                                    "text": "---\nname: mine\n---\nnew\n"}, "k")
+    rec = do_apply(f, ledger, bridge, root, skills)
+    assert rec.state == "trial"
+    assert p.read_bytes() == b"---\nname: mine\n---\nnew\n"
+    assert stat.S_IMODE(p.stat().st_mode) == 0o640
+    assert [x.name for x in p.parent.iterdir()] == ["SKILL.md"]  # no temp files left
+    assert base64.b64decode(vfile(root, "s1", "before.json")["b64"]) == original
+    out = do_rollback(rec, ledger, bridge, root, skills)
+    assert out.state == "rolled_back" and p.read_bytes() == original
+
+
+def test_skill_rollback_skips_owner_edit(tmp_path):
+    root, skills, bridge, ledger = make(tmp_path)
+    p = make_skill(skills)
+    f = Fix("s1", "skill", "mine", {"path": "mine/SKILL.md",
+                                    "text": "---\nname: mine\n---\nnew\n"}, "k")
+    rec = do_apply(f, ledger, bridge, root, skills)
+    p.write_bytes(b"owner")
+    assert do_rollback(rec, ledger, bridge, root, skills).state == "owner_changed"
+    assert p.read_bytes() == b"owner"
+
+
+def test_skill_outside_skills_root_is_refused(tmp_path):
+    root, skills, bridge, ledger = make(tmp_path)
+    outside = tmp_path / "evil" / "SKILL.md"
+    outside.parent.mkdir()
+    outside.write_text("x")
+    f = Fix("s1", "skill", "x", {"path": "../evil/SKILL.md", "text": "y"}, "k")
+    rec = do_apply(f, ledger, bridge, root, skills)
+    assert rec.state == "bridge_error"
+    assert outside.read_text() == "x"
+
+
+def test_composed_tool_apply_writes_tool_dir_and_rollback_removes_it(tmp_path):
+    root, skills, bridge, ledger = make(tmp_path)
+    f = Fix("t1", "composed_tool", JOB, tool_payload(), "k")
+    rec = do_apply(f, ledger, bridge, root, skills)
+    d = root / "tools" / "tuned_x"
+    assert json.loads((d / "tool.json").read_text()) == {
+        "name": "tuned_x", "description": "d", "parameters": {"type": "object"},
+        "calls": ["web_search"], "mutating": False}
+    assert (d / "program.py").read_text() == "print(1)\n"
+    assert stat.S_IMODE((d / "program.py").stat().st_mode) == 0o600
+    assert stat.S_IMODE(d.stat().st_mode) == 0o700
+    assert rec.state == "trial" and rec.needs_restart is policy.COMPOSED_TOOL_NEEDS_RESTART
+    assert sorted(p.name for p in (root / "tools").iterdir()) == ["tuned_x"]
+    out = do_rollback(rec, ledger, bridge, root, skills)
+    assert out.state == "rolled_back" and not d.exists()
+
+
+def test_composed_tool_with_job_prompt_updates_and_restores_job(tmp_path):
+    root, skills, bridge, ledger = make(tmp_path)
+    f = Fix("t1", "composed_tool", JOB, tool_payload(job_prompt=NEW), "k")
+    rec = do_apply(f, ledger, bridge, root, skills)
+    job = bridge.get_job(JOB)
+    assert job["prompt"] == NEW and job["enabled_toolsets"] == ["web", "tuner"]
+    before = vfile(root, "t1", "before.json")
+    assert before["job"] == {"prompt": OLD, "enabled_toolsets": ["web"]}
+    out = do_rollback(rec, ledger, bridge, root, skills)
+    assert out.state == "rolled_back"
+    assert bridge.get_job(JOB)["prompt"] == OLD
+    assert not (root / "tools" / "tuned_x").exists()
+
+
+def test_composed_tool_rollback_keeps_owner_edited_tool(tmp_path):
+    root, skills, bridge, ledger = make(tmp_path)
+    rec = do_apply(Fix("t1", "composed_tool", JOB, tool_payload(), "k"),
+                   ledger, bridge, root, skills)
+    (root / "tools" / "tuned_x" / "program.py").write_text("print(2)\n")
+    assert do_rollback(rec, ledger, bridge, root, skills).state == "owner_changed"
+    assert (root / "tools" / "tuned_x" / "program.py").read_text() == "print(2)\n"
+
+
+def test_composed_tool_failure_after_dir_write_removes_dir(tmp_path):
+    root, skills, bridge, ledger = make(tmp_path, fail={"update_job"})
+    f = Fix("t1", "composed_tool", JOB, tool_payload(job_prompt=NEW), "k")
+    rec = do_apply(f, ledger, bridge, root, skills)
+    assert rec.state == "bridge_error"
+    assert not (root / "tools" / "tuned_x").exists()
+    assert bridge.jobs[JOB]["prompt"] == OLD
+
+
+def test_bridge_error_marks_record_and_changes_nothing(tmp_path):
+    root, skills, bridge, ledger = make(tmp_path, fail={"update_job"})
+    rec = do_apply(job_fix(), ledger, bridge, root, skills)
+    assert rec.state == "bridge_error" and "update_job" in rec.reason
+    assert (root / "versions" / "f1" / "before.json").exists()
+    assert not (root / "versions" / "f1" / "after.json").exists()
+    assert bridge.jobs[JOB]["prompt"] == OLD
+    assert rec.applied_at is None
+    assert Ledger.load(root).records[0].state == "bridge_error"
+
+
+def test_bridge_error_on_read_marks_record(tmp_path):
+    root, skills, bridge, ledger = make(tmp_path, fail={"get_job"})
+    rec = do_apply(job_fix(), ledger, bridge, root, skills)
+    assert rec.state == "bridge_error"
+    assert not [c for c in bridge.calls if c[0] in FakeBridge.MUTATING]
+
+
+def test_missing_job_is_bridge_error(tmp_path):
+    root, skills, bridge, ledger = make(tmp_path)
+    bridge.jobs.clear()
+    assert do_apply(job_fix(), ledger, bridge, root, skills).state == "bridge_error"
+
+
+def test_new_reach_is_not_applied_here(tmp_path):
+    root, skills, bridge, ledger = make(tmp_path)
+    f = Fix("n1", "new_reach", "x", {"change": {"type": "mcp_include_add"}}, "k")
+    with pytest.raises(ValueError):
+        do_apply(f, ledger, bridge, root, skills)
+    assert not [c for c in bridge.calls if c[0] in FakeBridge.MUTATING]
+
+
+def test_foreign_toolset_is_refused_before_any_change(tmp_path):
+    root, skills, bridge, ledger = make(tmp_path)
+    with pytest.raises(ValueError):
+        do_apply(job_fix(add=["terminal"]), ledger, bridge, root, skills)
+    assert bridge.jobs[JOB]["prompt"] == OLD
+
+
+def test_apply_twice_and_rollback_of_unapplied_are_refused(tmp_path):
+    root, skills, bridge, ledger = make(tmp_path)
+    rec = do_apply(job_fix(), ledger, bridge, root, skills)
+    with pytest.raises(ValueError):
+        apply(job_fix(), ledger, bridge, root, 300.0, skills_root=skills)
+    rolled = do_rollback(rec, ledger, bridge, root, skills)
+    with pytest.raises(ValueError):
+        do_rollback(rolled, ledger, bridge, root, skills)
+
+
+def test_bridge_error_during_rollback_is_recorded(tmp_path):
+    root, skills, bridge, ledger = make(tmp_path)
+    rec = do_apply(job_fix(), ledger, bridge, root, skills)
+    bridge.fail.add("update_job")
+    out = do_rollback(rec, ledger, bridge, root, skills)
+    assert out.state == "bridge_error" and bridge.jobs[JOB]["prompt"] == NEW
+
+
+def test_fix_id_cannot_escape_versions_dir(tmp_path):
+    root, skills, bridge, ledger = make(tmp_path)
+    with pytest.raises(ValueError):
+        do_apply(job_fix(fid="../../x"), ledger, bridge, root, skills)
+
+
+def test_ledger_round_trip_modes_and_lookup(tmp_path):
+    root, skills, bridge, ledger = make(tmp_path)
+    f = job_fix()
+    ledger.add(record(f), f)
+    ledger.save()
+    assert stat.S_IMODE((root / "ledger.json").stat().st_mode) == 0o600
+    for d in (root, root / "versions", root / "versions" / "f1"):
+        assert stat.S_IMODE(d.stat().st_mode) == 0o700
+    assert stat.S_IMODE((root / "versions" / "f1" / "fix.json").stat().st_mode) == 0o600
+    again = Ledger.load(root)
+    assert again.records == ledger.records
+    assert again.fix("f1") == f
+    assert again.active_for(JOB).id == "f1"           # shadow_pending counts as active
+    assert again.active_for("other") is None
+    again.records[0].state = "rolled_back"
+    assert again.active_for(JOB) is None
+
+
+def test_ledger_writes_leave_no_temp_files(tmp_path):
+    root, skills, bridge, ledger = make(tmp_path)
+    do_apply(job_fix(), ledger, bridge, root, skills)
+    names = sorted(p.name for p in root.rglob("*") if p.is_file())
+    assert names == ["after.json", "before.json", "fix.json", "ledger.json"]
+
+
+# --- bridge ---------------------------------------------------------------
+
+def test_bridge_entry_compiles_and_op_table_matches_protocol():
+    py_compile.compile(inspect.getsourcefile(bridge_entry), doraise=True)
+    protocol = {n for n, v in vars(Bridge).items()
+                if callable(v) and not n.startswith("_")}
+    assert set(bridge_entry.OPS) == protocol - {"restart_gateway"}
+    # HermesBridge exposes the same ops
+    assert protocol <= {n for n in dir(HermesBridge) if not n.startswith("_")}
+
+
+def test_bridge_entry_runs_without_hermes_and_reports_json_error(tmp_path):
+    entry = inspect.getsourcefile(bridge_entry)
+    r = subprocess.run(["python3", "-I", entry, "scan"], input=json.dumps({"text": "x"}),
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode != 0
+    assert "error" in json.loads(r.stdout)
+    r = subprocess.run(["python3", "-I", entry, "nope"], input="{}",
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode != 0 and "unknown op" in json.loads(r.stdout)["error"]
+
+
+def fake_python(tmp_path, body):
+    p = tmp_path / "fakepy"
+    p.write_text("#!/bin/sh\n" + body)
+    p.chmod(0o755)
+    return str(p)
+
+
+def test_hermes_bridge_round_trip_and_errors(tmp_path):
+    ok = fake_python(tmp_path, 'cat >/dev/null; echo \'{"result": ["a"]}\'\n')
+    assert HermesBridge(hermes_py=ok).scan("x") == ["a"]
+    bad = fake_python(tmp_path, 'cat >/dev/null; echo boom >&2; exit 3\n')
+    with pytest.raises(BridgeError, match="boom"):
+        HermesBridge(hermes_py=bad).scan("x")
+    junk = fake_python(tmp_path, 'cat >/dev/null; echo not-json\n')
+    with pytest.raises(BridgeError):
+        HermesBridge(hermes_py=junk).scan("x")
+    with pytest.raises(BridgeError):
+        HermesBridge(hermes_py=str(tmp_path / "missing")).scan("x")
+    slow = fake_python(tmp_path, 'sleep 5\n')
+    with pytest.raises(BridgeError, match="timed out"):
+        HermesBridge(hermes_py=slow, timeout=0.3).scan("x")
+    loud = fake_python(tmp_path, 'cat >/dev/null; yes x | head -c 100000 >&2; exit 1\n')
+    with pytest.raises(BridgeError) as e:
+        HermesBridge(hermes_py=loud).scan("x")
+    assert len(str(e.value)) < 2000
+
+
+def test_hermes_bridge_sends_op_and_args(tmp_path):
+    log = tmp_path / "log"
+    py = fake_python(tmp_path, f'echo "$2" > {log}; cat >> {log}; echo \'{{"result": null}}\'\n')
+    HermesBridge(hermes_py=py).config_set("compression.threshold", 0.5)
+    op, payload = log.read_text().splitlines()
+    assert op == "config_set"
+    assert json.loads(payload) == {"key": "compression.threshold", "value": "0.5"}
+
+
+def test_config_value_encoding():
+    enc = bridge_mod.encode_config_value
+    assert enc(True) == "true" and enc(False) == "false"
+    assert enc(5) == "5" and enc(0.5) == "0.5" and enc("auto") == "auto"
+    for bad in (None, {}, [1]):
+        with pytest.raises(ValueError):
+            enc(bad)
+
+
+def test_restart_gateway_runs_systemctl_and_raises_on_failure(tmp_path):
+    seen = {}
+
+    def runner(argv, **kw):
+        seen["argv"], seen["timeout"] = argv, kw.get("timeout")
+        return subprocess.CompletedProcess(argv, 1, "", "no unit")
+
+    b = HermesBridge(runner=runner)
+    with pytest.raises(BridgeError, match="no unit"):
+        b.restart_gateway()
+    assert seen["argv"] == ["systemctl", "--user", "restart", "hermes-gateway"]
+    assert seen["timeout"] == 60
+
+
+def test_fake_bridge_records_calls_and_scripts_oneshot():
+    b = FakeBridge(oneshot_script=[{"text": "hi", "input_tokens": 1, "output_tokens": 2,
+                                    "estimated_cost_usd": 0.0}])
+    assert b.oneshot("i", "u", 10)["text"] == "hi"
+    assert b.calls == [("oneshot", ("i", "u", 10))]
+    with pytest.raises(BridgeError):
+        b.oneshot("i", "u", 10)  # script exhausted
+    b.restart_gateway()
+    assert b.calls[-1] == ("restart_gateway", ())
+
+
+def test_skill_write_failure_leaves_original_and_no_temp_file(tmp_path, monkeypatch):
+    root, skills, bridge, ledger = make(tmp_path)
+    p = make_skill(skills)
+    original = p.read_bytes()
+
+    real = os.replace
+
+    def boom(src, dst):
+        if Path(dst).name == "SKILL.md":
+            raise OSError("disk full")
+        real(src, dst)
+
+    monkeypatch.setattr(os, "replace", boom)
+    f = Fix("s1", "skill", "mine", {"path": "mine/SKILL.md",
+                                    "text": "---\nname: mine\n---\nnew\n"}, "k")
+    rec = do_apply(f, ledger, bridge, root, skills)
+    assert rec.state == "bridge_error"
+    assert p.read_bytes() == original
+    assert [x.name for x in p.parent.iterdir()] == ["SKILL.md"]
