@@ -1,6 +1,7 @@
 """Deterministic gate on model-drafted fixes (spec 5). Empty list = allowed."""
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -86,16 +87,28 @@ def _check_composed(fix: Fix, ctx: LimitContext) -> list[str]:
     return reasons
 
 
-def _frontmatter_name(text: str) -> str | None:
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != "---":
+_CLOSE = re.compile(r"\n---\s*\n")
+
+
+def _frontmatter_block(text: str) -> str | None:
+    """Frontmatter exactly as Hermes delimits it (agent/skill_utils.py parse_frontmatter):
+    optional BOM, leading '---', through the closing '---' line. None if absent."""
+    bom = "\ufeff" if text.startswith("\ufeff") else ""
+    body = text[len(bom):]
+    if not body.startswith("---"):
         return None
-    for line in lines[1:]:
-        if line.strip() == "---":
-            return None
+    m = _CLOSE.search(body[3:])
+    if not m:
+        return None
+    return bom + body[: m.end() + 3]
+
+
+def _block_names_bundled(block: str | None, bundled: frozenset[str]) -> str | None:
+    """Fail closed: any line (nested or not) naming a bundled skill."""
+    for line in (block or "").splitlines():
         key, sep, val = line.partition(":")
-        if sep and key.strip() == "name":
-            return val.strip().strip("\"'") or None
+        if sep and key.strip() == "name" and val.strip().strip("\"'") in bundled:
+            return val.strip().strip("\"'")
     return None
 
 
@@ -122,13 +135,12 @@ def _check_skill(fix: Fix, ctx: LimitContext) -> list[str]:
     hit = [p for p in parts if p in ctx.bundled_skills]
     if hit:
         return [f"skill {hit[0]!r} is bundled with Hermes"]
-    dirname = resolved.parent.name
-    old_name = _frontmatter_name(old) or dirname
-    new_name = _frontmatter_name(text) or dirname
-    if new_name in ctx.bundled_skills:
-        return [f"skill name {new_name!r} is bundled with Hermes"]
-    if new_name != old_name:
-        return [f"skill name changed from {old_name!r} to {new_name!r}"]
+    old_block = _frontmatter_block(old)
+    named = _block_names_bundled(old_block, ctx.bundled_skills)
+    if named is not None:
+        return [f"existing skill is named {named!r}, which is bundled with Hermes"]
+    if _frontmatter_block(text) != old_block:
+        return ["skill fixes must leave the frontmatter byte-identical"]
     return []
 
 

@@ -149,14 +149,45 @@ def test_new_skill_file_rejected(tmp_path):
     assert check_fix(skill(str(tmp_path / "skills/fresh/SKILL.md")), ctx(tmp_path))
 
 
-def test_frontmatter_rename_rejected(tmp_path):
-    p = mk(tmp_path, "mine/SKILL.md")
+FM = "---\nname: mine\n---\n"
+
+
+def test_frontmatter_changes_rejected(tmp_path):
+    p = mk(tmp_path, "mine/SKILL.md", FM + "old")
     c = ctx(tmp_path)
+    assert check_fix(skill(p, FM + "shrunk"), c) == []
     assert check_fix(skill(p, "---\nname: arxiv\n---\nx"), c)
     assert check_fix(skill(p, "---\nname: other\n---\nx"), c)
-    assert check_fix(skill(p, "no frontmatter"), c) == []
-    assert check_fix(skill(p, "---\nname: mine\n---\nnew"), c) == []
-    assert check_fix(skill(p, "---\nname: 'mine'\n---\nnew"), c) == []
+    assert check_fix(skill(p, "no frontmatter"), c)
+    assert check_fix(skill(p, "---\nname: mine\n---\n\nx"), c)  # whitespace change
+    assert check_fix(skill(p, "---\nname:  mine\n---\nx"), c)
+    nested = "---\nmetadata:\n  name: mine\nname: arxiv\n---\nx"
+    assert check_fix(skill(p, nested), c)
+
+
+def test_unterminated_or_added_frontmatter_rejected(tmp_path):
+    p = mk(tmp_path, "mine/SKILL.md", "plain body")
+    c = ctx(tmp_path)
+    assert check_fix(skill(p, "shorter body"), c) == []
+    assert check_fix(skill(p, "---\nname: arxiv\n---\nx"), c)
+    p2 = mk(tmp_path, "mine2/SKILL.md", "---\nunterminated")
+    assert check_fix(skill(p2, "---\nunterminated"), c) == []
+    assert check_fix(skill(p2, "---\nunterminated\n---\nx"), c)
+
+
+def test_bom_handled_like_hermes(tmp_path):
+    p = mk(tmp_path, "mine/SKILL.md", "\ufeff" + FM + "old")
+    c = ctx(tmp_path)
+    assert check_fix(skill(p, "\ufeff" + FM + "new"), c) == []
+    assert check_fix(skill(p, FM + "new"), c)
+
+
+def test_existing_skill_named_bundled_rejected(tmp_path):
+    c = ctx(tmp_path)
+    top = mk(tmp_path, "a/SKILL.md", "---\nname: arxiv\n---\nold")
+    assert check_fix(skill(top, "---\nname: arxiv\n---\nnew"), c)
+    nest = mk(tmp_path, "b/SKILL.md", "---\nmetadata:\n  name: arxiv\n---\nold")
+    assert check_fix(skill(nest, "---\nmetadata:\n  name: arxiv\n---\nnew"), c)
 
 
 def test_dirname_fallback_rewrite_ok(tmp_path):
@@ -237,11 +268,6 @@ def test_approval_cannot_admit_composed_tool_call(tmp_path):
 def test_never_touch_beats_editable(tmp_path, monkeypatch):
     monkeypatch.setitem(policy.EDITABLE_JOBS, "8da9a6857256", "x")
     assert check_fix(jp("8da9a6857256"), ctx(tmp_path))
-
-
-def test_existing_skill_already_shadowing_bundled_rejected(tmp_path):
-    p = mk(tmp_path, "mine/SKILL.md", "---\nname: arxiv\n---\nold")
-    assert check_fix(skill(p, "---\nname: arxiv\n---\nnew"), ctx(tmp_path))
 
 
 def test_unhashable_target_does_not_raise(tmp_path):
