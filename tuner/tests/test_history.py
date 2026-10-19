@@ -216,3 +216,13 @@ def test_null_tool_call_id_not_joined(tmp_path):
     conn.close()
     (call,) = History.open(db).sessions(0)[0].calls
     assert call.name == "?" and call.arg_keys == () and call.ref is None
+
+
+def test_chain_ids_root_then_continuations(tmp_path):
+    h = History.open(_chain_db(tmp_path))
+    assert h.chain_ids(ROOT) == [ROOT, CHILD, GRAND]
+
+
+def test_chain_ids_stops_at_non_compression_parent(tmp_path):
+    h = History.open(_chain_db(tmp_path, child_parent_reason="branched"))
+    assert h.chain_ids(ROOT) == [ROOT, CHILD]

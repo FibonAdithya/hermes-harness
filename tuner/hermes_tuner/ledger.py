@@ -49,6 +49,7 @@ class FixRecord:
     reason: str = ""
     spend_usd: float = 0.0
     needs_restart: bool = False
+    decided_at: float | None = None  # when a trial was kept or rolled back
 
 
 # --- atomic file helpers ------------------------------------------------------

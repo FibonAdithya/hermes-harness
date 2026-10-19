@@ -210,6 +210,11 @@ class History:
         chains = self._chains([{"id": session_id}])
         return [(c.name, a) for c, a, _t in self._chain_calls(chains)[session_id]]
 
+    def chain_ids(self, root_id: str) -> list[str]:
+        """Session ids of the run rooted at `root_id`: the root, then its compression
+        continuations (breadth-first, as `sessions` merges them)."""
+        return self._chains([{"id": root_id}])[root_id]
+
     def untrusted_texts(self, since: float) -> Iterator[str]:
         for _s, c, a, text in self._calls(None, since):
             if _is_untrusted(c.name, a):

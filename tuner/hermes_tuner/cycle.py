@@ -1,0 +1,450 @@
+"""One daily tuner run (spec 4, 6), held under a lock on `root/.lock`.
+
+Order: clean up shadows -> evaluate shadows -> judge trials -> apply approved
+proposals -> budget check -> detect -> draft / validate / shadow / apply / propose
+-> restart if allowed -> weekly line.
+
+`now` is a parameter; nothing here reads the clock. A BridgeError in any step is
+recorded in the report and the cycle moves on; the ledger guarantees nothing is
+left half-applied. A dry run makes no mutating bridge call (no drafting either)
+and writes nothing under `root`; it lists what it would do in `planned`.
+
+Besides the ledger, `root/cycle_state.json` holds {"pending_restart": bool,
+"weekly_written": "YYYY-Www", "errors": [{"at": epoch, "error": str}]} (errors
+from the last 28 days, counted in the weekly line).
+"""
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import shutil
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from statistics import median
+
+from . import policy, trial
+from .bridge import Bridge, BridgeError
+from .budget import DAY, JOB_KINDS, weekly_line
+from .cycle_draft import GLOBAL_KINDS, DraftSteps
+from .fingerprint import CopyIndex
+from .history import History, HistoryUnavailable
+from .ledger import (FixRecord, Ledger, _tool_files, _tool_matches, apply, atomic_write,
+                     rollback)
+from .measure import run_cost
+from .model import Fix, Session
+from .proposals import apply_approved, approved, dropped
+from .restart import restart_allowed
+
+__all__ = ["CycleConfig", "CycleReport", "run_cycle", "weekly_line"]
+
+HISTORY_DAYS = 35          # detection window (28) plus a week of margin
+SHADOW_GRACE_S = 2 * DAY   # a shadow that has not run 2 days after run_at failed
+ERROR_KEEP_S = 28 * DAY
+STATE_FILE = "cycle_state.json"
+
+
+@dataclass(frozen=True)
+class CycleConfig:
+    root: Path
+    db: Path
+    broker_state: Path
+    skills_root: Path
+    dry_run: bool = False
+
+
+@dataclass
+class CycleReport:
+    applied: list[str] = field(default_factory=list)
+    kept: list[str] = field(default_factory=list)
+    rolled_back: list[str] = field(default_factory=list)
+    rejected: list[str] = field(default_factory=list)
+    proposed: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    spend_usd: float = 0.0
+    shadowed: list[str] = field(default_factory=list)
+    planned: list[str] = field(default_factory=list)   # dry run: what would happen
+    budget: str = ""
+    weekly: str = ""
+    restarted: bool = False
+    skipped: str = ""
+    dry_run: bool = False
+
+
+def run_cycle(cfg: CycleConfig, bridge: Bridge, now: float) -> CycleReport:
+    report = CycleReport(dry_run=cfg.dry_run)
+    if cfg.dry_run:
+        _Cycle(cfg, bridge, now, report).run()
+        return report
+    root = Path(cfg.root)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(root / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            report.skipped = "already running"
+            return report
+        _Cycle(cfg, bridge, now, report).run()
+    finally:
+        os.close(fd)  # releases the lock
+    return report
+
+
+class _Cycle(DraftSteps):
+    def __init__(self, cfg: CycleConfig, bridge: Bridge, now: float, report: CycleReport):
+        self.cfg, self.bridge, self.now, self.report = cfg, bridge, now, report
+        self.root = Path(cfg.root)
+        self.dry = cfg.dry_run
+        self.restart_wanted = False
+        self.history: History | None = None
+        self.sessions: list[Session] = []
+        self._copy_index: CopyIndex | None = None
+
+    # --- plumbing -----------------------------------------------------------------
+
+    def err(self, msg: str) -> None:
+        self.report.errors.append(msg)
+
+    def plan(self, msg: str) -> None:
+        self.report.planned.append(msg)
+
+    def _load_state(self) -> dict:
+        try:
+            data = json.loads((self.root / STATE_FILE).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as exc:
+            self.err(f"{STATE_FILE} unreadable: {exc}")
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _save_state(self) -> None:
+        if self.dry:
+            return
+        atomic_write(self.root / STATE_FILE,
+                     json.dumps(self.state, indent=2, sort_keys=True).encode("utf-8"))
+
+    def _shadow_entries(self) -> dict:
+        try:
+            return trial._read_entries(self.root)
+        except (OSError, ValueError) as exc:
+            self.err(f"{trial.SHADOW_FILE} unreadable: {exc}")
+            return {}
+
+    def _close(self, rec: FixRecord, state: str, reason: str) -> None:
+        rec.state, rec.reason = state, reason  # type: ignore[assignment]
+        self.ledger.save()
+
+    def _global_active(self) -> bool:
+        return any(r.kind in GLOBAL_KINDS and r.state in ("shadow_pending", "trial", "applied")
+                   for r in self.ledger.records)
+
+    # --- the run ---------------------------------------------------------------------
+
+    def run(self) -> None:
+        try:
+            self.ledger = Ledger.load(self.root)
+        except (OSError, ValueError, TypeError) as exc:
+            self.err(f"ledger unreadable, nothing done: {exc}")
+            return
+        self.state = self._load_state()
+        self.cleanup()
+        self.entries = self._shadow_entries()
+        self.shadow_ids = set(self.entries)
+        try:
+            self.history = History.open(self.cfg.db)
+            self.sessions = self.history.sessions(self._history_since())
+        except HistoryUnavailable as exc:
+            self.err(f"state.db unavailable, run skipped: {exc}")
+            self._finish_errors()
+            self._save_state()
+            return
+        self.evaluate_shadows()
+        self.judge_trials()
+        self.approved_proposals()
+        self.draft_fixes()
+        self.restart()
+        self._finish_errors()
+        self.weekly()
+        self._save_state()
+
+    def _history_since(self) -> float:
+        since = self.now - HISTORY_DAYS * DAY
+        for r in self.ledger.records:
+            if r.applied_at is not None and r.state in ("trial", "kept", "applied"):
+                since = min(since, r.applied_at - 28 * DAY)
+        return since
+
+    def _finish_errors(self) -> None:
+        if self.dry:
+            return
+        log = [e for e in self.state.get("errors", []) if isinstance(e, dict)
+               and isinstance(e.get("at"), (int, float)) and self.now - e["at"] < ERROR_KEEP_S]
+        log += [{"at": self.now, "error": m[:500]} for m in self.report.errors]
+        self.state["errors"] = log
+
+    # 1. cleanup ------------------------------------------------------------------------
+
+    def cleanup(self) -> None:
+        if self.dry:
+            return
+        try:
+            trial.cleanup_shadows(self.bridge, self.root, self.now)
+        except (BridgeError, OSError, ValueError) as exc:
+            self.err(f"cleanup_shadows: {type(exc).__name__}: {exc}")
+
+    # 2. shadows ------------------------------------------------------------------------
+
+    def evaluate_shadows(self) -> None:
+        by_start = sorted(self.sessions, key=lambda s: (s.started_at, s.id))
+        for rec in [r for r in self.ledger.records if r.state == "shadow_pending"]:
+            if rec.kind not in JOB_KINDS:
+                continue
+            mine = [(sid, e) for sid, e in self.entries.items()
+                    if isinstance(e, dict) and e.get("fix_id") == rec.id]
+            if not mine:
+                if self.now - rec.created_at > SHADOW_GRACE_S:
+                    self._shadow_failed(rec, "shadow did not run")
+                continue
+            shadow_id, entry = max(mine, key=lambda x: x[1].get("created_at") or 0)
+            live = entry.get("live_job_id")
+            shadow = next((s for s in by_start if s.job_id == shadow_id), None)
+            if shadow is None:
+                run_at = trial._epoch(entry.get("run_at"))
+                if run_at is None or self.now - run_at > SHADOW_GRACE_S:
+                    self._shadow_failed(rec, "shadow did not run")
+                continue
+            if not shadow.calls:
+                self._shadow_failed(rec, "shadow run made no tool calls")
+                continue
+            old = next((s for s in by_start if s.job_id == live and s.calls
+                        and s.started_at > shadow.started_at), None)
+            if old is None:
+                continue  # wait for the live run to compare with
+            verdict = self._compare(live, shadow, old)
+            if verdict is None:
+                self._shadow_failed(rec, f"no quality check for job {live}")
+            elif not verdict.ok:
+                self._shadow_failed(rec, f"shadow disagreed: agreement {verdict.agreement:.2f}, "
+                                         f"{len(verdict.flips)} flips")
+            else:
+                self._go_live(rec)
+
+    def _compare(self, live: object, shadow: Session, old: Session):
+        rule = policy.EDITABLE_JOBS.get(live) if isinstance(live, str) else None
+        if rule is None:
+            return None
+        h = self.history
+        intents = trial.read_intents(self.root, h.chain_ids(shadow.id))
+        old_calls, new_calls = h.calls_with_args(old.id), h.calls_with_args(shadow.id)
+        if rule == "triage":
+            return trial.compare_triage(trial.triage_decisions(old_calls, []),
+                                        trial.triage_decisions(new_calls, intents))
+        if rule == "calendar":
+            return trial.compare_calendar(trial.calendar_events(old_calls, []),
+                                          trial.calendar_events(new_calls, intents))
+        return None
+
+    def _shadow_failed(self, rec: FixRecord, reason: str) -> None:
+        if self.dry:
+            self.plan(f"shadow_failed {rec.id}: {reason}")
+            return
+        self._remove_shadow_tool(rec)
+        self._close(rec, "shadow_failed", reason)
+        self.report.rejected.append(rec.id)
+
+    def _shadow_tool(self, fix: Fix) -> tuple[dict, str] | None:
+        if fix.kind != "composed_tool":
+            return None
+        try:
+            return _tool_files(fix.payload)
+        except ValueError:
+            return None
+
+    def _remove_shadow_tool(self, rec: FixRecord) -> None:
+        """Remove the tool dir written for a composed_tool shadow, if it is still ours."""
+        try:
+            files = self._shadow_tool(self.ledger.fix(rec.id))
+        except (OSError, ValueError, TypeError):
+            return
+        if files is None:
+            return
+        spec, program = files
+        tools = self.root / "tools"
+        if _tool_matches(tools, {"spec": spec, "program": program}):
+            shutil.rmtree(tools / spec["name"], ignore_errors=True)
+
+    def _go_live(self, rec: FixRecord) -> None:
+        if self.dry:
+            self.plan(f"apply {rec.id}")
+            return
+        fix = self.ledger.fix(rec.id)
+        self._remove_shadow_tool(rec)  # apply writes it again, with before/after saved
+        try:
+            out = apply(fix, self.ledger, self.bridge, self.root, self.now,
+                        skills_root=self.cfg.skills_root)
+        except ValueError as exc:
+            self._close(rec, "rejected", f"apply refused: {exc}")
+            self.report.rejected.append(rec.id)
+            return
+        self._went_live(out)
+
+    def _went_live(self, rec: FixRecord) -> None:
+        if rec.state != "trial":
+            self.err(f"apply {rec.id}: {rec.reason}")
+            return
+        if rec.kind in JOB_KINDS:
+            base = trial.baseline_stats(self.sessions, rec.target, rec.applied_at)
+            rec.baseline_cost = base.median_cost if base is not None else None
+            self.ledger.save()
+        self.report.applied.append(rec.id)
+        self.restart_wanted |= rec.needs_restart
+
+    # 3. trials -------------------------------------------------------------------------
+
+    def judge_trials(self) -> None:
+        for rec in [r for r in self.ledger.records if r.state == "trial"]:
+            if rec.applied_at is None:
+                continue
+            if rec.kind in JOB_KINDS:
+                base = trial.baseline_stats(self.sessions, rec.target, rec.applied_at)
+                verdict = trial.trial_verdict(
+                    rec, trial.trial_stats(self.sessions, rec.target, rec.applied_at),
+                    base.median_prompt_tokens if base is not None else 0.0)
+            elif rec.kind in GLOBAL_KINDS:
+                if self.now - rec.applied_at < policy.GLOBAL_TRIAL_DAYS * DAY:
+                    continue
+                verdict = self._global_verdict(rec.applied_at)
+            else:
+                continue
+            if verdict == "keep":
+                self._keep(rec)
+            elif verdict == "rollback":
+                self._rollback(rec)
+
+    def _global_verdict(self, applied_at: float) -> str:
+        """keep only if the median run_cost over chat sessions and editable-job runs
+        since applied_at is strictly below the 28 days before (prompt tokens when
+        both medians are 0)."""
+        def runs(lo: float, hi: float) -> list[Session]:
+            return [s for s in self.sessions if lo <= s.started_at < hi and s.calls
+                    and (s.source == "telegram" or s.job_id in policy.EDITABLE_JOBS)]
+        after = [s for s in runs(applied_at, float("inf")) if s.started_at > applied_at]
+        before = runs(applied_at - 28 * DAY, applied_at)
+        if not after or not before:
+            return "rollback"
+        ca, cb = median(map(run_cost, after)), median(map(run_cost, before))
+        if ca == 0 and cb == 0:
+            better = (median(s.prompt_tokens for s in after)
+                      < median(s.prompt_tokens for s in before))
+        else:
+            better = ca < cb
+        return "keep" if better else "rollback"
+
+    def _keep(self, rec: FixRecord) -> None:
+        if self.dry:
+            self.plan(f"keep {rec.id}")
+            return
+        rec.decided_at = self.now
+        self._close(rec, "kept", "trial: cheaper than baseline")
+        self.report.kept.append(rec.id)
+
+    def _rollback(self, rec: FixRecord) -> None:
+        if self.dry:
+            self.plan(f"rollback {rec.id}")
+            return
+        try:
+            out = rollback(rec, self.ledger, self.bridge, self.root, self.now,
+                           skills_root=self.cfg.skills_root)
+        except (ValueError, OSError, KeyError) as exc:
+            self.err(f"rollback {rec.id}: {type(exc).__name__}: {exc}")
+            return
+        if out.state == "trial":
+            self.err(f"rollback {rec.id}: {out.reason}")
+            return
+        out.decided_at = self.now
+        if out.state == "rolled_back":
+            out.reason = "trial: not cheaper than baseline"
+        self.ledger.save()
+        self.report.rolled_back.append(rec.id)
+
+    # 4. proposals ----------------------------------------------------------------------
+
+    def approved_proposals(self) -> None:
+        cfg = self.cfg
+        for doc in approved(self.root, cfg.broker_state):
+            pid = doc.get("id")
+            rec = self.ledger.get(pid)
+            if rec is not None and rec.state not in ("proposed", "approved", "bridge_error"):
+                continue
+            if self.dry:
+                self.plan(f"apply proposal {pid}")
+                continue
+            try:
+                out = apply_approved(pid, self.bridge, self.ledger, self.root,
+                                     cfg.broker_state, self.now)
+            except (ValueError, OSError) as exc:
+                self.err(f"proposal {pid}: {exc}")
+                continue
+            if out is None:
+                continue
+            if out.state == "applied" and out.applied_at == self.now:
+                self.report.applied.append(pid)
+                self.restart_wanted |= out.needs_restart
+            elif out.state == "bridge_error":
+                self.err(f"proposal {pid}: {out.reason}")
+        for doc in dropped(self.root, cfg.broker_state):
+            rec = self.ledger.get(doc.get("id"))
+            if rec is not None and rec.state == "proposed":
+                if self.dry:
+                    self.plan(f"drop proposal {rec.id}")
+                else:
+                    self._close(rec, "dropped", "owner dropped the proposal")
+
+    # 8. restart --------------------------------------------------------------------------
+
+    def restart(self) -> None:
+        if not (self.restart_wanted or self.state.get("pending_restart")):
+            return
+        if self.dry:
+            self.plan("restart gateway when the window allows")
+            return
+        self.state["pending_restart"] = True
+        try:
+            next_runs = []
+            for j in self.bridge.list_jobs():
+                if isinstance(j, dict) and j.get("enabled", True):
+                    t = trial._epoch(j.get("next_run_at"))
+                    if t is not None:
+                        next_runs.append(t)
+            last = self.history.last_activity()
+            if restart_allowed(datetime.fromtimestamp(self.now, timezone.utc), last, next_runs):
+                self.bridge.restart_gateway()
+                self.state["pending_restart"] = False
+                self.report.restarted = True
+        except (BridgeError, HistoryUnavailable) as exc:
+            self.err(f"restart: {type(exc).__name__}: {exc}")
+
+    # 9. weekly line ----------------------------------------------------------------------
+
+    def weekly(self) -> None:
+        iso = datetime.fromtimestamp(self.now, timezone.utc).isocalendar()
+        tag = f"{iso.year}-W{iso.week:02d}"
+        path = self.root / "outbox" / f"weekly-{tag}.txt"
+        if (self.state.get("weekly_written") == tag or path.exists()
+                or path.with_suffix(".sent").exists()):
+            return
+        if self.dry:  # _finish_errors does not log in a dry run
+            recent = len(self.report.errors)
+        else:
+            recent = sum(1 for e in self.state.get("errors", [])
+                         if isinstance(e, dict) and self.now - e.get("at", 0) < 7 * DAY)
+        line = weekly_line(self.ledger, self.sessions, self.now, self.shadow_ids, errors=recent)
+        self.report.weekly = line
+        if self.dry:
+            self.plan(f"weekly line {tag}")
+            return
+        atomic_write(path, (line + "\n").encode("utf-8"))
+        self.state["weekly_written"] = tag
