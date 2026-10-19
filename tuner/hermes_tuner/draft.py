@@ -112,7 +112,15 @@ def build_request(candidate: Candidate, job: dict | None, skill_text: str | None
 
 
 def parse_draft(text: str, candidate: Candidate, now: float) -> Fix | None:
-    """The reply must be exactly one JSON object. Unknown payload keys are dropped."""
+    """The reply must be exactly one JSON object. Unknown payload keys are dropped.
+    Any failure to parse (including RecursionError on deep nesting) gives None."""
+    try:
+        return _parse_draft(text, candidate, now)
+    except (ValueError, TypeError, RecursionError, MemoryError):
+        return None
+
+
+def _parse_draft(text: str, candidate: Candidate, now: float) -> Fix | None:
     text = text.strip()
     try:
         obj, end = json.JSONDecoder().raw_decode(text)

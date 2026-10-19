@@ -859,3 +859,38 @@ def test_owner_edit_after_drafting_closes_owner_changed(env, field, value, compo
     assert bridge.jobs[TRIAGE][field] == value
     assert not [c for c in bridge.calls if c[0] == "update_job"]
     assert not (env.root / "tools" / "tuned_triage").exists()
+
+
+# --- m1: an unexpected exception in one step does not stop the cycle -----------------------
+
+def test_unexpected_error_in_a_step_is_logged_and_the_cycle_continues(env, monkeypatch):
+    from hermes_tuner import trial as trial_mod
+    fix = shadow_setup(env, old_mod=[], new_mod=[])
+
+    def boom(*a, **k):
+        raise RuntimeError("compare exploded")
+    monkeypatch.setattr(trial_mod, "compare_triage", boom)
+    bridge = FakeBridge(jobs=jobs(), oneshot_script=[reply(JOB_PROMPT_REPLY)])
+    report = run_cycle(env, bridge, NOW)
+    assert any("compare exploded" in e for e in report.errors)
+    assert Ledger.load(env.root).get(fix.id).state == "shadow_pending"
+    line = (env.root / "outbox" / "weekly-2026-W43.txt").read_text()
+    assert "; errors: 1 (" in line
+    assert any("compare exploded" in e["error"] for e in state(env)["errors"])
+
+
+def test_unexpected_error_after_drafting_still_records_the_spend(env, monkeypatch):
+    from hermes_tuner import cycle_draft
+    build(env, triage_runs())
+
+    def boom(*a, **k):
+        raise RuntimeError("limits exploded")
+    monkeypatch.setattr(cycle_draft, "check_fix", boom)
+    bridge = FakeBridge(jobs=jobs(), oneshot_script=[reply(JOB_PROMPT_REPLY, tokens=(10_000, 2000))])
+    report = run_cycle(env, bridge, NOW)
+    assert any("limits exploded" in e for e in report.errors)
+    (rec,) = Ledger.load(env.root).records
+    assert rec.state == "rejected"
+    assert rec.spend_usd == pytest.approx(12_000 * policy.USD_PER_MTOK / 1e6)
+    assert report.spend_usd == pytest.approx(rec.spend_usd)
+    assert (env.root / "outbox" / "weekly-2026-W43.txt").exists()

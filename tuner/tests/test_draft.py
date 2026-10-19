@@ -238,3 +238,12 @@ def test_instructions_pass_no_obvious_injection_phrases():
     low = D.INSTRUCTIONS.lower()
     for bad in ("ignore previous", "ignore all", "disregard", "system prompt", "you are now"):
         assert bad not in low
+
+
+@pytest.mark.parametrize("text", [
+    '{"kind": "job_prompt", "target": "t", "payload": ' + "[" * 200_000 + "]" * 200_000 + "}",
+    "[" * 200_000,
+], ids=["nested-payload", "bare-brackets"])
+def test_parse_draft_deeply_nested_reply_is_none(text):
+    """m1: a reply that blows the JSON decoder's recursion is unparseable, not a crash."""
+    assert D.parse_draft(text, CAND, NOW) is None

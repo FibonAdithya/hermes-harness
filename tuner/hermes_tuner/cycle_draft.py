@@ -162,11 +162,28 @@ class DraftSteps:
             return 0.0, False
         self.report.spend_usd += spend
         if fix is None:
-            digest = hashlib.sha256(f"{cand.key}|{self.now!r}".encode()).hexdigest()[:8]
-            day = datetime.fromtimestamp(self.now, timezone.utc).strftime("%Y%m%d")
-            placeholder = Fix(f"{day}-u{digest}", "unparseable", cand.job_id or "", {}, cand.key)  # type: ignore[arg-type]
-            self._record(placeholder, "rejected", spend, "unparseable draft")
+            self._spend_record(cand, spend, "unparseable", "unparseable draft")
             return spend, False
+        try:
+            return self._act(cand, job, fix, spend, bundled)
+        except Exception as exc:  # noqa: BLE001 - keep the spend, report, go on
+            self.err(f"draft {cand.key}: unexpected {type(exc).__name__}: {exc}")
+            rec = self.ledger.get(fix.id)
+            if rec is None:
+                self._spend_record(cand, spend, "error", f"internal error: {type(exc).__name__}")
+            elif rec.state == "shadow_pending" and rec.applied_at is None:
+                self._close(rec, "rejected", f"internal error: {type(exc).__name__}")
+            return spend, False
+
+    def _spend_record(self, cand: Candidate, spend: float, tag: str, reason: str) -> None:
+        """A rejected placeholder record that carries drafting spend with no usable fix."""
+        digest = hashlib.sha256(f"{cand.key}|{tag}|{self.now!r}".encode()).hexdigest()[:8]
+        day = datetime.fromtimestamp(self.now, timezone.utc).strftime("%Y%m%d")
+        placeholder = Fix(f"{day}-u{digest}", tag, cand.job_id or "", {}, cand.key)  # type: ignore[arg-type]
+        self._record(placeholder, "rejected", spend, reason)
+
+    def _act(self, cand: Candidate, job: dict | None, fix: Fix, spend: float,
+             bundled: frozenset[str] | None) -> tuple[float, bool]:
         if self.ledger.get(fix.id) is not None:
             self.err(f"draft {fix.id} is already in the ledger")
             return spend, False

@@ -183,7 +183,7 @@ class _Cycle(DraftSteps):
             self.err(f"ledger unreadable, nothing done: {exc}")
             return
         self.state = self._load_state()
-        self.cleanup()
+        self._step("cleanup", self.cleanup)
         self.entries = self._shadow_entries()
         self.shadow_ids = set(self.entries)
         try:
@@ -194,14 +194,24 @@ class _Cycle(DraftSteps):
             self._finish_errors()
             self._save_state()
             return
-        self.evaluate_shadows()
-        self.judge_trials()
-        self.approved_proposals()
-        self.draft_fixes()
-        self.restart()
+        for name, step in (("evaluate_shadows", self.evaluate_shadows),
+                           ("judge_trials", self.judge_trials),
+                           ("approved_proposals", self.approved_proposals),
+                           ("draft_fixes", self.draft_fixes),
+                           ("restart", self.restart)):
+            self._step(name, step)
         self._finish_errors()
-        self.weekly()
+        self._step("weekly", self.weekly)
         self._save_state()
+
+    def _step(self, name: str, fn) -> None:
+        """Run one step; an unexpected exception is logged (report and cycle_state
+        errors) and the cycle goes on to the next step and the weekly line. Every
+        state change a step makes is saved as it is made, so nothing is half-done."""
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001
+            self.err(f"{name}: unexpected {type(exc).__name__}: {exc}")
 
     def _history_since(self) -> float:
         """The detection window, widened only for records still being judged: a
