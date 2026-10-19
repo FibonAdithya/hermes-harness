@@ -45,3 +45,25 @@ def test_short_text_and_empty_index():
     idx = CopyIndex.build(["x" * 100])
     assert not idx.contains_copy("x" * 10)
     assert not CopyIndex.build([]).contains_copy("anything at all " * 10)
+
+
+def _disguise(text: str) -> str:
+    """Full-width letters and digits, and a zero-width space every 10 characters."""
+    wide = "".join(chr(ord(c) + 0xFEE0) if c.isascii() and c.isalnum() else c for c in text)
+    return "​".join(wide[i:i + 10] for i in range(0, len(wide), 10))
+
+
+def test_copy_with_zero_width_and_full_width_characters_is_detected():
+    """M1: NFKC and format-character stripping on corpus and query."""
+    from hermes_tuner.fingerprint import CopyIndex
+    secret = "Invoice 4471 from Acme Ltd due on Friday"  # exactly 40 characters
+    assert len(secret) == 40
+    disguised = _disguise(secret)
+    assert disguised != secret and "​" in disguised
+    assert CopyIndex.build(["header " + secret + " footer"]).contains_copy(
+        "draft: " + disguised + " end")
+    assert CopyIndex.build(["header " + disguised + " footer"]).contains_copy(
+        "draft: " + secret + " end")
+    # control: unrelated text of the same shape is not a copy
+    assert not CopyIndex.build(["header " + secret + " footer"]).contains_copy(
+        _disguise("Quarterly report for the north-east team"))

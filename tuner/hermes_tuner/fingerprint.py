@@ -1,11 +1,13 @@
 """Winnowing copy detector (spec 5.3).
 
-Any shared run of at least K + W - 1 = 40 characters (after whitespace
-normalisation) is detected. Shorter runs may be detected; nothing is
+Any shared run of at least K + W - 1 = 40 characters (after normalisation:
+NFKC, format characters such as zero-width spaces removed, whitespace collapsed)
+is detected. Shorter runs may be detected; nothing is
 guaranteed below 40.
 """
 from __future__ import annotations
 
+import unicodedata
 from array import array
 from bisect import bisect_left
 from collections import deque
@@ -19,6 +21,11 @@ _TOP = pow(BASE, K - 1, MOD)
 
 
 def _normalise(text: str) -> str:
+    """NFKC (full-width and compatibility forms fold to plain ones), drop every
+    format (Cf) character (zero-width spaces, joiners, bidi marks), collapse
+    whitespace. Applied to corpus and query alike."""
+    text = unicodedata.normalize("NFKC", text)
+    text = "".join(c for c in text if unicodedata.category(c) != "Cf")
     return " ".join(text.split())
 
 
