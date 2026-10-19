@@ -128,11 +128,11 @@ def test_rollback_skips_owner_edit(tmp_path):
 def test_rollback_config_skips_owner_edit(tmp_path):
     root, skills, bridge, ledger = make(tmp_path)
     f = Fix("c1", "config", "k", {"key": "compression.threshold", "value": "0.5"}, "k")
-    bridge.config["compression.threshold"] = "0.8"
+    bridge.config["compression.threshold"] = 0.8
     rec = do_apply(f, ledger, bridge, root, skills)
-    bridge.config["compression.threshold"] = "0.9"
+    bridge.config["compression.threshold"] = 0.9
     assert do_rollback(rec, ledger, bridge, root, skills).state == "owner_changed"
-    assert bridge.config["compression.threshold"] == "0.9"
+    assert bridge.config["compression.threshold"] == 0.9
 
 
 def test_config_coercion_does_not_look_like_owner_edit(tmp_path):
@@ -301,12 +301,65 @@ def test_apply_twice_and_rollback_of_unapplied_are_refused(tmp_path):
         do_rollback(rolled, ledger, bridge, root, skills)
 
 
-def test_bridge_error_during_rollback_is_recorded(tmp_path):
+def test_failed_rollback_stays_applied_and_retry_restores(tmp_path):
     root, skills, bridge, ledger = make(tmp_path)
-    rec = do_apply(job_fix(), ledger, bridge, root, skills)
+    rec = do_apply(job_fix(add=["tuner"]), ledger, bridge, root, skills)
     bridge.fail.add("update_job")
     out = do_rollback(rec, ledger, bridge, root, skills)
-    assert out.state == "bridge_error" and bridge.jobs[JOB]["prompt"] == NEW
+    assert out.state == "trial" and "rollback failed" in out.reason and "update_job" in out.reason
+    assert ledger.active_for(JOB) is out
+    assert Ledger.load(root).records[0].state == "trial"
+    assert bridge.jobs[JOB]["prompt"] == NEW
+    bridge.fail.clear()
+    out = do_rollback(out, ledger, bridge, root, skills)
+    assert out.state == "rolled_back" and out.reason == ""
+    assert bridge.jobs[JOB] == {"id": JOB, "prompt": OLD, "enabled_toolsets": ["web"]}
+    assert ledger.active_for(JOB) is None
+
+
+def test_rollback_retry_after_partial_restore_is_not_owner_changed(tmp_path):
+    root, skills, bridge, ledger = make(tmp_path)
+    rec = do_apply(job_fix(), ledger, bridge, root, skills)
+    bridge.jobs[JOB]["prompt"] = OLD  # restored by an earlier attempt that then failed
+    assert do_rollback(rec, ledger, bridge, root, skills).state == "rolled_back"
+
+
+def test_composed_rollback_failure_keeps_tool_dir_and_job(tmp_path):
+    root, skills, bridge, ledger = make(tmp_path)
+    f = Fix("t1", "composed_tool", JOB, tool_payload(job_prompt=NEW), "k")
+    rec = do_apply(f, ledger, bridge, root, skills)
+    bridge.fail.add("update_job")
+    out = do_rollback(rec, ledger, bridge, root, skills)
+    assert out.state == "trial" and "rollback failed" in out.reason
+    assert (root / "tools" / "tuned_x" / "tool.json").exists()
+    assert bridge.jobs[JOB]["prompt"] == NEW
+    bridge.fail.clear()
+    out = do_rollback(out, ledger, bridge, root, skills)
+    assert out.state == "rolled_back"
+    assert bridge.jobs[JOB]["prompt"] == OLD and not (root / "tools" / "tuned_x").exists()
+
+
+@pytest.mark.parametrize("bad", [None, [1], {"a": 1}])
+def test_unsettable_config_value_writes_nothing(tmp_path, bad):
+    root, skills, bridge, ledger = make(tmp_path)
+    f = Fix("c1", "config", "k", {"key": "tools.tool_search.enabled", "value": bad}, "k")
+    with pytest.raises(ValueError):
+        do_apply(f, ledger, bridge, root, skills, add=False)
+    assert ledger.records == [] and not (root / "versions").exists()
+    assert bridge.config["tools.tool_search.enabled"] == "auto"
+    assert not [c for c in bridge.calls if c[0] in FakeBridge.MUTATING]
+
+
+@pytest.mark.parametrize("old", [{"a": 1}, [1, 2], -1, 1e-05, "on", float("nan")])
+def test_config_with_unrestorable_old_value_is_refused(tmp_path, old):
+    root, skills, bridge, ledger = make(tmp_path)
+    bridge.config["compression.x"] = old
+    f = Fix("c1", "config", "k", {"key": "compression.x", "value": "1"}, "k")
+    rec = do_apply(f, ledger, bridge, root, skills)
+    assert rec.state == "bridge_error" and "restored" in rec.reason
+    assert repr(bridge.config["compression.x"]) == repr(old)
+    assert not (root / "versions" / "c1" / "after.json").exists()
+    assert not [c for c in bridge.calls if c[0] == "config_set"]
 
 
 def test_fix_id_cannot_escape_versions_dir(tmp_path):

@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from . import policy
-from .bridge import Bridge, BridgeError
+from .bridge import Bridge, BridgeError, encode_config_value
 from .model import Fix
 
 State = Literal["rejected", "shadow_pending", "shadow_failed", "trial", "kept",
@@ -164,6 +164,31 @@ def _norm(v: Any) -> Any:
     return v
 
 
+def _hermes_coerce(s: str) -> Any:
+    """What set_config_value does to a string for a non-string setting."""
+    low = s.lower()
+    if low in ("true", "yes", "on"):
+        return True
+    if low in ("false", "no", "off"):
+        return False
+    if s.isdigit():
+        return int(s)
+    if s.replace(".", "", 1).isdigit():
+        return float(s)
+    return s
+
+
+def _round_trips(old: Any) -> bool:
+    """True when `old` is a scalar that setting it back via its string form restores."""
+    if not isinstance(old, (bool, int, float, str)):
+        return False
+    try:
+        back = _hermes_coerce(encode_config_value(old))
+    except ValueError:
+        return False
+    return type(back) is type(old) and back == old
+
+
 def _same_config(a: Any, b: Any) -> bool:
     return type(_norm(a)) is type(_norm(b)) and _norm(a) == _norm(b)
 
@@ -266,6 +291,7 @@ def apply(fix: Fix, ledger: Ledger, bridge: Bridge, root: Path, now: float,
     elif fix.kind == "config":
         if not isinstance(p.get("key"), str) or "value" not in p:
             raise ValueError("config payload needs a key and a value")
+        encode_config_value(p["value"])  # ValueError for None/list/dict, before any write
     elif fix.kind == "composed_tool":
         spec, program = _tool_files(p)
         job_prompt = p.get("job_prompt")
@@ -296,6 +322,9 @@ def apply(fix: Fix, ledger: Ledger, bridge: Bridge, root: Path, now: float,
             old = bridge.config_get(key)
             if old is None:
                 raise _Failed(f"config key {key!r} has no current value to roll back to")
+            if not _round_trips(old):
+                raise _Failed(f"config key {key!r} current value cannot be restored "
+                              "through `hermes config set`")
             _write_json(vdir / "before.json", {"key": key, "value": old})
             _write_json(after_path, {"key": key, "value": p["value"]})
             bridge.config_set(key, p["value"])
@@ -357,36 +386,45 @@ def rollback(record: FixRecord, ledger: Ledger, bridge: Bridge, root: Path, now:
             _rollback_job(bridge, record.target, before, after, changed)
         elif record.kind == "config":
             cur = bridge.config_get(before["key"])
-            if _same_config(cur, after["value"]):
+            if _same_config(cur, before["value"]):
+                pass  # already restored (a retry)
+            elif _same_config(cur, after["value"]):
                 bridge.config_set(before["key"], before["value"])
             else:
                 changed.append(f"config {before['key']}")
         elif record.kind == "skill":
             path = _resolve_skill(skills_root, after["file"])  # absolute path; re-checked
+            original = base64.b64decode(before["b64"])
             try:
-                same = path.read_bytes() == after["text"].encode("utf-8")
+                cur = path.read_bytes()
             except OSError:
-                same = False
-            if same:
-                _atomic_write(path, base64.b64decode(before["b64"]), before["mode"])
+                cur = None
+            if cur == original:
+                pass  # already restored (a retry)
+            elif cur == after["text"].encode("utf-8"):
+                _atomic_write(path, original, before["mode"])
             else:
                 changed.append("skill file")
         elif record.kind == "composed_tool":
             tools = root / "tools"
             d = tools / after["spec"]["name"]
+            # Job first: if it fails the tool dir is still there for the job to use.
+            if after["job"] is not None:
+                _rollback_job(bridge, record.target, before["job"], after["job"], changed)
             if not d.exists():
                 pass
             elif _tool_matches(tools, after):
                 shutil.rmtree(d)
             else:
                 changed.append("tool dir")
-            if after["job"] is not None:
-                _rollback_job(bridge, record.target, before["job"], after["job"], changed)
         else:
             raise ValueError(f"cannot roll back {record.kind!r}")
     except (BridgeError, _Failed, OSError) as exc:
-        return _set_state(ledger, record, "bridge_error",
-                          f"rollback: {type(exc).__name__}: {exc}")
+        # Stay applied (and active) so the rollback can be retried; parts already
+        # restored are detected and skipped next time.
+        record.reason = f"rollback failed: {type(exc).__name__}: {exc}"
+        ledger.save()
+        return record
     if changed:
         return _set_state(ledger, record, "owner_changed",
                           "owner changed since apply, left alone: " + ", ".join(changed))
@@ -397,6 +435,8 @@ def _rollback_job(bridge: Bridge, job_id: str, before: dict, after: dict,
                   changed: list[str]) -> None:
     mine = _job_updates(before, after)  # the fields apply wrote
     live = _read_job(bridge, job_id)
+    if all(live.get(k) == before[k] for k in mine):
+        return  # already restored (a retry)
     if any(live.get(k) != after[k] for k in mine):
         changed.append(f"job {job_id}")
     elif mine:
