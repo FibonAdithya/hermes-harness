@@ -1,0 +1,7 @@
+name: hermes-tuner
+version: 0.1.0
+description: "Composed tools written by the Hermes tuner, run in a no-network Docker sandbox with their tool calls checked against an allowlist; blocks and records state-changing tools in shadow trial sessions."
+author: fibonadithya
+provides_hooks:
+  - pre_tool_call
+  - on_session_start

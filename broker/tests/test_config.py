@@ -44,3 +44,20 @@ def test_missing_key_is_an_error(tmp_path):
 def test_empty_owner_id_rejected(tmp_path):
     with pytest.raises(ValueError):
         load_config(write(tmp_path, owner_telegram_id=0))
+
+
+def test_tuner_dir_defaults_when_absent(tmp_path):
+    from pathlib import Path
+    assert load_config(write(tmp_path)).tuner_dir == Path("/home/hermes/.hermes/tuner")
+
+
+def test_tuner_dir_can_be_configured(tmp_path):
+    from pathlib import Path
+    assert load_config(write(tmp_path, tuner_dir=str(tmp_path / "t"))).tuner_dir == tmp_path / "t"
+
+
+def test_broker_config_constructs_without_tuner_dir(tmp_path):
+    from pathlib import Path
+    from hermes_broker.config import BrokerConfig
+    cfg = BrokerConfig(1, "t", (), {}, tmp_path)
+    assert cfg.tuner_dir == Path("/home/hermes/.hermes/tuner")

@@ -1,0 +1,8 @@
+[Unit]
+Description=Hermes tuner daily cycle
+
+[Service]
+Type=oneshot
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+TimeoutStartSec=1800
+ExecStart=%h/hermes-harness/tuner/.venv/bin/python -m hermes_tuner run

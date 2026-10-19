@@ -1,0 +1,9 @@
+[Unit]
+Description=Hermes tuner, daily at 03:30 London time
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 Europe/London
+Persistent=false
+
+[Install]
+WantedBy=timers.target

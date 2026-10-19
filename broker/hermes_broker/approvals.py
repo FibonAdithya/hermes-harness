@@ -2,21 +2,25 @@
 
 Grants are issued only from a message that is (a) from the owner's numeric id,
 (b) an exact `approve <4 digits>`, `deploy <7-40 hex>`, `revoke`, or
-`task|solo|drop <4 digits>`, and (c) not forwarded. (c) is the
+`task|solo|drop <4 digits>`, or `tool <4 digits>`, and (c) not forwarded. (c) is the
 defence against As-built #20: text someone else wrote, forwarded in, arrives
 through a channel already vetted as the owner.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
+import unicodedata
+from pathlib import Path
 from typing import Callable
 
 import httpx
 
 from .grants import DEPLOY_GRANT_MINUTES, GrantStore
+from .proposals import ProposalStore, change_hash, record_approval, record_drop, safe_id
 from .tasks import TaskStore
 
 logger = logging.getLogger(__name__)
@@ -25,6 +29,7 @@ _APPROVE = re.compile(r"^approve\s+(\d{4})$", re.IGNORECASE)
 _REVOKE = re.compile(r"^revoke$", re.IGNORECASE)
 _DEPLOY = re.compile(r"^deploy\s+(?:(harness|fleet)\s+)?([0-9a-f]{7,40})$", re.IGNORECASE)
 _TASK = re.compile(r"^(task|solo|drop)\s+(\d{4})$", re.IGNORECASE)
+_TOOL = re.compile(r"^tool\s+(\d{4})$", re.IGNORECASE)
 
 # Any of these on a message means it originated elsewhere.
 _FORWARD_MARKERS = (
@@ -61,6 +66,9 @@ def parse_command(update: dict, owner_id: int) -> tuple[str, str] | None:
     task = _TASK.match(text)
     if task:
         return (task.group(1).lower(), task.group(2))
+    tool = _TOOL.match(text)
+    if tool:
+        return ("tool", tool.group(1))
     if _REVOKE.match(text):
         return ("revoke", "")
     return None
@@ -180,12 +188,31 @@ def handle_task(tasks: TaskStore, verb: str, code: str, now: float, call: Call, 
     return f"{ref}: run_task {task_id} started; it opens a PR that closes #{entry['number']}."
 
 
+def handle_proposal(proposals: ProposalStore, state_dir: Path, verb: str, code: str, now: float) -> str:
+    """Record the owner's `tool`/`drop` reply for a proposal. Nothing is applied
+    here: the tuner reads the record and applies exactly the hashed change. The
+    code is spent only once the record is written."""
+    entry = proposals.peek(code, now)
+    if entry is None:
+        return "No announced tool proposal with that code."
+    pid, h = entry["proposal_id"], entry["hash"]
+    if verb == "drop":
+        record_drop(state_dir / "dropped_proposals.json", pid, h, now)
+        proposals.settle(code, now)
+        return f"Tool proposal {pid} dropped."
+    record_approval(state_dir / "approved_proposals.json", pid, h, now)
+    proposals.settle(code, now)
+    return f"Tool proposal {pid} approved; the tuner applies it on its next run."
+
+
 class Announcer:
     """Posts each fleet:triage issue once, with a code. Lives in the listener
     because getUpdates is single-consumer and this bot is the owner's only channel."""
 
-    def __init__(self, tasks: TaskStore, grants: GrantStore, call: Call, send: Callable[[str], bool]) -> None:
+    def __init__(self, tasks: TaskStore, grants: GrantStore, call: Call, send: Callable[[str], bool],
+                 proposals: ProposalStore | None = None) -> None:
         self.tasks, self.grants, self.call, self.send = tasks, grants, call, send
+        self.proposals = proposals
         self.box_down = False
 
     def tick(self, now: float) -> None:
@@ -204,11 +231,119 @@ class Announcer:
         self.tasks.prune(set(r.get("repos_ok", [])), {(i["repo"], i["number"]) for i in issues}, now)
         for issue in issues:
             code = self.tasks.announce(issue["repo"], issue["slug"], issue["number"], issue["hash"], now,
-                                       avoid=self.grants.pending_codes(now), drop_only=is_drop_only(issue))
+                                       avoid=_avoid_codes(self.grants, None, self.proposals, now),
+                                       drop_only=is_drop_only(issue))
             if code and not self.send(format_announcement(issue, code)):
                 # The send failed: give the code back so the next tick re-announces
                 # instead of the issue silently sitting unannounced for 7 days.
                 self.tasks.take(code, now)
+
+
+def _avoid_codes(grants: GrantStore, tasks: TaskStore | None, proposals: ProposalStore | None,
+                 now: float) -> set[str]:
+    """Every live code in every store that issues codes; a new code must avoid all of them."""
+    out = set(grants.pending_codes(now))
+    if tasks is not None:
+        out |= tasks.live_codes(now)
+    if proposals is not None:
+        out |= proposals.live_codes(now)
+    return out
+
+
+TELEGRAM_MAX = 4096
+
+
+def one_line(text: str) -> str:
+    """`text` as one line: control, format (zero-width), line/paragraph separator
+    and space characters become single spaces, then the reply separator is
+    removed. Tuner text cannot lay out a fake announcement or reply prompt."""
+    out = "".join(" " if unicodedata.category(c) in _FLATTEN else c for c in text)
+    while True:  # a removal or a collapse can join pieces into a new separator
+        prev, out = out, " ".join(out.split()).replace(_TAIL_SEPARATOR, "")
+        if out == prev:
+            return out.strip()
+
+
+_FLATTEN = frozenset({"Cc", "Cf", "Zl", "Zp", "Zs"})
+
+
+def format_proposal(proposal_id: str, why: str, change: dict, code: str) -> str:
+    """Announcement for a tool proposal: the exact change first, then the tuner's
+    `why` on one line (see one_line), then the reply instructions. `why` is
+    trimmed first when the whole text would pass Telegram's limit. The change is
+    never trimmed: the owner approves exactly what is shown. Raises ValueError when
+    the change alone does not fit, or itself contains the separator."""
+    canon = json.dumps(change, sort_keys=True, separators=(",", ":"))
+    if _TAIL_SEPARATOR in canon:
+        raise ValueError("change contains the reply separator")
+    head = f"Tool proposal {proposal_id}\n\nChange: {canon}\n\n"
+    tail = f"\n\n{_TAIL_SEPARATOR}\ncode {code}\ntool {code} | drop {code}"
+    room = TELEGRAM_MAX - len(head) - len(tail)
+    if room < 0:
+        raise ValueError("change is too long to show in full")
+    why = one_line(why)
+    if len(why) > room:
+        mark = " [… trimmed]"
+        why = why[:max(room - len(mark), 0)] + mark[:room]
+    return head + why + tail
+
+
+class TunerAnnouncer:
+    """Announces the tuner's proposals and sends its weekly outbox. Needs only local
+    files and the send function: it works with no tig-server wiring and when
+    list_triage fails (R14)."""
+
+    def __init__(self, proposals: ProposalStore, avoid_fn: Callable[[float], set[str]], tuner_dir: Path,
+                 send: Callable[[str], bool]) -> None:
+        self.proposals, self.avoid_fn, self.tuner_dir, self.send = proposals, avoid_fn, Path(tuner_dir), send
+
+    def tick(self, now: float) -> None:
+        for part in (self._announce_proposals, self._send_outbox):
+            try:
+                part(now)
+            except Exception:
+                logger.exception("tuner announcer: %s failed", part.__name__)
+
+    def _announce_proposals(self, now: float) -> None:
+        for path in sorted((self.tuner_dir / "proposals").glob("*.json")):
+            try:
+                doc = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                logger.warning("skipping unreadable proposal %s", path.name)
+                continue
+            pid, change = (doc.get("id"), doc.get("change")) if isinstance(doc, dict) else (None, None)
+            if not safe_id(pid) or pid != path.stem or not isinstance(change, dict):
+                logger.warning("skipping malformed proposal %s", path.name)
+                continue
+            why = doc.get("why")
+            why = why if isinstance(why, str) else ""
+            try:
+                # Fail before a code is issued if the text cannot be shown in full.
+                format_proposal(pid, why, change, "0000")
+                h = change_hash(change)
+            except (ValueError, TypeError):
+                logger.warning("proposal %s cannot be announced in full; skipping", pid)
+                continue
+            code = self.proposals.announce(pid, h, now, avoid=self.avoid_fn(now))
+            if code and not self.send(format_proposal(pid, why, change, code)):
+                # Give the code back so the next tick re-announces.
+                self.proposals.take(code, now)
+
+    def _send_outbox(self, now: float) -> None:
+        for path in sorted((self.tuner_dir / "outbox").glob("*.txt")):
+            try:
+                # One line with no reply separator (as in format_proposal), so the
+                # text cannot lay out fake reply instructions in front of the owner.
+                text = one_line(path.read_text(encoding="utf-8"))[:TELEGRAM_MAX]
+            except (OSError, ValueError):
+                logger.warning("skipping unreadable outbox file %s", path.name)
+                continue
+            if not text.strip():
+                path.rename(path.with_suffix(".sent"))
+                continue
+            if not self.send(text):
+                return  # leave this and the later files for the next tick, in order
+            path.rename(path.with_suffix(".sent"))
 
 
 def _send(client: httpx.Client, token: str, chat_id: int, text: str) -> bool:
@@ -243,6 +378,8 @@ def _dispatch(
     call: Call | None,
     repos: tuple[str, ...],
     now_fn: Callable[[], float],
+    proposals: ProposalStore | None = None,
+    state_dir: Path | None = None,
 ) -> str | None:
     """Route one parsed update to its handler; None means nothing to send.
 
@@ -258,6 +395,15 @@ def _dispatch(
     if parsed is None:
         return None
     verb, arg = parsed
+    if verb == "tool" or (verb == "drop" and proposals is not None
+                          and arg in proposals.live_codes(now_fn())):
+        if proposals is None or state_dir is None:
+            return None
+        try:
+            return handle_proposal(proposals, Path(state_dir), verb, arg, now_fn())
+        except Exception as exc:
+            logger.exception("handle_proposal failed")
+            return f"tool reply failed: {exc}"
     if verb in TASK_VERBS:
         if tasks is None or call is None:
             return None
@@ -278,13 +424,23 @@ def run_listener(
     tasks: TaskStore | None = None,
     call: Call | None = None,
     repos: tuple[str, ...] = (),
+    proposals: ProposalStore | None = None,
+    tuner_dir: Path | None = None,
+    state_dir: Path | None = None,
 ) -> None:
     offset = 0
     last_announce = 0.0
+    last_tuner = 0.0
     with httpx.Client() as client:
         announcer = None
+        tuner_announcer = None
         if tasks is not None and call is not None:
-            announcer = Announcer(tasks, store, call, lambda text: _send(client, token, owner_id, text))
+            announcer = Announcer(tasks, store, call, lambda text: _send(client, token, owner_id, text),
+                                  proposals=proposals)
+        if proposals is not None and tuner_dir is not None:
+            tuner_announcer = TunerAnnouncer(
+                proposals, lambda t: _avoid_codes(store, tasks, proposals, t), tuner_dir,
+                lambda text: _send(client, token, owner_id, text))
         while True:
             try:
                 response = client.get(
@@ -301,7 +457,7 @@ def run_listener(
 
             for update in updates:
                 offset = max(offset, update.get("update_id", 0) + 1)
-                reply = _dispatch(update, owner_id, store, tasks, call, repos, time.time)
+                reply = _dispatch(update, owner_id, store, tasks, call, repos, time.time, proposals, state_dir)
                 if reply is not None:
                     _send(client, token, owner_id, reply)
             now = time.time()
@@ -312,3 +468,9 @@ def run_listener(
                 except Exception:
                     # The announcer must never take grant approval down with it.
                     logger.exception("announcer tick failed")
+            if tuner_announcer is not None and now - last_tuner >= ANNOUNCE_EVERY:
+                last_tuner = now
+                try:
+                    tuner_announcer.tick(now)
+                except Exception:
+                    logger.exception("tuner announcer tick failed")
