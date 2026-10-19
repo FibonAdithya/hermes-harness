@@ -17,13 +17,15 @@ from .budget import DAY, JOB_KINDS, iso_week_start, job_runs, savings, tuner_spe
 from .detect import SCHEMA_TOOL, SKILL_TOOL, Candidate, detect
 from .draft import draft
 from .fingerprint import CopyIndex
-from .ledger import FixRecord, _Failed, _write_tool_dir, apply, needs_restart
+from .ledger import FixRecord, _Failed, apply, needs_restart, write_shadow_tool
 from .limits import LimitContext, check_fix
 from .measure import priced_cost
 from .model import Fix, Session
 from .proposals import approved_callables, write_proposal
 
 COPY_INDEX_DAYS = 14
+BASE_KEY = "_base"  # Fix payload key: the job as drafted against; never sent to Hermes
+PLUGIN_NOT_LOADED = "plugin not loaded; shadow not scheduled"
 GLOBAL_KINDS = frozenset({"config", "skill"})
 GLOBAL_CANDIDATES = ("schema_lookup", "skill_load")
 JOB_CANDIDATES = ("sequence", "reread")
@@ -130,6 +132,9 @@ class DraftSteps:
         """Draft, check and act on one candidate. Returns (spend, shadow scheduled)."""
         job = None
         if cand.job_id is not None:
+            if not self.plugin_loaded():  # a job fix needs a guarded shadow run (F4)
+                self.err(PLUGIN_NOT_LOADED)
+                return 0.0, False
             try:
                 job = self.bridge.get_job(cand.job_id)
             except BridgeError as exc:
@@ -224,15 +229,23 @@ class DraftSteps:
         return reasons + check_fix(fix, ctx)
 
     def _shadow(self, fix: Fix, job: dict | None, spend: float) -> bool:
+        if job is not None:  # F8: remember what the fix was drafted against
+            fix = Fix(fix.id, fix.kind, fix.target, dict(fix.payload) | {BASE_KEY: {
+                "prompt": job.get("prompt"), "enabled_toolsets": job.get("enabled_toolsets")}},
+                fix.candidate_key)
         rec = self._record(fix, "shadow_pending", spend, "")
         if job is None:  # unreachable: job fixes come only from job candidates
             self._close(rec, "rejected", "no job to shadow")
             self.report.rejected.append(rec.id)
             return False
+        if not self.plugin_loaded():  # unreachable: _draft_one checked it
+            self._close(rec, "rejected", PLUGIN_NOT_LOADED)
+            self.err(PLUGIN_NOT_LOADED)
+            return False
         files = self._shadow_tool(fix)
         try:
-            if files is not None:  # the shadow run needs the tool to exist
-                _write_tool_dir(self.root / "tools", files[0]["name"], *files)
+            if files is not None:  # the shadow run needs the tool; shadow-only until go-live
+                write_shadow_tool(self.root / "tools", fix.payload)
             trial.schedule_shadow(fix, job, self.bridge, self.root, self.now)
         except (ValueError, OSError) as exc:
             self._remove_shadow_tool(rec)

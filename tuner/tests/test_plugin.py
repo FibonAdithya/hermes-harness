@@ -325,3 +325,52 @@ def test_handler_declared_but_unlisted_call_refused_until_approved(home, local_r
         [{"proposal_id": "p1", "hash": proposals.change_hash(change), "approved_at": "x"}]))
     assert json.loads(h({}, session_id="s1")) == {"result": {"ok": "web_fetch"}}
     assert [n for n, _, _ in ctx.dispatched] == ["web_fetch"]
+
+
+# --- shadow-only tools (F3) and the heartbeat (F4) ---------------------------
+
+def test_shadow_only_tool_refused_outside_shadow_sessions(home, local_runner):
+    shadow_jobs_by_name(home)
+    ctx = FakeCtx()
+    d = add_tool(home, "tuned_t", calls=(SEARCH, LABELS), mutating=True, program=MUTATE)
+    spec = json.loads((d / "tool.json").read_text())
+    (d / "tool.json").write_text(json.dumps(dict(spec, shadow_only=True)))
+    local_runner.register(ctx)
+    h = ctx.tools["tuned_t"]["handler"]
+    out = json.loads(h({"q": "a"}, task_id="t", session_id=LIVE_SID))
+    assert "error" in out and "shadow" in out["error"]
+    assert ctx.dispatched == []
+    # in a shadow session it runs (as a dry run)
+    out = json.loads(h({"q": "a"}, task_id="t", session_id=SHADOW_SID))
+    assert out == {"result": {"dry_run": True}}
+    assert [n for n, _, _ in ctx.dispatched] == [SEARCH]
+
+
+def test_shadow_only_must_be_a_boolean(home):
+    plugin = load_plugin()
+    d = add_tool(home, "tuned_t")
+    spec = json.loads((d / "tool.json").read_text())
+    (d / "tool.json").write_text(json.dumps(dict(spec, shadow_only="yes")))
+    ctx = FakeCtx()
+    plugin.register(ctx)
+    assert ctx.tools == {}
+
+
+def test_register_writes_heartbeat(home):
+    import os
+    plugin = load_plugin()
+    t0 = time.time()
+    plugin.register(FakeCtx())
+    beat = json.loads((home / "tuner" / "plugin_heartbeat.json").read_text())
+    assert beat["pid"] == os.getpid()
+    assert t0 <= beat["registered_at"] <= time.time()
+    assert not [p for p in (home / "tuner").iterdir() if p.name.startswith(".tmp")]
+
+
+def test_heartbeat_failure_does_not_raise(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "tuner").write_text("a file, not a dir")
+    plugin = load_plugin()
+    ctx = FakeCtx()
+    plugin.register(ctx)
+    assert sorted(h for h, _ in ctx.hooks) == ["on_session_start", "pre_tool_call"]

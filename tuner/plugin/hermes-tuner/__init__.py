@@ -9,10 +9,16 @@
   blocks tools that would change anything and records them (spec 4.5).
   `ctx.dispatch_tool` skips that hook, so the composed-tool handler forces a
   dry run itself in shadow sessions.
+- A tool whose tool.json has `"shadow_only": true` (written when its shadow run
+  is scheduled, before its quality check) runs only in shadow sessions; anywhere
+  else the handler refuses it. Go-live rewrites tool.json without the flag.
 - `on_session_start` -> re-scan the tools dir (spec 4.7).
+- `register` writes `$HERMES_HOME/tuner/plugin_heartbeat.json` =
+  {"pid", "registered_at"}; the cycle schedules shadows and applies composed
+  tools only when it is newer than the last gateway restart.
 
 Never raises into Hermes's plugin loader. Never writes outside
-`$HERMES_HOME/tuner/shadow/`.
+`$HERMES_HOME/tuner/shadow/` and `$HERMES_HOME/tuner/plugin_heartbeat.json`.
 """
 from __future__ import annotations
 
@@ -21,6 +27,7 @@ import logging
 import os
 import re
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -229,15 +236,17 @@ def load_tool(tool_dir: Path) -> dict | None:
         return None
     desc, params = spec.get("description"), spec.get("parameters")
     calls, mutating = spec.get("calls"), spec.get("mutating")
+    shadow_only = spec.get("shadow_only", False)
     if (not isinstance(desc, str) or not isinstance(params, dict)
             or not isinstance(calls, list) or not all(isinstance(c, str) for c in calls)
-            or not isinstance(mutating, bool)):
+            or not isinstance(mutating, bool) or not isinstance(shadow_only, bool)):
         logger.warning("hermes-tuner: skipping %s: tool.json fields invalid", name)
         return None
     # A tool that may call a mutating tool is mutating whatever it declares.
     mutating = mutating or any(c in policy.MUTATING_TOOLS for c in calls)
     return {"name": name, "description": desc, "parameters": params,
-            "calls": frozenset(calls), "mutating": mutating, "program": program}
+            "calls": frozenset(calls), "mutating": mutating, "program": program,
+            "shadow_only": shadow_only}
 
 
 def _schema(spec: dict) -> dict:
@@ -262,6 +271,9 @@ def _make_handler(ctx, tool_dir: Path):
             args = dict(args) if isinstance(args, dict) else {}
             wants_dry = args.pop("dry_run", None) is True
             shadow = shadow_root(session_id)
+            if spec["shadow_only"] and shadow is None:
+                return json.dumps({"error": f"{tool_dir.name} is in a shadow trial and "
+                                            "runs only in shadow sessions"})
             dry_run = shadow is not None or (spec["mutating"] and wants_dry)
             callable_now = policy.CALLABLE_TOOLS | proposals.approved_callables(
                 tuner_root(), broker_state())
@@ -319,7 +331,28 @@ def scan(ctx) -> list[str]:
     return names
 
 
+def write_heartbeat() -> None:
+    """Atomically write {"pid", "registered_at"} to tuner/plugin_heartbeat.json.
+    Never raises."""
+    try:
+        root = tuner_root()
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=root, prefix=".tmp-heartbeat-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"pid": os.getpid(), "registered_at": time.time()}, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, root / "plugin_heartbeat.json")
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
+    except Exception:  # noqa: BLE001
+        logger.exception("hermes-tuner: could not write the heartbeat")
+
+
 def register(ctx) -> None:
+    write_heartbeat()
     scan(ctx)
     ctx.register_hook("pre_tool_call", shadow_guard)
 

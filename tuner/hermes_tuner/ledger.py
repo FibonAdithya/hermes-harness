@@ -292,6 +292,30 @@ def _write_tool_dir(tools: Path, name: str, spec: dict, program: str) -> None:
         raise
 
 
+def shadow_tool_spec(spec: dict) -> dict:
+    """tool.json as written at shadow scheduling: the plugin refuses the tool outside
+    shadow sessions until go-live rewrites it without the flag (F3)."""
+    return dict(spec, shadow_only=True)
+
+
+def write_shadow_tool(tools: Path, payload: dict) -> str:
+    """Write a composed_tool payload's tool dir for its shadow run, flagged
+    shadow_only. Returns the tool name. Raises ValueError for a bad payload and
+    _Failed if the tool already exists."""
+    spec, program = _tool_files(payload)
+    _write_tool_dir(Path(tools), spec["name"], shadow_tool_spec(spec), program)
+    return spec["name"]
+
+
+def is_shadow_tool(tools: Path, payload: dict) -> bool:
+    """True when `tools` holds exactly this payload's shadow-only tool dir."""
+    try:
+        spec, program = _tool_files(payload)
+    except ValueError:
+        return False
+    return _tool_matches(Path(tools), {"spec": shadow_tool_spec(spec), "program": program})
+
+
 def _tool_matches(tools: Path, after: dict) -> bool:
     d = tools / after["spec"]["name"]
     try:
@@ -388,7 +412,11 @@ def apply(fix: Fix, ledger: Ledger, bridge: Bridge, root: Path, now: float,
                 after["job"] = job_after_for(fix, live)
             _write_json(vdir / "before.json", before)
             _write_json(after_path, after)
-            _write_tool_dir(tools, spec["name"], spec, program)
+            if is_shadow_tool(tools, p):  # written at shadow scheduling: drop the flag
+                atomic_write(tools / spec["name"] / "tool.json",
+                             json.dumps(spec, indent=2).encode())
+            else:
+                _write_tool_dir(tools, spec["name"], spec, program)
             undo = lambda: shutil.rmtree(tools / spec["name"], ignore_errors=True)  # noqa: E731
             if job_prompt is not None:
                 bridge.update_job(fix.target, _job_updates(before["job"], after["job"]))

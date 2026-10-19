@@ -29,11 +29,11 @@ from statistics import median
 from . import policy, trial
 from .bridge import Bridge, BridgeError
 from .budget import DAY, JOB_KINDS, weekly_line
-from .cycle_draft import GLOBAL_KINDS, DraftSteps
+from .cycle_draft import BASE_KEY, GLOBAL_KINDS, DraftSteps
 from .fingerprint import CopyIndex
 from .history import History, HistoryUnavailable
-from .ledger import (APPLIED_STATES, FixRecord, Ledger, _tool_files, _tool_matches, apply, atomic_write,
-                     rollback)
+from .ledger import (APPLIED_STATES, FixRecord, Ledger, _tool_files, apply, atomic_write,
+                     is_shadow_tool, rollback)
 from .measure import priced_cost
 from .model import Fix, Session
 from .proposals import apply_approved, approved, dropped
@@ -47,6 +47,8 @@ NO_LIVE_RUN_S = 3 * DAY    # a shadow with no live run to compare 3 days after r
 ERROR_KEEP_S = 28 * DAY
 RESTART_KEEP_S = 28 * DAY
 STATE_FILE = "cycle_state.json"
+HEARTBEAT_FILE = "plugin_heartbeat.json"   # written by the plugin at register()
+PLUGIN_NAME = "hermes-tuner"
 
 
 @dataclass(frozen=True)
@@ -105,6 +107,7 @@ class _Cycle(DraftSteps):
         self.history: History | None = None
         self.sessions: list[Session] = []
         self._copy_index: CopyIndex | None = None
+        self._plugin_ok: bool | None = None
 
     # --- plumbing -----------------------------------------------------------------
 
@@ -140,6 +143,32 @@ class _Cycle(DraftSteps):
     def _close(self, rec: FixRecord, state: str, reason: str) -> None:
         rec.state, rec.reason = state, reason  # type: ignore[assignment]
         self.ledger.save()
+
+    def plugin_loaded(self) -> bool:
+        """True when Hermes's config enables the tuner plugin AND the plugin's
+        heartbeat is at or after the last recorded gateway restart (if any), i.e.
+        the running gateway loaded it. Checked once per cycle, before the restart
+        step; shadows and composed tools are unsafe without the guard (F4)."""
+        if self._plugin_ok is None:
+            self._plugin_ok = self._check_plugin()
+        return self._plugin_ok
+
+    def _check_plugin(self) -> bool:
+        try:
+            enabled = self.bridge.config_get("plugins.enabled")
+        except BridgeError:
+            return False
+        if not isinstance(enabled, list) or PLUGIN_NAME not in enabled:
+            return False
+        try:
+            beat = json.loads((self.root / HEARTBEAT_FILE).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        t = beat.get("registered_at") if isinstance(beat, dict) else None
+        if not isinstance(t, (int, float)) or isinstance(t, bool):
+            return False
+        restarts = self._restart_times()
+        return not restarts or t >= max(restarts)
 
     def _global_active(self) -> bool:
         return any(r.kind in GLOBAL_KINDS and r.state in ("shadow_pending", "trial", "applied")
@@ -297,28 +326,55 @@ class _Cycle(DraftSteps):
             return None
 
     def _remove_shadow_tool(self, rec: FixRecord) -> None:
-        """Remove the tool dir written for a composed_tool shadow, if it is still ours."""
+        """Remove the shadow-only tool dir written for a composed_tool shadow, if it
+        is still exactly ours."""
         try:
-            files = self._shadow_tool(self.ledger.fix(rec.id))
+            fix = self.ledger.fix(rec.id)
         except (OSError, ValueError, TypeError):
             return
+        files = self._shadow_tool(fix)
         if files is None:
             return
-        spec, program = files
         tools = self.root / "tools"
-        if _tool_matches(tools, {"spec": spec, "program": program}):
-            shutil.rmtree(tools / spec["name"], ignore_errors=True)
+        if is_shadow_tool(tools, fix.payload):
+            shutil.rmtree(tools / files[0]["name"], ignore_errors=True)
+
+    def _owner_changed_job(self, fix: Fix) -> bool | None:
+        """True when the live job's prompt or toolsets differ from the `_base` recorded
+        at scheduling (the owner edited it since); None when it cannot be read."""
+        base = fix.payload.get(BASE_KEY) if isinstance(fix.payload, dict) else None
+        if not isinstance(base, dict):
+            return False  # recorded before _base existed
+        try:
+            live = self.bridge.get_job(fix.target)
+        except BridgeError as exc:
+            self.err(f"get_job {fix.target}: {exc}")
+            return None
+        if live is None:
+            return False  # apply reports the missing job
+        return any(live.get(k) != base.get(k) for k in ("prompt", "enabled_toolsets"))
 
     def _go_live(self, rec: FixRecord) -> None:
         if self.dry:
             self.plan(f"apply {rec.id}")
             return
         fix = self.ledger.fix(rec.id)
-        self._remove_shadow_tool(rec)  # apply writes it again, with before/after saved
-        try:
+        if fix.kind == "composed_tool" and not self.plugin_loaded():
+            self.err(f"plugin not loaded; {rec.id} not applied")
+            return  # stays shadow_pending; retried next cycle
+        changed = self._owner_changed_job(fix)
+        if changed is None:
+            return
+        if changed:
+            self._remove_shadow_tool(rec)
+            self._close(rec, "owner_changed",
+                        "owner changed the job after drafting; not applied")
+            return
+        try:  # apply rewrites a shadow-only tool dir without the flag
             out = apply(fix, self.ledger, self.bridge, self.root, self.now,
                         skills_root=self.cfg.skills_root)
         except ValueError as exc:
+            self._remove_shadow_tool(rec)
             self._close(rec, "rejected", f"apply refused: {exc}")
             self.report.rejected.append(rec.id)
             return

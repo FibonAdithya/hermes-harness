@@ -12,9 +12,9 @@ import pytest
 from factory import make_db
 from hermes_tuner import policy
 from hermes_tuner.__main__ import main
-from hermes_tuner.bridge import FakeBridge
+from hermes_tuner.bridge import FakeBridge as _FakeBridge
 from hermes_tuner.cycle import CycleConfig, run_cycle, weekly_line
-from hermes_tuner.ledger import FixRecord, Ledger, _tool_files, _write_tool_dir
+from hermes_tuner.ledger import FixRecord, Ledger, _tool_files, write_shadow_tool
 from hermes_tuner.model import Fix, Session, ToolCall
 from hermes_tuner.proposals import change_hash
 
@@ -29,6 +29,20 @@ ARG_SENTINEL = "ZZ_SENTINEL_q"
 ALL_METHODS = {"scan", "get_job", "list_jobs", "update_job", "create_job", "remove_job",
                "config_get", "config_set", "config_set_json", "oneshot", "restart_gateway"}
 CFG_KEY = "compression.threshold"
+PLUGINS = "plugins.enabled"
+
+
+def FakeBridge(*args, config=None, **kw):
+    """A FakeBridge whose Hermes config enables the tuner plugin (F4), unless the
+    test's own config says otherwise."""
+    return _FakeBridge(*args, config={PLUGINS: ["hermes-tuner"], **(config or {})}, **kw)
+
+
+def heartbeat(cfg, registered_at):
+    """What the plugin writes at register() (F4)."""
+    cfg.root.mkdir(parents=True, exist_ok=True)
+    (cfg.root / "plugin_heartbeat.json").write_text(
+        json.dumps({"pid": 4242, "registered_at": registered_at}))
 
 
 def sid(job, t):
@@ -101,6 +115,7 @@ def env(tmp_path):
     cfg = CycleConfig(root=home / "tuner", db=home / "state.db",
                       broker_state=home / "broker" / "state", skills_root=home / "skills",
                       dry_run=False)
+    heartbeat(cfg, NOW - 60)  # the gateway (and the plugin) last started a minute ago
     return cfg
 
 
@@ -119,7 +134,7 @@ def oneshots(bridge):
 
 
 def mutating(bridge):
-    return [c for c in bridge.calls if c[0] in FakeBridge.MUTATING]
+    return [c for c in bridge.calls if c[0] in _FakeBridge.MUTATING]
 
 
 # --- one active fix per job ----------------------------------------------------------
@@ -143,10 +158,15 @@ def test_cycle_drafts_and_shadows_when_job_is_free(env):
     bridge = FakeBridge(jobs=jobs(), oneshot_script=[reply(JOB_PROMPT_REPLY)])
     report = run_cycle(env, bridge, NOW)
     assert len(oneshots(bridge)) == 1
-    (rec,) = Ledger.load(env.root).records
+    led = Ledger.load(env.root)
+    (rec,) = led.records
     assert rec.state == "shadow_pending" and rec.target == TRIAGE and rec.spend_usd > 0
     assert [c for c in bridge.calls if c[0] == "create_job"]
     assert report.shadowed == [rec.id] and report.errors == []
+    # F8: the drafted-against job is recorded, and never written to Hermes
+    assert led.fix(rec.id).payload["_base"] == {"prompt": "Triage the inbox.",
+                                                "enabled_toolsets": ["google"]}
+    assert "_base" not in json.dumps(bridge.calls)
 
 
 # --- budget ------------------------------------------------------------------------------
@@ -248,7 +268,7 @@ def test_bridge_failure_mid_apply_records_bridge_error(env):
 
 def test_second_concurrent_run_exits(env, monkeypatch, capsys):
     build(env, triage_runs())
-    env.root.mkdir(parents=True)
+    env.root.mkdir(parents=True, exist_ok=True)
     with open(env.root / ".lock", "a") as held:
         fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
         bridge = FakeBridge(jobs=jobs(), oneshot_script=[reply(JOB_PROMPT_REPLY)])
@@ -417,13 +437,13 @@ def shadow_setup(env, old_mod, new_mod, composed=False, live=True, base_runs=Non
                                    (GET, {"message_id": "m2"}, "b")] + old_mod})
     build(env, sessions)
     SETUP_SESSIONS[env.root] = sessions
+    base = {"_base": {"prompt": "Triage the inbox.", "enabled_toolsets": ["google"]}}
     if composed:
-        fix = Fix("20261018-bbbb0002", "composed_tool", TRIAGE, dict(TOOL), "seq:x")
-        spec, program = _tool_files(fix.payload)
-        _write_tool_dir(env.root / "tools", spec["name"], spec, program)
+        fix = Fix("20261018-bbbb0002", "composed_tool", TRIAGE, dict(TOOL) | base, "seq:x")
+        write_shadow_tool(env.root / "tools", fix.payload)
     else:
         fix = Fix("20261018-bbbb0001", "job_prompt", TRIAGE,
-                  {"prompt": "new prompt", "add_toolsets": []}, "seq:x")
+                  {"prompt": "new prompt", "add_toolsets": []} | base, "seq:x")
     add_record(env, FixRecord(fix.id, fix.kind, TRIAGE, "seq:x", "shadow_pending",
                               NOW - DAY - 3600, spend_usd=0.01, needs_restart=composed), fix)
     (env.root / "shadow_jobs.json").write_text(json.dumps({SHADOW_JOB: {
@@ -512,6 +532,8 @@ def test_composed_shadow_requests_restart(env):
     (rec,) = Ledger.load(env.root).records
     assert rec.state == "shadow_pending" and rec.needs_restart
     assert (env.root / "tools" / "tuned_triage" / "program.py").exists()
+    assert json.loads((env.root / "tools" / "tuned_triage" / "tool.json").read_text())[
+        "shadow_only"] is True  # F3: not callable outside the shadow until go-live
     assert bridge.calls.count(("restart_gateway", ())) == 1 and report.restarted
     assert state(env)["restart_times"] == [NOW] and state(env)["pending_restart"] is False
     (entry,) = json.loads((env.root / "shadow_jobs.json").read_text()).values()
@@ -715,13 +737,13 @@ def test_later_unrelated_restart_does_not_fail_waiting_shadow(env):
                      "calls": [(GET, {"message_id": "m1"}, "b"), (GET, {"message_id": "m2"}, "b")]})
     env.db.unlink()
     build(env, sessions)
+    heartbeat(env, NOW + 1)  # the plugin reloaded at that restart
     run_cycle(env, FakeBridge(jobs=jobs(), config={INCLUDE: ["x_tool"]}), NOW + 3600)
     assert Ledger.load(env.root).get(fix.id).state == "trial"
 
 
 def test_restart_times_pruned_to_28_days(env):
     build(env, triage_runs())
-    (env.root).mkdir(parents=True)
     (env.root / "cycle_state.json").write_text(json.dumps(
         {"restart_times": [NOW - 29 * DAY, NOW - 27 * DAY], "pending_restart": True}))
     run_cycle(env, FakeBridge(jobs=jobs()), NOW)
@@ -749,11 +771,80 @@ def test_composed_shadow_restarted_in_its_scheduling_cycle_reaches_trial(env):
                      "calls": calls})
     env.db.unlink()
     build(env, sessions)
+    heartbeat(env, NOW + 1)  # the restart in cycle 1 reloaded the plugin
     b2 = FakeBridge(jobs=jobs())
     r2 = run_cycle(env, b2, run_at + 7200)
     (rec,) = Ledger.load(env.root).records
     assert rec.state == "trial" and rec.kind == "composed_tool", rec.reason
     assert rec.id in r2.applied
     assert (env.root / "tools" / "tuned_triage" / "program.py").exists()
+    assert "shadow_only" not in json.loads(
+        (env.root / "tools" / "tuned_triage" / "tool.json").read_text())
     assert b2.jobs[TRIAGE]["prompt"] == "new prompt"
     assert "tuner" in b2.jobs[TRIAGE]["enabled_toolsets"]
+
+
+# --- F4: shadows and composed tools need the plugin loaded -------------------------------
+
+@pytest.mark.parametrize("plugins, beat", [
+    (None, NOW - 60),                     # plugins.enabled unset
+    (["other-plugin"], NOW - 60),         # enabled list without hermes-tuner
+    ("hermes-tuner", NOW - 60),           # not a list
+    (["hermes-tuner"], None),             # no heartbeat
+    (["hermes-tuner"], NOW - 2 * DAY),    # heartbeat older than the last restart
+])
+def test_no_shadow_scheduled_without_the_plugin(env, plugins, beat):
+    build(env, triage_runs())
+    (env.root / "plugin_heartbeat.json").unlink()
+    if beat is not None:
+        heartbeat(env, beat)
+    (env.root / "cycle_state.json").write_text(json.dumps({"restart_times": [NOW - DAY]}))
+    bridge = _FakeBridge(jobs=jobs(), config={PLUGINS: plugins} if plugins else {},
+                         oneshot_script=[reply(JOB_PROMPT_REPLY)])
+    report = run_cycle(env, bridge, NOW)
+    assert "plugin not loaded; shadow not scheduled" in report.errors
+    assert not [c for c in bridge.calls if c[0] in ("create_job", "oneshot")]
+    assert report.shadowed == []
+
+
+def test_shadow_scheduled_when_heartbeat_follows_the_last_restart(env):
+    """Control for the test above: same restart, fresh heartbeat."""
+    build(env, triage_runs())
+    (env.root / "cycle_state.json").write_text(json.dumps({"restart_times": [NOW - DAY]}))
+    heartbeat(env, NOW - DAY)  # registered at the restart itself: loaded
+    bridge = FakeBridge(jobs=jobs(), oneshot_script=[reply(JOB_PROMPT_REPLY)])
+    report = run_cycle(env, bridge, NOW)
+    assert len(report.shadowed) == 1 and report.errors == []
+
+
+def test_composed_go_live_waits_for_the_plugin(env):
+    fix = shadow_setup(env, old_mod=[], new_mod=[], composed=True)
+    (env.root / "cycle_state.json").write_text(json.dumps({"restart_times": [SHADOW_T - 3600]}))
+    heartbeat(env, SHADOW_T - 7200)  # from before that restart: plugin not reloaded
+    bridge = FakeBridge(jobs=jobs())
+    report = run_cycle(env, bridge, NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert rec.state == "shadow_pending" and rec.applied_at is None
+    assert any(e.startswith("plugin not loaded") for e in report.errors)
+    assert bridge.jobs[TRIAGE]["prompt"] == "Triage the inbox."
+
+
+# --- F8: an owner edit after drafting stops go-live ---------------------------------------
+
+@pytest.mark.parametrize("field, value", [("prompt", "Owner's new triage prompt."),
+                                          ("enabled_toolsets", ["google", "web"])])
+@pytest.mark.parametrize("composed", [False, True])
+def test_owner_edit_after_drafting_closes_owner_changed(env, field, value, composed):
+    fix = shadow_setup(env, old_mod=[], new_mod=[], composed=composed)
+    if composed:
+        (env.root / "cycle_state.json").write_text(
+            json.dumps({"restart_times": [SHADOW_T - 3600]}))
+    js = jobs()
+    js[TRIAGE][field] = value
+    bridge = FakeBridge(jobs=js)
+    run_cycle(env, bridge, NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert rec.state == "owner_changed" and rec.applied_at is None
+    assert bridge.jobs[TRIAGE][field] == value
+    assert not [c for c in bridge.calls if c[0] == "update_job"]
+    assert not (env.root / "tools" / "tuned_triage").exists()

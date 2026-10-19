@@ -220,6 +220,32 @@ def test_composed_tool_apply_writes_tool_dir_and_rollback_removes_it(tmp_path):
     assert out.state == "rolled_back" and not d.exists()
 
 
+def test_go_live_rewrites_shadow_only_tool_without_the_flag(tmp_path):
+    """F3: the tool dir written at shadow scheduling carries shadow_only; apply at
+    go-live rewrites tool.json without it (and rollback still recognises it)."""
+    from hermes_tuner.ledger import _tool_files, write_shadow_tool
+    root, skills, bridge, ledger = make(tmp_path)
+    f = Fix("t1", "composed_tool", JOB, tool_payload(), "k")
+    write_shadow_tool(root / "tools", f.payload)
+    d = root / "tools" / "tuned_x"
+    assert json.loads((d / "tool.json").read_text())["shadow_only"] is True
+    rec = do_apply(f, ledger, bridge, root, skills)
+    assert rec.state == "trial"
+    assert json.loads((d / "tool.json").read_text()) == _tool_files(f.payload)[0]
+    assert do_rollback(rec, ledger, bridge, root, skills).state == "rolled_back"
+    assert not d.exists()
+
+
+def test_apply_refuses_a_foreign_tool_dir_of_the_same_name(tmp_path):
+    from hermes_tuner.ledger import write_shadow_tool
+    root, skills, bridge, ledger = make(tmp_path)
+    write_shadow_tool(root / "tools", tool_payload() | {"program": "print(2)\n"})
+    rec = do_apply(Fix("t1", "composed_tool", JOB, tool_payload(), "k"),
+                   ledger, bridge, root, skills)
+    assert rec.state == "bridge_error" and "already exists" in rec.reason
+    assert (root / "tools" / "tuned_x" / "program.py").read_text() == "print(2)\n"
+
+
 def test_composed_tool_with_job_prompt_updates_and_restores_job(tmp_path):
     root, skills, bridge, ledger = make(tmp_path)
     f = Fix("t1", "composed_tool", JOB, tool_payload(job_prompt=NEW), "k")
