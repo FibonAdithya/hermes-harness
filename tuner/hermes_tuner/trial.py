@@ -121,7 +121,7 @@ def schedule_shadow(fix: Fix, job: dict, bridge: Bridge, root: Path, now: float)
     try:
         entries = _read_entries(root)
         entries[shadow_id] = {"fix_id": fix.id, "live_job_id": job.get("id"),
-                              "run_at": run_at, "created_at": now}
+                              "run_at": run_at, "created_at": now, "scheduled_at": now}
         _write_entries(root, entries)
     except BaseException:
         try:
@@ -298,7 +298,8 @@ def baseline_stats(sessions: list[Session], job_id: str, applied_at: float) -> J
 
 def trial_verdict(record: FixRecord, stats_now: JobStats | None,
                   prompt_baseline: float) -> Literal["continue", "keep", "rollback"]:
-    """`stats_now` covers only runs after `record.applied_at`.
+    """`stats_now` covers only runs after `record.live_from` (when the fix took
+    effect: applied_at, or the gateway restart for a fix that needs one).
 
     continue until JOB_TRIAL_RUNS runs; then keep only if strictly cheaper than
     `record.baseline_cost`, or, when that is missing or zero (billing reads $0),

@@ -148,7 +148,7 @@ def kept_cal_fix(cfg):
               "seq:cal")
     add_record(cfg, FixRecord(fix.id, fix.kind, CAL, fix.candidate_key, "kept",
                               NOW - 20 * DAY, applied_at=NOW - 20 * DAY,
-                              baseline_cost=0.50), fix)
+                              baseline_cost=0.50, live_from=NOW - 20 * DAY), fix)
     return cal_runs(range(21, 41), 0.50) + cal_runs(range(1, 20), 0.10)
 
 
@@ -313,19 +313,26 @@ def run_session(job, t, cost, n_calls=1):
                                for i in range(n_calls)))
 
 
-def test_weekly_saving_is_baseline_minus_actual(tmp_path):
+@pytest.mark.parametrize("live_days_ago, saved", [(10, "0.21"), (2.5, "0.14")])
+def test_weekly_saving_is_baseline_minus_actual(tmp_path, live_days_ago, saved):
+    """Baseline from before applied_at; runs counted from live_from (10 days ago: all
+    three this week; 2.5 days ago, after a late restart: only two)."""
     led = Ledger(tmp_path)
     applied = NOW - 10 * DAY
     led.records.append(FixRecord("20261009-abcd0001", "job_prompt", TRIAGE, "seq:x", "kept",
                                  applied, applied_at=applied, baseline_cost=0.12,
-                                 decided_at=NOW - 2 * DAY))
+                                 decided_at=NOW - 2 * DAY, live_from=NOW - live_days_ago * DAY))
+    # waiting for a restart: never counted
+    led.records.append(FixRecord("20261009-abcd0003", "job_prompt", CAL, "seq:c", "trial",
+                                 applied, applied_at=applied, needs_restart=True))
     sessions = [run_session(TRIAGE, applied - d * DAY, 0.12) for d in range(1, 6)]  # baseline
     sessions += [run_session(TRIAGE, NOW - d * DAY, 0.05) for d in (8, 9)]  # before the week
     sessions += [run_session(TRIAGE, NOW - d * DAY, 0.05) for d in (1, 2, 3)]  # this week
     sessions += [run_session(TRIAGE, NOW - 4 * DAY, 0.30, n_calls=0)]  # outage: not a run
-    sessions += [run_session(CAL, NOW - DAY, 0.01)]  # another job: not counted
+    sessions += [run_session(CAL, applied - d * DAY, 0.05) for d in range(1, 6)]
+    sessions += [run_session(CAL, NOW - DAY, 0.01)]  # its fix awaits a restart: not counted
     line = weekly_line(led, sessions, NOW)
-    assert line == ("Hermes tuner: saved ~$0.21 this week (ESTIMATE), 0 applied, 1 kept, "
+    assert line == (f"Hermes tuner: saved ~${saved} this week (ESTIMATE), 0 applied, 1 kept, "
                     "0 rolled back; tuner spent $0.00")
 
 
@@ -361,6 +368,7 @@ SHADOW_JOB = "abcdef012345"
 
 
 SHADOW_T = NOW - 3 * 3600 - DAY + 6 * 3600 + 40 * 60  # 06:40 UTC yesterday
+SCHEDULED_AT = NOW - DAY - 3600                          # 02:00 UTC yesterday
 TOOL = {"name": "tuned_triage", "description": "search and read in one step",
         "parameters": {}, "calls": [SEARCH, GET], "mutating": False,
         "program": "def main(args, call):\n    return 1\n", "job_prompt": "new prompt"}
@@ -393,7 +401,7 @@ def shadow_setup(env, old_mod, new_mod, composed=False, live=True):
                               NOW - DAY - 3600, spend_usd=0.01, needs_restart=composed), fix)
     (env.root / "shadow_jobs.json").write_text(json.dumps({SHADOW_JOB: {
         "fix_id": fix.id, "live_job_id": TRIAGE, "run_at": shadow_t,
-        "created_at": NOW - DAY - 3600}}))
+        "created_at": NOW - DAY - 3600, "scheduled_at": SCHEDULED_AT}}))
     shadow_dir = env.root / "shadow"
     shadow_dir.mkdir()
     (shadow_dir / f"{sid(SHADOW_JOB, shadow_t)}.jsonl").write_text(
@@ -459,7 +467,9 @@ def test_composed_shadow_requests_restart(env):
     assert rec.state == "shadow_pending" and rec.needs_restart
     assert (env.root / "tools" / "tuned_triage" / "program.py").exists()
     assert bridge.calls.count(("restart_gateway", ())) == 1 and report.restarted
-    assert state(env)["last_restart_at"] == NOW and state(env)["pending_restart"] is False
+    assert state(env)["restart_times"] == [NOW] and state(env)["pending_restart"] is False
+    (entry,) = json.loads((env.root / "shadow_jobs.json").read_text()).values()
+    assert entry["scheduled_at"] == NOW
 
 
 def test_shadow_that_ran_before_restart_fails(env):
@@ -472,21 +482,29 @@ def test_shadow_that_ran_before_restart_fails(env):
     assert bridge.jobs[TRIAGE]["prompt"] == "Triage the inbox."
 
 
-@pytest.mark.parametrize("restarted_at, ok", [(SHADOW_T - 3600, True), (SHADOW_T + 60, False)])
-def test_shadow_after_restart_goes_live_from_next_restart(env, restarted_at, ok):
+@pytest.mark.parametrize("restarts, ok", [
+    ([SHADOW_T - 3600], True),               # between scheduling and the shadow
+    ([SHADOW_T], True),                      # exactly at the shadow start: allowed
+    ([SCHEDULED_AT - DAY], False),           # before scheduling: tool never loaded
+    ([SCHEDULED_AT], False),                 # at scheduling: not after the tool dir
+    ([SHADOW_T + 60], False),                # after the shadow ran
+    ([SCHEDULED_AT - DAY, SHADOW_T + 60], False),
+    ([SCHEDULED_AT - DAY, SHADOW_T - 3600, NOW - 600], True),  # later restarts don't matter
+])
+def test_shadow_after_restart_goes_live_from_next_restart(env, restarts, ok):
     fix = shadow_setup(env, old_mod=[], new_mod=[], composed=True)
-    (env.root / "cycle_state.json").write_text(json.dumps({"last_restart_at": restarted_at}))
+    (env.root / "cycle_state.json").write_text(json.dumps({"restart_times": restarts}))
     bridge = FakeBridge(jobs=jobs())
     run_cycle(env, bridge, NOW)
     rec = Ledger.load(env.root).get(fix.id)
     if not ok:
-        assert rec.state == "shadow_failed"
+        assert rec.state == "shadow_failed" and rec.reason == "shadow ran before restart"
         return
     assert rec.state == "trial" and rec.applied_at == NOW
     # applying needs a restart; NOW is inside the window, so it restarts and the fix is
     # live from then
     assert bridge.calls.count(("restart_gateway", ())) == 1
-    assert rec.live_from == NOW and state(env)["last_restart_at"] == NOW
+    assert rec.live_from == NOW and state(env)["restart_times"][-1] == NOW
 
 
 def test_shadow_with_no_live_run_fails_after_three_days(env):
@@ -592,3 +610,36 @@ def test_global_trial_days_count_from_live_from(env):
     led.save()
     run_cycle(env, FakeBridge(jobs=jobs(), config={CFG_KEY: 0.7}), NOW)
     assert Ledger.load(env.root).get(fix.id).state == "trial"
+
+
+def test_later_unrelated_restart_does_not_fail_waiting_shadow(env):
+    """Reviewer scenario: a valid shadow waits for its live run while an unrelated
+    restart happens; the later restart must not fail it."""
+    fix = shadow_setup(env, old_mod=[], new_mod=[], composed=True, live=False)
+    (env.root / "cycle_state.json").write_text(json.dumps({"restart_times": [SHADOW_T - 3600]}))
+    approve_proposal(env)  # an unrelated restart-needing change, applied this run
+    b1 = FakeBridge(jobs=jobs(), config={INCLUDE: []})
+    run_cycle(env, b1, NOW)
+    assert b1.calls.count(("restart_gateway", ())) == 1
+    assert state(env)["restart_times"] == [SHADOW_T - 3600, NOW]
+    assert Ledger.load(env.root).get(fix.id).state == "shadow_pending"
+    sessions = triage_runs(range(2, 30))  # now the live run has happened
+    sessions.append({"id": sid(SHADOW_JOB, SHADOW_T), "source": "cron", "started_at": SHADOW_T,
+                     "cost": 0.08, "in": 80_000, "out": 800,
+                     "calls": [(GET, {"message_id": "m1"}, "b"), (GET, {"message_id": "m2"}, "b")]})
+    sessions.append({"id": sid(TRIAGE, SHADOW_T + 1200), "source": "cron",
+                     "started_at": SHADOW_T + 1200, "cost": 0.10, "in": 100_000, "out": 1000,
+                     "calls": [(GET, {"message_id": "m1"}, "b"), (GET, {"message_id": "m2"}, "b")]})
+    env.db.unlink()
+    build(env, sessions)
+    run_cycle(env, FakeBridge(jobs=jobs(), config={INCLUDE: ["x_tool"]}), NOW + 3600)
+    assert Ledger.load(env.root).get(fix.id).state == "trial"
+
+
+def test_restart_times_pruned_to_28_days(env):
+    build(env, triage_runs())
+    (env.root).mkdir(parents=True)
+    (env.root / "cycle_state.json").write_text(json.dumps(
+        {"restart_times": [NOW - 29 * DAY, NOW - 27 * DAY], "pending_restart": True}))
+    run_cycle(env, FakeBridge(jobs=jobs()), NOW)
+    assert state(env)["restart_times"] == [NOW - 27 * DAY, NOW]

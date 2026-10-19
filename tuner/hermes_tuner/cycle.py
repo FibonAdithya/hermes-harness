@@ -10,7 +10,8 @@ left half-applied. A dry run makes no mutating bridge call (no drafting either)
 and writes nothing under `root`; it lists what it would do in `planned`.
 
 Besides the ledger, `root/cycle_state.json` holds {"pending_restart": bool,
-"last_restart_at": epoch, "weekly_written": "YYYY-Www", "weekly_written_at": epoch,
+"restart_times": [epoch, ... last 28 days], "weekly_written": "YYYY-Www",
+"weekly_written_at": epoch,
 "errors": [{"at": epoch, "error": str}]} (errors from the last 28 days; each failure
 is logged once and the weekly line counts the log).
 """
@@ -44,6 +45,7 @@ HISTORY_DAYS = 35          # detection window (28) plus a week of margin
 SHADOW_GRACE_S = 2 * DAY   # a shadow that has not run 2 days after run_at failed
 NO_LIVE_RUN_S = 3 * DAY    # a shadow with no live run to compare 3 days after run_at failed
 ERROR_KEEP_S = 28 * DAY
+RESTART_KEEP_S = 28 * DAY
 STATE_FILE = "cycle_state.json"
 
 
@@ -218,11 +220,10 @@ class _Cycle(DraftSteps):
                 if run_at is None or self.now - run_at > SHADOW_GRACE_S:
                     self._shadow_failed(rec, "shadow did not run")
                 continue
-            if rec.needs_restart:
-                restarted = self.state.get("last_restart_at")
-                if not isinstance(restarted, (int, float)) or restarted > shadow.started_at:
-                    self._shadow_failed(rec, "shadow ran before restart")
-                    continue
+            if rec.needs_restart and not self._restarted_between(
+                    trial._epoch(entry.get("scheduled_at")), shadow.started_at):
+                self._shadow_failed(rec, "shadow ran before restart")
+                continue
             if not shadow.calls:
                 self._shadow_failed(rec, "shadow run made no tool calls")
                 continue
@@ -241,6 +242,19 @@ class _Cycle(DraftSteps):
                                          f"{len(verdict.flips)} flips")
             else:
                 self._go_live(rec)
+
+    def _restart_times(self) -> list[float]:
+        times = self.state.get("restart_times")
+        return [t for t in times if isinstance(t, (int, float)) and not isinstance(t, bool)] \
+            if isinstance(times, list) else []
+
+    def _restarted_between(self, scheduled_at: float | None, shadow_start: float) -> bool:
+        """True when a gateway restart r satisfies scheduled_at < r <= shadow_start: the
+        tool dir was written at scheduling, so only a later restart loaded it before the
+        shadow ran. An unknown scheduling time fails closed."""
+        if scheduled_at is None:
+            return False
+        return any(scheduled_at < r <= shadow_start for r in self._restart_times())
 
     def _compare(self, live: object, shadow: Session, old: Session):
         rule = policy.EDITABLE_JOBS.get(live) if isinstance(live, str) else None
@@ -437,7 +451,8 @@ class _Cycle(DraftSteps):
             if restart_allowed(datetime.fromtimestamp(self.now, timezone.utc), last, next_runs):
                 self.bridge.restart_gateway()
                 self.state["pending_restart"] = False
-                self.state["last_restart_at"] = self.now
+                self.state["restart_times"] = [
+                    t for t in self._restart_times() if self.now - t < RESTART_KEEP_S] + [self.now]
                 self.report.restarted = True
                 for r in self.ledger.records:
                     if r.state in APPLIED_STATES and r.needs_restart and r.live_from is None:

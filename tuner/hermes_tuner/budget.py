@@ -56,23 +56,27 @@ def tuner_spend(ledger: Ledger, sessions: Iterable[Session], shadow_ids: Iterabl
 
 def savings(ledger: Ledger, sessions: list[Session], since: float, until: float) -> float:
     """Σ over jobs with a job fix in trial or kept, of Σ over that job's runs in
-    (since, until] after the fix was applied, of (baseline − run_cost(run)).
+    (since, until] after the fix went live (`live_from`), of (baseline − run_cost(run)).
 
-    Per job the baseline is the one before its EARLIEST live fix, so two fixes kept
-    one after the other on the same job are not counted twice. Config and skill
-    fixes have no dollar figure (chat sessions differ too much to attribute).
+    Per job the fix used is the EARLIEST applied one that is live, so two fixes kept
+    one after the other on the same job are not counted twice; its baseline is the 28
+    days before its applied_at. Records with live_from None (waiting for a restart)
+    are skipped. Config and skill fixes have no dollar figure (chat sessions differ
+    too much to attribute).
     """
-    first: dict[str, float] = {}
+    first: dict[str, tuple[float, float]] = {}  # job -> (applied_at, live_from)
     for r in ledger.records:
-        if r.kind in JOB_KINDS and r.state in SAVING_STATES and r.applied_at is not None:
-            first[r.target] = min(first.get(r.target, r.applied_at), r.applied_at)
+        if (r.kind in JOB_KINDS and r.state in SAVING_STATES and r.applied_at is not None
+                and r.live_from is not None):
+            if r.target not in first or r.applied_at < first[r.target][0]:
+                first[r.target] = (r.applied_at, r.live_from)
     total = 0.0
-    for job, applied_at in first.items():
+    for job, (applied_at, live_from) in first.items():
         base = job_cost_baseline(sessions, job, applied_at)
         if base is None:
             continue
         total += sum(base - run_cost(s) for s in job_runs(sessions, job)
-                     if since < s.started_at <= until and s.started_at >= applied_at)
+                     if since < s.started_at <= until and s.started_at > live_from)
     return total
 
 
