@@ -30,7 +30,8 @@ All under `~/.hermes/tuner/` (mode 700, files 600):
 | `versions/<id>/fix.json` | the full fix as drafted |
 | `versions/<id>/before.json` | live values before the fix was applied (the rollback source) |
 | `versions/<id>/after.json` | the values the fix wrote |
-| `tools/<name>/` | composed tools (`tool.json`, `program.py`), read by the plugin |
+| `tools/<name>/` | composed tools (`tool.json`, `program.py`), read by the plugin. A `tool.json` with `"shadow_only": true` is waiting for its shadow check: the plugin runs it only in shadow sessions until go-live rewrites it without the flag |
+| `plugin_heartbeat.json` | written by the plugin when the gateway loads it (`pid`, `registered_at`). The tuner schedules shadows and applies composed tools only when `plugins.enabled` lists `hermes-tuner` and this is newer than the last restart it recorded; otherwise it logs `plugin not loaded; shadow not scheduled` |
 | `shadow_jobs.json` | shadow runs scheduled and not yet evaluated |
 | `shadow/<session>.jsonl` | what a shadow session tried to do (one intent per line) |
 | `proposals/<id>.json` | `new_reach` proposals waiting for your reply |
@@ -189,7 +190,13 @@ One line a week, sent by the approvals bot from `outbox/`:
 Hermes tuner: saved ~$X.XX this week (ESTIMATE), A applied, K kept, R rolled back; tuner spent $Y.YY
 ```
 
-with `; errors: N (see ~/.hermes/tuner/ledger.json)` appended when the tuner
-logged errors that week. Every dollar figure is an ESTIMATE. Hermes's billing
-reports $0 for the subscription models, so the tuner prices tokens itself and
-the figures are not an invoice.
+with `; errors: N (see ~/.hermes/tuner/cycle_state.json and ledger.json)`
+appended when the tuner logged errors that week. The messages are in the
+`errors` list of `cycle_state.json` (last 28 days); records that failed have the
+reason in `ledger.json`.
+
+Every dollar figure is an ESTIMATE. Hermes's `estimated_cost_usd` changed regime
+when billing moved to the subscription (it reads $0), so the tuner never uses it:
+every decision and figure prices a run from its tokens at one fixed rate,
+`policy.USD_PER_MTOK` (0.42 $/Mtok, from the September median). Figures are
+comparable week to week but are not an invoice.

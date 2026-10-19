@@ -99,5 +99,5 @@ def weekly_line(ledger: Ledger, sessions: list[Session], now: float,
     line = (f"Hermes tuner: saved ~{_money(saved)} this week (ESTIMATE), {applied} applied, "
             f"{kept} kept, {rolled} rolled back; tuner spent {_money(spent)}")
     if errs:
-        line += f"; errors: {errs} (see ~/.hermes/tuner/ledger.json)"
+        line += f"; errors: {errs} (see ~/.hermes/tuner/cycle_state.json and ledger.json)"
     return line

@@ -385,7 +385,8 @@ def test_weekly_line_counts_errors(tmp_path):
                                  NOW - DAY, spend_usd=0.03))
     # the cycle logs each failure once, bridge_error records included: not counted twice
     line = weekly_line(led, [], NOW, errors=1)
-    assert line.endswith("; tuner spent $0.03; errors: 1 (see ~/.hermes/tuner/ledger.json)")
+    assert line.endswith("; tuner spent $0.03; errors: 1 "
+                         "(see ~/.hermes/tuner/cycle_state.json and ledger.json)")
     assert "errors" not in weekly_line(led, [], NOW, errors=0)
 
 
