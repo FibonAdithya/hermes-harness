@@ -204,3 +204,53 @@ def test_production_argv_shape():
                     r.STUB_SOURCE]
     assert "--network=none" in argv
     assert r.STUB_SOURCE == STUB.read_text()
+
+
+def test_web_refused_after_read_in_same_run():
+    program = (f"def main(args, call):\n"
+               f"    call({GET!r}, {{'message_id': 'm1'}})\n"
+               f"    return [call('web_search', {{'query': 'q'}}), call('web_extract', {{'urls': ['u']}})]\n")
+    call = FakeCall()
+    out = run(program, call)
+    assert out == {"result": [{"error": "web_search refused after a read in the same run"},
+                              {"error": "web_extract refused after a read in the same run"}]}
+    assert [n for n, _ in call.calls] == [GET]
+
+
+def test_web_then_read_allowed():
+    program = (f"def main(args, call):\n"
+               f"    a = call('web_search', {{'query': 'q'}})\n"
+               f"    b = call('web_extract', {{'urls': ['u']}})\n"
+               f"    return [a, b, call({GET!r}, {{'message_id': 'm1'}})]\n")
+    call = FakeCall()
+    out = run(program, call)
+    assert [n for n, _ in call.calls] == ["web_search", "web_extract", GET]
+    assert out == {"result": [{"ok": "web_search"}, {"ok": "web_extract"}, {"ok": GET}]}
+
+
+def test_container_removed_when_run_does_not_finish(monkeypatch):
+    r = relay()
+    removed = []
+    monkeypatch.setattr(r, "_kill_container", removed.append)
+    program = "def main(args, call):\n    while True:\n        pass\n"
+    out = run(program, FakeCall(), timeout_s=1, container_name="tuned-test")
+    assert "error" in out
+    assert removed == ["tuned-test"]
+    removed.clear()
+    out = run("def main(args, call):\n    return 1\n", FakeCall(), container_name="tuned-test")
+    assert out == {"result": 1}
+    assert removed == []
+    out = run("import sys\ndef main(args, call):\n    sys.__stdout__.close()\n    return 1\n",
+              FakeCall(), container_name="tuned-test")
+    assert "error" in out
+    assert removed == ["tuned-test"]
+
+
+def test_sandbox_argv_limits():
+    from hermes_tuner import policy
+    argv = list(policy.SANDBOX_ARGV)
+    for flag, value in (("--memory", "512m"), ("--pids-limit", "64"), ("--cpus", "1"),
+                        ("--cap-drop", "ALL"), ("--security-opt", "no-new-privileges"),
+                        ("--user", "65534:65534")):
+        assert argv[argv.index(flag) + 1] == value, flag
+    assert "--network=none" in argv and "--read-only" in argv and "--rm" in argv

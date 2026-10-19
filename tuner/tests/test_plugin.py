@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -116,20 +119,77 @@ def test_shadow_guard_blocks_memory_and_gated_compute(home):
     shadow_jobs_by_name(home)
     for name in ("memory", "mcp__compute__run_task", "execute_code", "skill_manage",
                  "cronjob", "send_message", "delegate_task", "terminal", "patch",
-                 "mcp__google__draft_gmail_message", LABELS):
+                 "mcp__google__draft_gmail_message", LABELS,
+                 "process", "browser_click", "mcp__other__x", "ha_call_service"):
         res = plugin.shadow_guard(name, {}, session_id=SHADOW_SID)
         assert res == {"action": "block", "message": "dry run: recorded"}, name
     for name in ("mcp__compute__night_status", "mcp__compute__job_logs", SEARCH, GET,
-                 "read_file", "web_search"):
+                 "mcp__google__get_events", "read_file", "web_search", "tool_call",
+                 "tool_search", "skill_view", "todo", "tuned_x"):
         assert plugin.shadow_guard(name, {}, session_id=SHADOW_SID) is None, name
 
 
 def test_shadow_blocked_policy():
     from hermes_tuner import policy
-    assert policy.MUTATING_TOOLS <= policy.SHADOW_BLOCK
+    assert not (policy.MUTATING_TOOLS & policy.SHADOW_ALLOW)
+    assert all(policy.shadow_blocked(n) for n in policy.MUTATING_TOOLS)
     assert policy.shadow_blocked("mcp__compute__anything_new")
+    assert policy.shadow_blocked("some_future_tool")
     assert not policy.shadow_blocked("mcp__compute__night_log")
     assert not policy.shadow_blocked("read_file")
+    assert not policy.shadow_blocked("tuned_anything")
+
+
+# --- compression lineage ---------------------------------------------------
+
+CHILD = "20261020_074512_a1b2c3"
+GRANDCHILD = "20261020_075501_d4e5f6"
+
+
+def make_state_db(home: Path, rows: list[tuple[str, str | None]]) -> Path:
+    path = home / "state.db"
+    conn = sqlite3.connect(path)
+    conn.execute("create table sessions (id text primary key, source text, "
+                 "parent_session_id text)")
+    conn.executemany("insert into sessions values (?, 'cron', ?)", rows)
+    conn.commit()
+    conn.close()
+    return path
+
+
+def test_compression_descendants_of_shadow_session_are_blocked(home):
+    plugin = load_plugin()
+    shadow_jobs_by_name(home)
+    make_state_db(home, [(SHADOW_SID, None), (CHILD, SHADOW_SID), (GRANDCHILD, CHILD)])
+    for sid in (CHILD, GRANDCHILD):
+        res = plugin.shadow_guard(LABELS, {"message_id": "m"}, session_id=sid)
+        assert res == {"action": "block", "message": "dry run: recorded"}, sid
+    # Recorded under the shadow job's own session.
+    assert [ln["tool"] for ln in shadow_lines(home, SHADOW_SID)] == [LABELS, LABELS]
+
+
+def test_compression_child_of_live_session_not_blocked(home):
+    plugin = load_plugin()
+    shadow_jobs_by_name(home)
+    make_state_db(home, [(LIVE_SID, None), ("20261020_080000_0a0b0c", LIVE_SID)])
+    assert plugin.shadow_guard(LABELS, {}, session_id="20261020_080000_0a0b0c") is None
+    assert plugin.shadow_guard(LABELS, {}, session_id="20261020_090000_ffffff") is None
+
+
+def test_db_missing_fails_closed_only_when_shadow_due(home):
+    plugin = load_plugin()
+    sid = "20261020_074512_0f0f0f"
+    ledger = home / "tuner" / "shadow_jobs.json"
+    ledger.write_text(json.dumps({"abc123abc123": {
+        "fix_id": "f", "live_job_id": "3bc4e11d29b1", "run_at": time.time() - 3 * 3600}}))
+    assert plugin.shadow_guard(LABELS, {}, session_id=sid) is None
+    now_iso = datetime.now(timezone.utc).isoformat()
+    ledger.write_text(json.dumps({"abc123abc123": {
+        "fix_id": "f", "live_job_id": "3bc4e11d29b1", "run_at": now_iso}}))
+    res = plugin.shadow_guard(LABELS, {}, session_id=sid)
+    assert res == {"action": "block", "message": "dry run: recorded"}
+    ledger.write_text("{}")
+    assert plugin.shadow_guard(LABELS, {}, session_id=sid) is None
 
 
 def test_registration_reads_tool_dir(home):
@@ -217,6 +277,18 @@ def test_handler_in_shadow_session_forces_dry_run(home, local_runner):
     assert [n for n, _, _ in ctx.dispatched] == [SEARCH]
     lines = shadow_lines(home, SHADOW_SID)
     assert [ln["tool"] for ln in lines] == [LABELS]
+
+
+def test_handler_in_compression_child_of_shadow_forces_dry_run(home, local_runner):
+    shadow_jobs_by_name(home)
+    make_state_db(home, [(SHADOW_SID, None), (CHILD, SHADOW_SID)])
+    ctx = FakeCtx()
+    h = handler_for(local_runner, ctx, home, calls=(SEARCH, LABELS), mutating=True,
+                    program=MUTATE)
+    out = json.loads(h({"q": "a"}, task_id="t", session_id=CHILD))
+    assert out == {"result": {"dry_run": True}}
+    assert [n for n, _, _ in ctx.dispatched] == [SEARCH]
+    assert [ln["tool"] for ln in shadow_lines(home, SHADOW_SID)] == [LABELS]
 
 
 def test_handler_dry_run_arg_on_mutating_tool(home, local_runner):

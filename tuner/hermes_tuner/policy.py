@@ -11,7 +11,11 @@ CONFIG_FORBIDDEN_PREFIXES = (
 # Composed tools (spec 5.2).
 TOOL_PREFIX = "tuned_"
 TOOLSET = "tuner"
-SANDBOX_ARGV = ("docker", "run", "--rm", "-i", "--network=none", "--memory", "512m")
+SANDBOX_ARGV = (
+    "docker", "run", "--rm", "-i", "--network=none", "--memory", "512m",
+    "--pids-limit", "64", "--cpus", "1", "--cap-drop", "ALL",
+    "--security-opt", "no-new-privileges", "--read-only", "--user", "65534:65534",
+)
 SANDBOX_IMAGE = "hermes-sandbox:latest"
 RUN_TIMEOUT_S = 300
 MAX_CALLS = 50
@@ -47,23 +51,27 @@ MUTATING_TOOLS = frozenset({
     "terminal",
 })
 
-# Shadow (dry-run trial) sessions: tools blocked by the plugin's pre_tool_call
-# guard (spec 4.5). execute_code is blocked because its relayed calls may not
-# pass through that hook. Gated compute tools are covered by shadow_blocked().
-SHADOW_BLOCK = MUTATING_TOOLS | frozenset({
-    "skill_manage",
-    "memory",
-    "cronjob",
-    "send_message",
-    "delegate_task",
-    "execute_code",
+# Shadow (dry-run trial) sessions: the plugin's pre_tool_call guard lets only
+# these tools run; every other tool is blocked and recorded (spec 4.5). An
+# allowlist, because Hermes has many state-changing tools beyond MUTATING_TOOLS.
+# tool_call is the Tool Search bridge: its inner call fires pre_tool_call again
+# under the underlying tool's name, so the inner tool is still checked.
+# Composed tools (TOOL_PREFIX) are allowed because they force a dry run themselves.
+SHADOW_ALLOW = (CALLABLE_TOOLS - MUTATING_TOOLS) | frozenset({
+    "tool_search",
+    "tool_describe",
+    "tool_call",
+    "skill_view",
+    "skills_list",
+    "session_search",
+    "todo",
 })
 
 
 def shadow_blocked(name: str) -> bool:
     """True when a shadow session must not run tool `name`."""
-    return name in SHADOW_BLOCK or (
-        name.startswith("mcp__compute__") and name not in COMPUTE_READ_TOOLS)
+    return not name.startswith(TOOL_PREFIX) and name not in SHADOW_ALLOW
+
 
 # Untrusted tool results (spec 5.3).
 UNTRUSTED_PREFIXES = ("mcp__google__", "browser_")

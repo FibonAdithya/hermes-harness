@@ -21,14 +21,16 @@ import logging
 import os
 import re
 import sys
+import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 _TUNER_DIR = str(Path(__file__).resolve().parents[2])
 if _TUNER_DIR not in sys.path:
     sys.path.insert(0, _TUNER_DIR)
 
-from hermes_tuner import policy, proposals  # noqa: E402
+from hermes_tuner import lineage, policy, proposals  # noqa: E402
 
 from . import relay  # noqa: E402
 
@@ -36,6 +38,12 @@ logger = logging.getLogger(__name__)
 
 BLOCK_MESSAGE = "dry run: recorded"
 _CRON_SESSION = re.compile(r"cron_([0-9a-f]{12})_\d{8}_\d{6}")
+# Session ids Hermes gives a conversation after compression.
+_CHILD_SESSION = re.compile(r"\d{8}_\d{6}_[0-9a-f]{6}")
+SHADOW_DUE_BEFORE_S = 2 * 3600
+SHADOW_DUE_AFTER_S = 10 * 60
+_ROOTS: dict[tuple[str, str], str] = {}
+_ROOTS_MAX = 4096
 _TOOL_NAME = re.compile(re.escape(policy.TOOL_PREFIX) + r"[A-Za-z0-9_]{1,58}")
 
 
@@ -55,6 +63,10 @@ def broker_state() -> Path:
 
 def jobs_path() -> Path:
     return hermes_home() / "cron" / "jobs.json"
+
+
+def state_db_path() -> Path:
+    return hermes_home() / "state.db"
 
 
 def runner_argv(container_name: str) -> list[str]:
@@ -77,38 +89,106 @@ def _shadow_job_id(session_id: object) -> str | None:
     return m.group(1) if m else None
 
 
-def is_shadow_session(session_id: object) -> bool:
-    """True when the session is a run of a shadow job. Never raises."""
-    try:
-        job_id = _shadow_job_id(session_id)
-        if job_id is None:
-            return False
-        ledger = _read_json(tuner_root() / "shadow_jobs.json")
-        if isinstance(ledger, dict) and job_id in ledger:
-            return True
-        jobs = _read_json(jobs_path())
-        if isinstance(jobs, dict):
-            jobs = jobs.get("jobs")
-        if not isinstance(jobs, list):
-            return False
-        for job in jobs:
-            if (isinstance(job, dict) and job.get("id") == job_id
-                    and isinstance(job.get("name"), str)
-                    and job["name"].startswith(policy.SHADOW_PREFIX)):
-                return True
+def _root_session(session_id: str) -> str | None:
+    """The cron session `session_id` descends from through compression.
+
+    A `cron_…` id is its own root. Others are looked up in state.db; found
+    roots are memoised (lineage never changes). Raises LineageError.
+    """
+    if _shadow_job_id(session_id) is not None:
+        return session_id
+    db = state_db_path()
+    key = (str(db), session_id)
+    if key in _ROOTS:
+        return _ROOTS[key]
+    root = lineage.root_session_id(db, session_id)
+    if root is not None:
+        if len(_ROOTS) >= _ROOTS_MAX:
+            del _ROOTS[next(iter(_ROOTS))]
+        _ROOTS[key] = root
+    return root
+
+
+def _epoch(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    return None
+
+
+def _shadow_due_now() -> bool:
+    """True when shadow_jobs.json has a run in [now - 2 h, now + 10 min]."""
+    ledger = _read_json(tuner_root() / "shadow_jobs.json")
+    if not isinstance(ledger, dict):
         return False
+    now = time.time()
+    for entry in ledger.values():
+        t = _epoch(entry.get("run_at")) if isinstance(entry, dict) else None
+        if t is not None and now - SHADOW_DUE_BEFORE_S <= t <= now + SHADOW_DUE_AFTER_S:
+            return True
+    return False
+
+
+def _is_shadow_job(job_id: str) -> bool:
+    ledger = _read_json(tuner_root() / "shadow_jobs.json")
+    if isinstance(ledger, dict) and job_id in ledger:
+        return True
+    jobs = _read_json(jobs_path())
+    if isinstance(jobs, dict):
+        jobs = jobs.get("jobs")
+    if not isinstance(jobs, list):
+        return False
+    return any(isinstance(job, dict) and job.get("id") == job_id
+               and isinstance(job.get("name"), str)
+               and job["name"].startswith(policy.SHADOW_PREFIX)
+               for job in jobs)
+
+
+def shadow_root(session_id: object) -> str | None:
+    """The id to record a shadow session under, or None if not shadow. Never raises.
+
+    Usually the shadow job's `cron_…` session (the root of `session_id`'s
+    compression lineage). When state.db cannot be read and a shadow run is due,
+    fails closed and returns `session_id` itself.
+    """
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    try:
+        try:
+            root = _root_session(session_id)
+        except lineage.LineageError:
+            logger.warning("hermes-tuner: lineage lookup failed for a session")
+            return session_id if _shadow_due_now() else None
+        job_id = _shadow_job_id(root)
+        if job_id is None or not _is_shadow_job(job_id):
+            return None
+        return root
     except Exception:  # noqa: BLE001
         logger.exception("hermes-tuner: shadow-session check failed")
-        return False
+        return None
 
 
-def _record_shadow(session_id: str, entries: list[dict]) -> None:
-    if not entries or _shadow_job_id(session_id) is None:
+def is_shadow_session(session_id: object) -> bool:
+    return shadow_root(session_id) is not None
+
+
+def _record_shadow(record_id: str, entries: list[dict]) -> None:
+    if not entries or not (_CRON_SESSION.fullmatch(record_id)
+                           or _CHILD_SESSION.fullmatch(record_id)):
         return
     try:
         d = tuner_root() / "shadow"
         d.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with open(d / f"{session_id}.jsonl", "a", encoding="utf-8") as f:
+        with open(d / f"{record_id}.jsonl", "a", encoding="utf-8") as f:
             for entry in entries:
                 f.write(json.dumps(entry, default=str) + "\n")
     except OSError:
@@ -116,12 +196,15 @@ def _record_shadow(session_id: str, entries: list[dict]) -> None:
 
 
 def shadow_guard(tool_name, args, session_id="", **_):
-    """pre_tool_call hook: block and record state-changing tools in shadow sessions."""
+    """pre_tool_call hook: in a shadow session, block and record every tool off
+    policy.SHADOW_ALLOW."""
     if not isinstance(tool_name, str) or not policy.shadow_blocked(tool_name):
         return None
-    if not is_shadow_session(session_id):
+    root = shadow_root(session_id)
+    if root is None:
         return None
-    _record_shadow(session_id, [{"tool": tool_name, "args": args, "via": "guard"}])
+    _record_shadow(root, [{"tool": tool_name, "args": args, "via": "guard",
+                           "session_id": session_id}])
     return {"action": "block", "message": BLOCK_MESSAGE}
 
 
@@ -178,8 +261,8 @@ def _make_handler(ctx, tool_dir: Path):
                 return json.dumps({"error": f"{tool_dir.name} is no longer available"})
             args = dict(args) if isinstance(args, dict) else {}
             wants_dry = args.pop("dry_run", None) is True
-            shadow = is_shadow_session(session_id)
-            dry_run = shadow or (spec["mutating"] and wants_dry)
+            shadow = shadow_root(session_id)
+            dry_run = shadow is not None or (spec["mutating"] and wants_dry)
             callable_now = policy.CALLABLE_TOOLS | proposals.approved_callables(
                 tuner_root(), broker_state())
             allowed = frozenset(c for c in spec["calls"] & callable_now
@@ -198,9 +281,10 @@ def _make_handler(ctx, tool_dir: Path):
             out = relay.run_program(spec["program"], args, call, runner_argv(container),
                                     dry_run=dry_run, intents=intents, allowed=allowed,
                                     container_name=container)
-            if shadow:
-                _record_shadow(session_id, [
-                    {"tool": i["tool"], "args": i["args"], "via": spec["name"]}
+            if shadow is not None:
+                _record_shadow(shadow, [
+                    {"tool": i["tool"], "args": i["args"], "via": spec["name"],
+                     "session_id": session_id}
                     for i in intents])
             return out
         except Exception as exc:  # noqa: BLE001
