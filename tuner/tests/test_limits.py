@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import random
 import string
 from pathlib import Path
@@ -292,3 +293,48 @@ def test_one_tool_name_pattern_everywhere():
     from test_relay import load_plugin
     assert ledger._TOOL_NAME is policy.TOOL_NAME_RE
     assert load_plugin()._TOOL_NAME is policy.TOOL_NAME_RE
+
+
+# --- m7: skills installed from the Skills Hub are treated as bundled -------------------
+
+def test_hub_installed_skills_count_as_bundled(tmp_path):
+    from hermes_tuner.cycle_draft import bundled_skills
+    (tmp_path / ".bundled_manifest").write_text("arxiv:abc\n")
+    (tmp_path / ".hub").mkdir()
+    (tmp_path / ".hub" / "lock.json").write_text(json.dumps({"version": 1, "installed": {
+        "web-recon": {"install_path": "research/web-recon-v2"},
+        "pdf-tools": {"install_path": str(tmp_path / "docs" / "pdf")},
+        "no-path": {}}}))
+    assert bundled_skills(tmp_path) == frozenset(
+        {"arxiv", "web-recon", "web-recon-v2", "pdf-tools", "pdf", "no-path"})
+
+
+def test_hub_lock_missing_leaves_the_manifest(tmp_path):
+    from hermes_tuner.cycle_draft import bundled_skills
+    (tmp_path / ".bundled_manifest").write_text("arxiv:abc\n")
+    assert bundled_skills(tmp_path) == frozenset({"arxiv"})
+    assert bundled_skills(tmp_path / "absent") is None
+
+
+@pytest.mark.parametrize("text", ["{not json", "[]", '{"installed": []}'])
+def test_unreadable_hub_lock_fails_closed(tmp_path, text):
+    from hermes_tuner.cycle_draft import bundled_skills
+    (tmp_path / ".bundled_manifest").write_text("arxiv:abc\n")
+    (tmp_path / ".hub").mkdir()
+    (tmp_path / ".hub" / "lock.json").write_text(text)
+    assert bundled_skills(tmp_path) is None  # as if the manifest were missing
+
+
+def test_hub_installed_skill_fix_is_refused(tmp_path):
+    from hermes_tuner.cycle_draft import bundled_skills
+    skills = tmp_path / "skills"
+    (skills / "research" / "web-recon").mkdir(parents=True)
+    (skills / "research" / "web-recon" / "SKILL.md").write_text("---\nname: web-recon\n---\nbody\n")
+    (skills / ".bundled_manifest").write_text("arxiv:abc\n")
+    (skills / ".hub").mkdir()
+    (skills / ".hub" / "lock.json").write_text(json.dumps(
+        {"installed": {"web-recon": {"install_path": "research/web-recon"}}}))
+    c = ctx(tmp_path, bundled_skills=bundled_skills(skills), skills_root=skills)
+    reasons = check_fix(skill("research/web-recon/SKILL.md",
+                              "---\nname: web-recon\n---\nshort\n"), c)
+    assert any("bundled" in r for r in reasons)

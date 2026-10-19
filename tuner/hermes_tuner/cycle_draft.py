@@ -7,6 +7,7 @@ and its `_close`, `_went_live`, `_shadow_tool` and `_remove_shadow_tool` helpers
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
@@ -38,6 +39,35 @@ def _skill_file(skills_root: Path, name: str) -> Path | None:
     except OSError:
         return None
     return hits[0] if hits else None
+
+
+def bundled_skills(skills_root: Path) -> frozenset[str] | None:
+    """Skill names the tuner must never edit: those in `.bundled_manifest` (shipped
+    with Hermes) plus those installed from the Skills Hub, read from `.hub/lock.json`
+    as Hermes reads it (tools/skill_usage.py): the keys of "installed" and the last
+    part of each entry's install_path. None when the manifest is missing, or when a
+    lock file exists but cannot be read (fail closed: no skill fixes)."""
+    root = Path(skills_root)
+    try:
+        text = (root / ".bundled_manifest").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    names = {line.split(":", 1)[0].strip() for line in text.splitlines()}
+    lock = root / ".hub" / "lock.json"
+    if lock.exists():
+        try:
+            data = json.loads(lock.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            return None
+        installed = data.get("installed") if isinstance(data, dict) else None
+        if not isinstance(installed, dict):
+            return None
+        for key, entry in installed.items():
+            names.add(str(key))
+            path = entry.get("install_path") if isinstance(entry, dict) else None
+            if isinstance(path, str) and path.strip():
+                names.add(Path(path.strip()).name)
+    return frozenset(n for n in names if n)
 
 
 class DraftSteps:
@@ -115,12 +145,7 @@ class DraftSteps:
         return [] if recent is None else [(c.name, c.arg_keys) for c in recent.calls]
 
     def _bundled(self) -> frozenset[str] | None:
-        try:
-            text = (Path(self.cfg.skills_root) / ".bundled_manifest").read_text(encoding="utf-8")
-        except OSError:
-            return None
-        return frozenset(line.split(":", 1)[0].strip() for line in text.splitlines()
-                         if line.split(":", 1)[0].strip())
+        return bundled_skills(self.cfg.skills_root)
 
     def copy_index(self) -> CopyIndex:
         if self._copy_index is None:
