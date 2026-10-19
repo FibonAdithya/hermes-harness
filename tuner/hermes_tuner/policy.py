@@ -54,13 +54,15 @@ MUTATING_TOOLS = frozenset({
 # Shadow (dry-run trial) sessions: the plugin's pre_tool_call guard lets only
 # these tools run; every other tool is blocked and recorded (spec 4.5). An
 # allowlist, because Hermes has many state-changing tools beyond MUTATING_TOOLS.
-# tool_call is the Tool Search bridge: its inner call fires pre_tool_call again
-# under the underlying tool's name, so the inner tool is still checked.
+# tool_call (the Tool Search bridge) is NOT allowed: when Hermes unwraps it
+# (agent/tool_executor.py) the hook fires once, under the underlying tool's name,
+# which is checked here as usual; when the unwrap fails Hermes swallows the error
+# and dispatches tool_call itself with the hook skipped on the recursion, so a
+# tool_call that reaches the guard must be blocked.
 # Composed tools (TOOL_PREFIX) are allowed because they force a dry run themselves.
 SHADOW_ALLOW = (CALLABLE_TOOLS - MUTATING_TOOLS) | frozenset({
     "tool_search",
     "tool_describe",
-    "tool_call",
     "skill_view",
     "skills_list",
     "session_search",

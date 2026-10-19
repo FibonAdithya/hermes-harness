@@ -120,11 +120,12 @@ def test_shadow_guard_blocks_memory_and_gated_compute(home):
     for name in ("memory", "mcp__compute__run_task", "execute_code", "skill_manage",
                  "cronjob", "send_message", "delegate_task", "terminal", "patch",
                  "mcp__google__draft_gmail_message", LABELS,
-                 "process", "browser_click", "mcp__other__x", "ha_call_service"):
+                 "process", "browser_click", "mcp__other__x", "ha_call_service",
+                 "tool_call"):
         res = plugin.shadow_guard(name, {}, session_id=SHADOW_SID)
         assert res == {"action": "block", "message": "dry run: recorded"}, name
     for name in ("mcp__compute__night_status", "mcp__compute__job_logs", SEARCH, GET,
-                 "mcp__google__get_events", "read_file", "web_search", "tool_call",
+                 "mcp__google__get_events", "read_file", "web_search",
                  "tool_search", "skill_view", "todo", "tuned_x"):
         assert plugin.shadow_guard(name, {}, session_id=SHADOW_SID) is None, name
 
@@ -138,6 +139,9 @@ def test_shadow_blocked_policy():
     assert not policy.shadow_blocked("mcp__compute__night_log")
     assert not policy.shadow_blocked("read_file")
     assert not policy.shadow_blocked("tuned_anything")
+    # M3: an unwrapped tool_call fires the hook under the inner tool's name; a
+    # tool_call that reaches the hook did not unwrap, so it is blocked
+    assert policy.shadow_blocked("tool_call") and "tool_call" not in policy.SHADOW_ALLOW
 
 
 # --- compression lineage ---------------------------------------------------
