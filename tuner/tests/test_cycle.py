@@ -1131,3 +1131,57 @@ def test_global_record_without_baseline_runs_waits_for_the_deadline(env):
     bridge = FakeBridge(jobs=jobs(), config={CFG_KEY: 0.7})
     run_cycle(env, bridge, NOW)
     assert Ledger.load(env.root).get(fix.id).state == "trial" and bridge.config[CFG_KEY] == 0.7
+
+
+# --- review fixes: restart clock, rollback_pending retry --------------------------------
+
+def test_restart_checks_the_window_when_it_restarts_not_at_cycle_start(env):
+    """Catches: checking restart_allowed against the cycle's start time after slow
+    drafting, so the restart lands inside a job's margin."""
+    build(env, triage_runs())
+    approve_proposal(env)
+    run_cycle(env, FakeBridge(jobs=jobs(), config={INCLUDE: []}), T_OUT)
+    due = jobs()
+    due[TRIAGE]["next_run_at"] = iso(T_IN + 20 * 60)  # 20 min after the cycle starts
+    late = FakeBridge(jobs=due, config={INCLUDE: ["x_tool"]})
+    run_cycle(env, late, T_IN, clock=lambda: T_IN + 10 * 60)  # 10 min in: job due in 10
+    assert ("restart_gateway", ()) not in late.calls
+    assert state(env)["pending_restart"] is True
+    ok = FakeBridge(jobs=due, config={INCLUDE: ["x_tool"]})  # control: no delay
+    run_cycle(env, ok, T_IN, clock=lambda: T_IN + 60)
+    assert ok.calls.count(("restart_gateway", ())) == 1
+    assert Ledger.load(env.root).get("p1").live_from == T_IN + 60  # the restart's time
+
+
+def test_rollback_pending_is_retried_by_the_cycle(env):
+    """Catches: a change left live by a failed apply that nothing ever reverts."""
+    build(env, triage_runs())
+    fix = Fix("20261018-eeee0001", "config", CFG_KEY, {"key": CFG_KEY, "value": 0.7},
+              "schema_lookup")
+    led = add_record(env, FixRecord(fix.id, fix.kind, CFG_KEY, fix.candidate_key,
+                                    "rollback_pending", NOW - DAY), fix)
+    vdir = led.version_dir(fix.id)
+    vdir.mkdir(parents=True, exist_ok=True)
+    (vdir / "before.json").write_text(json.dumps({"key": CFG_KEY, "value": 0.5}))
+    (vdir / "after.json").write_text(json.dumps({"key": CFG_KEY, "value": 0.7}))
+    bridge = FakeBridge(jobs=jobs(), config={CFG_KEY: 0.7})
+    report = run_cycle(env, bridge, NOW)
+    assert bridge.config[CFG_KEY] == 0.5
+    assert Ledger.load(env.root).get(fix.id).state == "rolled_back"
+    assert fix.id in report.rolled_back
+
+
+def test_failed_drafting_call_is_charged_and_not_retried_daily(env):
+    """Catches: a oneshot that times out (possibly billed) costing $0 to the budget,
+    so the same candidate is drafted again every day."""
+    build(env, triage_runs())
+    bridge = FakeBridge(jobs=jobs(), fail={"oneshot"})
+    report = run_cycle(env, bridge, NOW)
+    assert len(oneshots(bridge)) == 1
+    (rec,) = Ledger.load(env.root).records
+    assert rec.state == "rejected" and rec.spend_usd == policy.DRAFT_EST_USD
+    assert "oneshot" in rec.reason
+    assert any("oneshot" in e for e in report.errors)
+    bridge2 = FakeBridge(jobs=jobs(), fail={"oneshot"})
+    run_cycle(env, bridge2, NOW + DAY)
+    assert oneshots(bridge2) == []  # the charged spend counts against the budget

@@ -57,7 +57,8 @@ def main(argv: list[str] | None = None, bridge: Bridge | None = None,
                           broker_state=home / "broker" / "state",
                           skills_root=home / "skills", dry_run=args.dry_run)
         report = run_cycle(cfg, bridge if bridge is not None else HermesBridge(),
-                           time.time() if now is None else now)
+                           time.time() if now is None else now,
+                           clock=time.time if now is None else None)
         if report.skipped:
             print(report.skipped)
             return 0

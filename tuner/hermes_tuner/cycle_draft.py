@@ -189,8 +189,13 @@ class DraftSteps:
             fix, spend = draft(cand, job, skill_text, {}, self._call_shape(cand),
                                self.bridge, self.now, self.pricing)
         except BridgeError as exc:
+            # The call may have been billed before it failed (e.g. a timeout), and
+            # all spend counts (spec 6): charge the drafting estimate.
             self.err(f"draft {cand.key}: {exc}")
-            return 0.0, False
+            spend = policy.DRAFT_EST_USD
+            self.report.spend_usd += spend
+            self._spend_record(cand, spend, "bridge_error", f"drafting call failed: {exc}"[:1000])
+            return spend, False
         self.report.spend_usd += spend
         if fix is None:
             self._spend_record(cand, spend, "unparseable", "unparseable draft")

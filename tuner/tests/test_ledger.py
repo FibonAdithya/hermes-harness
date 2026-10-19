@@ -1011,3 +1011,72 @@ def test_bridge_entry_oneshot_returns_token_breakdown(monkeypatch):
     assert (got["input_tokens"], got["cache_read_tokens"], got["cache_write_tokens"],
             got["output_tokens"]) == (5, 300, 20, 7)
     assert got["text"] == "hi"
+
+
+class LostReply(FakeBridge):
+    """A bridge whose `method` does its write and then raises, as when Hermes stores
+    the change but the bridge call times out before replying. Fails `times` times."""
+
+    def __init__(self, method, times=1, **kw):
+        super().__init__(**kw)
+        self.lost, self.times = method, times
+
+    def _lose(self, method):
+        if method == self.lost and self.times > 0:
+            self.times -= 1
+            raise BridgeError(f"{method} timed out after 120s")
+
+    def update_job(self, job_id, updates):
+        out = super().update_job(job_id, updates)
+        self._lose("update_job")
+        return out
+
+    def config_get(self, key):
+        self._lose("config_get")
+        return super().config_get(key)
+
+
+def test_job_write_with_lost_reply_is_reverted(tmp_path):
+    """Catches: a bridge_error record whose change is still live in Hermes."""
+    root, skills, _, ledger = make(tmp_path)
+    bridge = LostReply("update_job", jobs={JOB: {"id": JOB, "prompt": OLD,
+                                                 "enabled_toolsets": ["web"]}})
+    rec = do_apply(job_fix(), ledger, bridge, root, skills)
+    assert rec.state == "bridge_error" and "timed out" in rec.reason
+    assert bridge.jobs[JOB]["prompt"] == OLD
+    assert ledger.active_for(JOB) is None
+
+
+def test_config_read_back_lost_then_revert_fails_stays_pending(tmp_path):
+    """Catches: losing the only record of a live change when the revert also fails."""
+    root, skills, _, ledger = make(tmp_path)
+    bridge = LostReply("config_get", times=99, config={"compression.x": 0.5})
+    bridge.times = 0  # the read of the old value works
+    real_set = bridge.config_set
+
+    def set_then_break(key, value):
+        real_set(key, value)
+        bridge.times = 99  # every later read times out
+        bridge.config_set = real_set
+    bridge.config_set = set_then_break
+    rec = do_apply(cfg_fix("compression.x", 0.7), ledger, bridge, root, skills)
+    assert rec.state == "rollback_pending" and "timed out" in rec.reason
+    assert bridge.config["compression.x"] == 0.7  # still live: must stay tracked
+    assert (root / "versions" / "c1" / "after.json").exists()
+    assert ledger.active_for("k") is rec
+    assert Ledger.load(root).records[0].state == "rollback_pending"
+    bridge.times = 0  # Hermes answers again: the retried rollback restores
+    out = do_rollback(rec, ledger, bridge, root, skills)
+    assert out.state == "rolled_back" and bridge.config["compression.x"] == 0.5
+
+
+def test_composed_rollback_keeps_tool_when_owner_kept_editing_job(tmp_path):
+    """Catches: deleting a tool that an owner-edited job still uses."""
+    root, skills, bridge, ledger = make(tmp_path)
+    f = Fix("t1", "composed_tool", JOB, tool_payload(job_prompt=NEW), "k")
+    rec = do_apply(f, ledger, bridge, root, skills)
+    bridge.jobs[JOB]["prompt"] = NEW + " (owner tweak)"
+    out = do_rollback(rec, ledger, bridge, root, skills)
+    assert out.state == "owner_changed"
+    assert (root / "tools" / "tuned_x" / "tool.json").exists()
+    assert "tool dir" in out.reason

@@ -28,8 +28,10 @@ from .model import Fix
 
 State = Literal["rejected", "shadow_pending", "shadow_failed", "trial", "kept",
                 "rolled_back", "owner_changed", "proposed", "approved", "applied",
-                "dropped", "bridge_error"]
-ACTIVE_STATES = frozenset({"shadow_pending", "trial", "applied"})
+                "dropped", "bridge_error", "rollback_pending"]
+# rollback_pending: an apply failed after a write may have reached Hermes, and the
+# revert has not succeeded yet. Active, so nothing else touches the target meanwhile.
+ACTIVE_STATES = frozenset({"shadow_pending", "trial", "applied", "rollback_pending"})
 APPLIED_STATES = frozenset({"trial", "applied", "kept"})
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,100}")
 _TOOL_NAME = policy.TOOL_NAME_RE
@@ -382,6 +384,7 @@ def apply(fix: Fix, ledger: Ledger, bridge: Bridge, root: Path, now: float,
     vdir = ledger.version_dir(fix.id)
     after_path = vdir / "after.json"
     undo = None  # called to revert partial work on failure
+    wrote = False  # a write to Hermes was attempted: it may have landed
     try:
         if fix.kind == "job_prompt":
             live = _read_job(bridge, fix.target)
@@ -390,6 +393,7 @@ def apply(fix: Fix, ledger: Ledger, bridge: Bridge, root: Path, now: float,
             after = job_after_for(fix, live)
             _write_json(vdir / "before.json", before)
             _write_json(after_path, after)
+            wrote = True
             bridge.update_job(fix.target, _job_updates(before, after))
         elif fix.kind == "config":
             key = p["key"]
@@ -403,6 +407,7 @@ def apply(fix: Fix, ledger: Ledger, bridge: Bridge, root: Path, now: float,
                               "through `hermes config set`")
             _write_json(vdir / "before.json", {"key": key, "value": old})
             _write_json(after_path, {"key": key, "value": p["value"]})
+            wrote = True
             bridge.config_set(key, p["value"])
             stored = _verify_config_write(bridge, key, p["value"], old)
             _write_json(after_path, {"key": key, "value": stored})  # what Hermes stored
@@ -435,12 +440,28 @@ def apply(fix: Fix, ledger: Ledger, bridge: Bridge, root: Path, now: float,
                 _write_tool_dir(tools, spec["name"], spec, program)
             undo = lambda: shutil.rmtree(tools / spec["name"], ignore_errors=True)  # noqa: E731
             if job_prompt is not None:
+                wrote = True
                 bridge.update_job(fix.target, _job_updates(before["job"], after["job"]))
     except (BridgeError, _Failed, OSError) as exc:
-        if undo:
-            undo()
-        after_path.unlink(missing_ok=True)
-        return _set_state(ledger, rec, "bridge_error", f"{type(exc).__name__}: {exc}")
+        reason = f"{type(exc).__name__}: {exc}"
+        # _Failed after a write comes from _verify_config_write, which has already
+        # restored (or named what is left); only a lost reply leaves the outcome unknown.
+        if not wrote or isinstance(exc, _Failed):
+            if undo:
+                undo()
+            after_path.unlink(missing_ok=True)
+            return _set_state(ledger, rec, "bridge_error", reason)
+        # The write may have landed (e.g. Hermes stored it, then the reply timed
+        # out). Revert it the way a rollback does, which checks what is live.
+        _set_state(ledger, rec, "rollback_pending", f"apply failed after a write: {reason}")
+        out = rollback(rec, ledger, bridge, root, now, skills_root=skills_root)
+        if out.state == "rolled_back":
+            after_path.unlink(missing_ok=True)
+            return _set_state(ledger, rec, "bridge_error", reason)
+        if out.state == "rollback_pending":  # the revert failed too: the cycle retries it
+            return _set_state(ledger, rec, "rollback_pending",
+                              f"apply failed after a write: {reason}; {out.reason}")
+        return out  # owner_changed
     rec.applied_at, rec.needs_restart = now, needs_restart(fix)
     rec.live_from = None if rec.needs_restart else now
     return _set_state(ledger, rec, "trial")
@@ -474,7 +495,7 @@ def rollback(record: FixRecord, ledger: Ledger, bridge: Bridge, root: Path, now:
     (state `owner_changed`); otherwise before.json is restored exactly (`rolled_back`)."""
     root = Path(root)
     skills_root = Path(skills_root) if skills_root is not None else root.parent / "skills"
-    if record.state not in APPLIED_STATES:
+    if record.state not in APPLIED_STATES and record.state != "rollback_pending":
         raise ValueError(f"fix {record.id} is {record.state}, not applied")
     vdir = ledger.version_dir(record.id)
     before, after = _read_json(vdir / "before.json"), _read_json(vdir / "after.json")
@@ -520,6 +541,8 @@ def rollback(record: FixRecord, ledger: Ledger, bridge: Bridge, root: Path, now:
                 _rollback_job(bridge, record.target, before["job"], after["job"], changed)
             if not d.exists():
                 pass
+            elif changed:  # the owner kept editing the job, which may still use the tool
+                changed.append("tool dir (the job may still use it)")
             elif _tool_matches(tools, after):
                 shutil.rmtree(d)
             else:

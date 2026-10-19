@@ -27,6 +27,7 @@ import fcntl
 import json
 import os
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,8 +39,8 @@ from .budget import DAY, JOB_KINDS, weekly_line
 from .cycle_draft import BASE_KEY, GLOBAL_KINDS, DraftSteps
 from .fingerprint import CopyIndex
 from .history import History, HistoryUnavailable
-from .ledger import (APPLIED_STATES, FixRecord, Ledger, _tool_files, apply, atomic_write,
-                     is_shadow_tool, rollback)
+from .ledger import (ACTIVE_STATES, APPLIED_STATES, FixRecord, Ledger, _tool_files, apply,
+                     atomic_write, is_shadow_tool, rollback)
 from .measure import priced_cost
 from .model import Fix, Pricing, Session
 from .proposals import apply_approved, approved, dropped
@@ -90,10 +91,14 @@ class CycleReport:
     pricing: dict | None = None   # the price list this run used (Pricing.to_dict)
 
 
-def run_cycle(cfg: CycleConfig, bridge: Bridge, now: float) -> CycleReport:
+def run_cycle(cfg: CycleConfig, bridge: Bridge, now: float,
+              clock: Callable[[], float] | None = None) -> CycleReport:
+    """`now` anchors the run's decisions. `clock` reads the time again where a step
+    depends on the time it actually happens (the restart, after drafting that can
+    take many minutes); it defaults to `now`."""
     report = CycleReport(dry_run=cfg.dry_run)
     if cfg.dry_run:
-        _Cycle(cfg, bridge, now, report).run()
+        _Cycle(cfg, bridge, now, report, clock).run()
         return report
     root = Path(cfg.root)
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -104,15 +109,17 @@ def run_cycle(cfg: CycleConfig, bridge: Bridge, now: float) -> CycleReport:
         except BlockingIOError:
             report.skipped = "already running"
             return report
-        _Cycle(cfg, bridge, now, report).run()
+        _Cycle(cfg, bridge, now, report, clock).run()
     finally:
         os.close(fd)  # releases the lock
     return report
 
 
 class _Cycle(DraftSteps):
-    def __init__(self, cfg: CycleConfig, bridge: Bridge, now: float, report: CycleReport):
+    def __init__(self, cfg: CycleConfig, bridge: Bridge, now: float, report: CycleReport,
+                 clock: Callable[[], float] | None = None):
         self.cfg, self.bridge, self.now, self.report = cfg, bridge, now, report
+        self.clock = clock if clock is not None else (lambda: now)
         self.root = Path(cfg.root)
         self.dry = cfg.dry_run
         self.restart_wanted = False
@@ -184,7 +191,7 @@ class _Cycle(DraftSteps):
         return not restarts or t >= max(restarts)
 
     def _global_active(self) -> bool:
-        return any(r.kind in GLOBAL_KINDS and r.state in ("shadow_pending", "trial", "applied")
+        return any(r.kind in GLOBAL_KINDS and r.state in ACTIVE_STATES
                    for r in self.ledger.records)
 
     # --- the run ---------------------------------------------------------------------
@@ -454,6 +461,9 @@ class _Cycle(DraftSteps):
     # 3. trials -------------------------------------------------------------------------
 
     def judge_trials(self) -> None:
+        # An apply that failed after a write left its change possibly live: retry the revert.
+        for rec in [r for r in self.ledger.records if r.state == "rollback_pending"]:
+            self._rollback(rec, "apply failed after a write; reverted")
         for rec in [r for r in self.ledger.records if r.state == "trial"]:
             if rec.applied_at is None:
                 continue
@@ -515,7 +525,7 @@ class _Cycle(DraftSteps):
         except (ValueError, OSError, KeyError) as exc:
             self.err(f"rollback {rec.id}: {type(exc).__name__}: {exc}")
             return
-        if out.state == "trial":
+        if out.state not in ("rolled_back", "owner_changed"):  # failed: retried next run
             self.err(f"rollback {rec.id}: {out.reason}")
             return
         out.decided_at = self.now
@@ -575,15 +585,16 @@ class _Cycle(DraftSteps):
                     if t is not None:
                         next_runs.append(t)
             last = self.history.last_activity()
-            if restart_allowed(datetime.fromtimestamp(self.now, timezone.utc), last, next_runs):
+            at = self.clock()  # drafting may have taken many minutes since self.now
+            if restart_allowed(datetime.fromtimestamp(at, timezone.utc), last, next_runs):
                 self.bridge.restart_gateway()
                 self.state["pending_restart"] = False
                 self.state["restart_times"] = [
-                    t for t in self._restart_times() if self.now - t < RESTART_KEEP_S] + [self.now]
+                    t for t in self._restart_times() if at - t < RESTART_KEEP_S] + [at]
                 self.report.restarted = True
                 for r in self.ledger.records:
                     if r.state in APPLIED_STATES and r.needs_restart and r.live_from is None:
-                        r.live_from = self.now
+                        r.live_from = at
                 self.ledger.save()
         except (BridgeError, HistoryUnavailable) as exc:
             self.err(f"restart: {type(exc).__name__}: {exc}")
