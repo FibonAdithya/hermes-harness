@@ -92,11 +92,13 @@ NEVER_TOUCH_JOBS = frozenset({"8da9a6857256"})
 # Spend and trials.
 WEEKLY_CAP_USD = 1.0
 DRAFT_EST_USD = 0.02  # ESTIMATE
-# Every tuner decision and figure prices a run from its tokens at this one rate
-# (measure.priced_cost), never from Hermes's estimated_cost_usd: that changed regime
-# when billing moved to a subscription (~2026-10-17, $0/NULL), so dollars before and
-# after the change are not comparable.
-USD_PER_MTOK = 0.42  # ESTIMATE: spec §2 Sept median $0.123 / 293.3k tokens
+# Every tuner decision and figure prices a run from its token breakdown at the
+# configured model's list prices (bridge `pricing` -> model.Pricing, then
+# measure.priced_cost), never from Hermes's estimated_cost_usd: that changed regime
+# when billing moved to a subscription (~2026-10-17, $0/NULL). One list prices both
+# sides of every comparison. When the lookup fails, the list stored in
+# cycle_state.json is used if fetched at most this long ago; else no pricing.
+PRICING_MAX_AGE_S = 7 * 86400
 JOB_TRIAL_RUNS = 5
 GLOBAL_TRIAL_DAYS = 7
 # A trial with no verdict this long after live_from (or applied_at while it waits

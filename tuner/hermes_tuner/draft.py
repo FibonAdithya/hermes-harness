@@ -15,7 +15,8 @@ from typing import Any
 from . import policy
 from .bridge import Bridge
 from .detect import Candidate
-from .model import Fix
+from .measure import priced_breakdown
+from .model import Fix, Pricing
 
 KINDS = ("composed_tool", "job_prompt", "config", "skill", "new_reach")
 JOB_FIELDS = ("id", "name", "schedule", "prompt", "enabled_toolsets")
@@ -144,20 +145,21 @@ def _count(v: Any) -> int:
     return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
 
 
-def _spend(reply: dict) -> float:
-    """Priced from the reply's token counts at USD_PER_MTOK, like every run
-    (measure.priced_cost); the reply's estimated_cost_usd is ignored."""
-    tokens = sum(_count(reply.get(k)) for k in ("input_tokens", "cache_read_tokens",
-                                                 "cache_write_tokens", "output_tokens"))
-    return tokens * policy.USD_PER_MTOK / 1e6
+def _spend(reply: dict, pricing: Pricing) -> float:
+    """The oneshot priced from its token breakdown at `pricing`'s list prices, like
+    every run (measure.priced_breakdown); the reply's estimated_cost_usd is ignored."""
+    tokens = [_count(reply.get(k)) for k in ("input_tokens", "cache_read_tokens",
+                                             "cache_write_tokens", "output_tokens")]
+    return priced_breakdown(tokens, pricing)
 
 
 def draft(candidate: Candidate, job: dict | None, skill_text: str | None,
           tool_schemas: dict[str, dict], call_shape: list[tuple[str, tuple[str, ...]]],
-          bridge: Bridge, now: float, max_tokens: int = 4000) -> tuple[Fix | None, float]:
+          bridge: Bridge, now: float, pricing: Pricing,
+          max_tokens: int = 4000) -> tuple[Fix | None, float]:
     """One model call. A BridgeError propagates; spend is reported for bad replies too."""
     instructions, user_input = build_request(candidate, job, skill_text, tool_schemas, call_shape)
     reply = bridge.oneshot(instructions, user_input, max_tokens)
     text = reply.get("text")
     fix = parse_draft(text, candidate, now) if isinstance(text, str) else None
-    return fix, _spend(reply)
+    return fix, _spend(reply, pricing)

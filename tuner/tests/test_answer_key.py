@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from factory import V4_PRO  # the answer key is judged at the v4-pro list prices
 from hermes_tuner import scrub
 from hermes_tuner.detect import Candidate, detect
 from tests.test_detect import DAY, GET, briefing_runs, call, schema_sessions, sess
@@ -60,7 +61,7 @@ def long_strings(path: Path) -> list[str]:
 
 @needs_fixture
 def test_answer_key_in_top_five():
-    cands = detect(scrub.load(FIXTURE), now=ANCHOR)
+    cands = detect(scrub.load(FIXTURE), now=ANCHOR, pricing=V4_PRO)
     assert missing_from_top5(cands) == [], [(c.kind, c.key, c.job_id) for c in cands[:5]]
 
 
@@ -84,7 +85,7 @@ def test_synthetic_history_satisfies_answer_key(tmp_path):
     out = tmp_path / "h.json.gz"
     scrub.dump(_history(), out, b"salt")
     now = max(s.started_at for s in scrub.load(out)) + DAY
-    assert missing_from_top5(detect(scrub.load(out), now=now)) == []
+    assert missing_from_top5(detect(scrub.load(out), now=now, pricing=V4_PRO)) == []
     assert long_strings(out) == []
 
 
@@ -93,7 +94,7 @@ def test_missing_items_are_reported_by_name(tmp_path):
     out = tmp_path / "h.json.gz"
     scrub.dump(briefing_runs(12, job=BRIEFING), out, b"salt")
     now = max(s.started_at for s in scrub.load(out)) + DAY
-    assert missing_from_top5(detect(scrub.load(out), now=now)) == [
+    assert missing_from_top5(detect(scrub.load(out), now=now, pricing=V4_PRO)) == [
         f"reread:{CALENDAR}", "schema_lookup"]
 
 
@@ -101,7 +102,7 @@ def test_sequence_for_another_job_does_not_count(tmp_path):
     out = tmp_path / "h.json.gz"
     scrub.dump(briefing_runs(12, job="ffffffffffff") + _history()[12:], out, b"salt")
     now = max(s.started_at for s in scrub.load(out)) + DAY
-    miss = missing_from_top5(detect(scrub.load(out), now=now))
+    miss = missing_from_top5(detect(scrub.load(out), now=now, pricing=V4_PRO))
     assert miss == ["sequence containing " + GET]
 
 

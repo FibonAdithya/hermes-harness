@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import pytest
 
 from hermes_tuner import draft as D
+from factory import FLAT, FLAT_RATE
 from hermes_tuner import policy
 from hermes_tuner.bridge import BridgeError, FakeBridge
 from hermes_tuner.detect import Candidate
@@ -146,29 +147,29 @@ def script(text, cost=0.01, i=100, o=50):
 
 
 def call_draft(bridge):
-    return D.draft(CAND, None, None, {}, [("a", ("k",))], bridge, NOW)
+    return D.draft(CAND, None, None, {}, [("a", ("k",))], bridge, NOW, FLAT)
 
 
 def test_draft_returns_fix_and_priced_spend():
     fix, spend = call_draft(FakeBridge(oneshot_script=[script(reply(), i=100, o=50)]))
-    assert fix is not None and spend == pytest.approx(150 * policy.USD_PER_MTOK / 1e6)
+    assert fix is not None and spend == pytest.approx(150 * FLAT_RATE / 1e6)
 
 
 def test_draft_returns_spend_even_when_unparseable():
     fix, spend = call_draft(FakeBridge(oneshot_script=[script("sorry, no", i=2000, o=1000)]))
-    assert fix is None and spend == pytest.approx(3000 * policy.USD_PER_MTOK / 1e6)
+    assert fix is None and spend == pytest.approx(3000 * FLAT_RATE / 1e6)
 
 
 @pytest.mark.parametrize("cost", [0.0, None, -1.0, 0.03, 5.0])
 def test_spend_is_priced_from_tokens_whatever_the_billing_says(cost):
     _fix, spend = call_draft(FakeBridge(oneshot_script=[script("x", cost=cost, i=1_000_000, o=0)]))
-    assert spend == pytest.approx(policy.USD_PER_MTOK)
+    assert spend == pytest.approx(FLAT_RATE)
 
 
 def test_spend_adds_input_and_output():
     _f, spend = call_draft(FakeBridge(oneshot_script=[
         script("x", cost=None, i=500_000, o=500_000)]))
-    assert spend == pytest.approx(policy.USD_PER_MTOK)
+    assert spend == pytest.approx(FLAT_RATE)
 
 
 def test_bridge_error_propagates():
@@ -178,7 +179,7 @@ def test_bridge_error_propagates():
 
 def test_draft_passes_request_and_max_tokens_to_oneshot():
     b = FakeBridge(oneshot_script=[script(reply())])
-    D.draft(CAND, {"id": "j"}, None, {}, [], b, NOW, max_tokens=123)
+    D.draft(CAND, {"id": "j"}, None, {}, [], b, NOW, FLAT, max_tokens=123)
     (_m, (instr, user, mt)), = b.calls
     assert instr == D.INSTRUCTIONS and mt == 123
     assert json.loads(user)["candidate"]["key"] == CAND.key
@@ -247,3 +248,13 @@ def test_instructions_pass_no_obvious_injection_phrases():
 def test_parse_draft_deeply_nested_reply_is_none(text):
     """m1: a reply that blows the JSON decoder's recursion is unparseable, not a crash."""
     assert D.parse_draft(text, CAND, NOW) is None
+
+
+def test_draft_spend_priced_from_breakdown():
+    from factory import V4_PRO
+    reply_ = {"text": "x", "input_tokens": 1_000_000, "cache_read_tokens": 2_000_000,
+              "cache_write_tokens": 1_000_000, "output_tokens": 1_000_000}
+    _f, spend = D.draft(CAND, None, None, {}, [], FakeBridge(oneshot_script=[reply_]), NOW,
+                        V4_PRO)
+    # fresh 0.435 + cache read 2 x 0.003625 + cache write at the input rate 0.435 + out 0.87
+    assert spend == pytest.approx(0.435 + 0.00725 + 0.435 + 0.87)

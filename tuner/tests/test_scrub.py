@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+from factory import FLAT
 from hermes_tuner import scrub
 from hermes_tuner.detect import detect
 from hermes_tuner.model import Session, ToolCall
@@ -40,8 +41,8 @@ def test_scrub_round_trip_keeps_detection_identical(tmp_path):
     scrub.dump(ss, tmp_path / "f.json.gz", SALT)
     back = scrub.load(tmp_path / "f.json.gz")
     assert len(back) == len(ss)
-    assert detect(back, NOW) == detect(ss, NOW)
-    assert detect(back, NOW)  # non-empty, so the equality means something
+    assert detect(back, NOW, FLAT) == detect(ss, NOW, FLAT)
+    assert detect(back, NOW, FLAT)  # non-empty, so the equality means something
 
 
 def test_round_trip_reread_still_found(tmp_path):
@@ -50,7 +51,7 @@ def test_round_trip_reread_still_found(tmp_path):
                                    f"r{r}", 1000) for i, r in enumerate(range(k, k + 7))))
             for k in range(1, 8)]
     scrub.dump(runs, tmp_path / "f.json.gz", SALT)
-    got = [c for c in detect(scrub.load(tmp_path / "f.json.gz"), NOW) if c.kind == "reread"]
+    got = [c for c in detect(scrub.load(tmp_path / "f.json.gz"), NOW, FLAT) if c.kind == "reread"]
     assert got[0].occurrences == 36
 
 

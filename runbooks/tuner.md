@@ -26,7 +26,7 @@ All under `~/.hermes/tuner/` (mode 700, files 600):
 | Path | Contents |
 |---|---|
 | `ledger.json` | every fix the tuner has handled, one record each |
-| `cycle_state.json` | pending restart flag, restart times (28 days), last weekly line written, error log (28 days) |
+| `cycle_state.json` | pending restart flag, restart times (28 days), last weekly line written, error log (28 days), the last price list looked up (`pricing`, with `fetched_at`) |
 | `versions/<id>/fix.json` | the full fix as drafted |
 | `versions/<id>/before.json` | live values before the fix was applied (the rollback source) |
 | `versions/<id>/after.json` | the values the fix wrote |
@@ -187,7 +187,13 @@ These are yours. The tuner never does them and its policy forbids changing
 One line a week, sent by the approvals bot from `outbox/`:
 
 ```
-Hermes tuner: saved ~$X.XX this week (ESTIMATE), A applied, K kept, R rolled back; tuner spent $Y.YY
+Hermes tuner: saved ~$X.XX this week (ESTIMATE at <model> list prices, <pricing version>), A applied, K kept, R rolled back; tuner spent $Y.YY
+```
+
+or, in a week with no price list (see Model prices below):
+
+```
+Hermes tuner: savings unknown this week (pricing unavailable), A applied, K kept, R rolled back; tuner spend unknown
 ```
 
 with `; errors: N (see ~/.hermes/tuner/cycle_state.json and ledger.json)`
@@ -195,8 +201,40 @@ appended when the tuner logged errors that week. The messages are in the
 `errors` list of `cycle_state.json` (last 28 days); records that failed have the
 reason in `ledger.json`.
 
-Every dollar figure is an ESTIMATE. Hermes's `estimated_cost_usd` changed regime
-when billing moved to the subscription (it reads $0), so the tuner never uses it:
-every decision and figure prices a run from its tokens at one fixed rate,
-`policy.USD_PER_MTOK` (0.42 $/Mtok, from the September median). Figures are
-comparable week to week but are not an invoice.
+## Model prices
+
+Every dollar figure is an ESTIMATE at list prices, not an invoice. Hermes's
+`estimated_cost_usd` changed regime when billing moved to the subscription (it
+reads $0), so the tuner never uses it. Instead, each run asks Hermes for the price
+list of the main model in `config.yaml` (`model.default`, `model.provider`,
+`model.base_url`): Hermes's `get_pricing_entry` looks at the provider's `/models`
+API, then at its own dated snapshot of the vendor's pricing page. If the provider
+has no real list (none, or the all-zero `included-route` entry a subscription
+gets), the tuner asks again for the model's vendor (the part of the model id
+before `/`, e.g. `deepseek` for `deepseek/deepseek-v4-pro`). For `deepseek-v4-pro`
+the snapshot is $0.435 input, $0.003625 cache read, $0.87 output per million
+tokens (`deepseek-pricing-2026-07`, from api-docs.deepseek.com/quick_start/pricing).
+
+Each run is priced from its token breakdown: fresh input, cache reads, cache
+writes and output, each at its own rate (a missing cache rate counts as the input
+rate). The same list prices both sides of every comparison; a trial's baseline is
+stored as token counts at go-live (`baseline_runs` in `ledger.json`) and priced
+under the current list when it is judged, so a price change never makes a fix look
+better or worse. `baseline_cost` in the ledger is only the figure at go-live.
+
+See the list the tuner would use:
+
+```bash
+cd ~/hermes-harness/tuner && .venv/bin/python -m hermes_tuner pricing
+```
+
+When the lookup fails, the run uses the list stored in `cycle_state.json` if it is
+at most 7 days old (`policy.PRICING_MAX_AGE_S`) and logs `pricing lookup failed;
+using cached list from <date>`. Otherwise it logs `no model pricing` and runs
+without prices: it still cleans up shadows, checks shadow quality, applies
+approved proposals, rolls back trials past their 21-day deadline, restarts the
+gateway and writes the weekly line (without dollar figures), but it drafts nothing
+and gives no trial a cost verdict (trials stay `trial`). If Hermes's snapshot is
+out of date, updating Hermes updates the prices; the tuner never scrapes a pricing
+page. `detect --pricing FILE` takes a list as `pricing` prints it, to run the
+detector without asking Hermes.

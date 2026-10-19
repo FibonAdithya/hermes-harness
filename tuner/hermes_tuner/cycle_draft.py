@@ -20,7 +20,7 @@ from .draft import draft
 from .fingerprint import CopyIndex
 from .ledger import FixRecord, _Failed, apply, needs_restart, write_shadow_tool
 from .limits import LimitContext, check_fix
-from .measure import INTERIM_FLAT_PRICING, priced_cost
+from .measure import priced_cost
 from .model import Fix, Session
 from .proposals import approved_callables, write_proposal
 
@@ -74,15 +74,21 @@ class DraftSteps:
     # 5-7. budget, detect, draft ----------------------------------------------------------
 
     def _job_cost(self, job_id: str) -> float:
-        costs = [priced_cost(s, INTERIM_FLAT_PRICING) for s in job_runs(self.sessions, job_id)
+        costs = [priced_cost(s, self.pricing) for s in job_runs(self.sessions, job_id)
                  if s.started_at >= self.now - 28 * DAY]
         return median(costs) if costs else 0.0
 
     def draft_fixes(self) -> None:
-        now = self.now
-        week = tuner_spend(self.ledger, self.sessions, self.shadow_ids, iso_week_start(now))
-        spend28 = tuner_spend(self.ledger, self.sessions, self.shadow_ids, now - 28 * DAY)
-        saved28 = savings(self.ledger, self.sessions, now - 28 * DAY, now)
+        """Skipped without a price list: the budget, the detector's ranking and the
+        trial baseline all need one (the cycle reported "no model pricing")."""
+        if self.pricing is None:
+            return
+        now, pricing = self.now, self.pricing
+        week = tuner_spend(self.ledger, self.sessions, self.shadow_ids, iso_week_start(now),
+                           pricing)
+        spend28 = tuner_spend(self.ledger, self.sessions, self.shadow_ids, now - 28 * DAY,
+                              pricing)
+        saved28 = savings(self.ledger, self.sessions, now - 28 * DAY, now, pricing)
         if spend28 > saved28:
             self.report.budget = (f"paused: 28-day spend ${spend28:.4f} > 28-day savings "
                                   f"${saved28:.4f} (ESTIMATE)")
@@ -90,7 +96,7 @@ class DraftSteps:
         window = [s for s in self.sessions if s.started_at >= now - 28 * DAY]
         self.skill_names = self._skill_names(window)
         self.window = window
-        cands = detect(window, now, self.skill_names)
+        cands = detect(window, now, pricing, self.skill_names)
         for cand in self._select(cands):
             job_cost = self._job_cost(cand.job_id) if cand.job_id else 0.0
             projected = policy.DRAFT_EST_USD + job_cost
@@ -181,7 +187,7 @@ class DraftSteps:
             skill_text = path.read_text(encoding="utf-8", errors="replace")
         try:
             fix, spend = draft(cand, job, skill_text, {}, self._call_shape(cand),
-                               self.bridge, self.now)
+                               self.bridge, self.now, self.pricing)
         except BridgeError as exc:
             self.err(f"draft {cand.key}: {exc}")
             return 0.0, False

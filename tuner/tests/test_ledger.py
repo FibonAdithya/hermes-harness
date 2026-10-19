@@ -719,6 +719,9 @@ def test_fake_bridge_pricing_is_settable_and_not_mutating():
     assert "pricing" not in FakeBridge.MUTATING
     b = FakeBridge()
     assert b.pricing() == bridge_mod.FAKE_PRICE
+    from factory import FLAT  # the tests' arithmetic assumes the fake's list is FLAT
+    from hermes_tuner.model import Pricing
+    assert Pricing.from_dict(bridge_mod.FAKE_PRICE) == FLAT
     b.price = {"model": "m", "input_per_m": 1.0, "output_per_m": 2.0}
     got = b.pricing()
     got["input_per_m"] = 9.0  # a copy: the caller cannot change the fake's list

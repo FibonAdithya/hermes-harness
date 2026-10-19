@@ -53,6 +53,12 @@ class FixRecord:
     # When the fix took effect: applied_at, or for a fix that needs a gateway restart
     # the restart time (spec 4.7). None until then.
     live_from: float | None = None
+    # Token breakdowns [input, cache read, cache write, output] of the runs the trial
+    # is compared against, stored at go-live (trial.baseline_runs). Verdicts and
+    # savings price them under the CURRENT list, so a price change never compares two
+    # lists. None on records saved before it existed: judged "continue" until the
+    # trial deadline, no saving. baseline_cost is the display value at go-live.
+    baseline_runs: list[list[int]] | None = None
 
 
 # --- atomic file helpers ------------------------------------------------------

@@ -1,17 +1,8 @@
 import pytest
 from hermes_tuner.measure import chat_stats, job_stats, priced_cost
+from factory import FLAT, V4_PRO
 from hermes_tuner.model import Pricing, Session, ToolCall
 
-# The v4-pro list (Hermes snapshot of DeepSeek's pricing page, deepseek-pricing-2026-07).
-V4_PRO = Pricing(model="deepseek-v4-pro", input_per_m=0.435, output_per_m=0.87,
-                 cache_read_per_m=0.003625, cache_write_per_m=None,
-                 source="official_docs_snapshot",
-                 source_url="https://api-docs.deepseek.com/quick_start/pricing",
-                 version="deepseek-pricing-2026-07", fetched_at=0.0)
-# One rate for every token kind: keeps the median arithmetic below easy to read.
-FLAT = Pricing(model="flat", input_per_m=0.42, output_per_m=0.42, cache_read_per_m=None,
-               cache_write_per_m=None, source="test", source_url=None, version="flat",
-               fetched_at=0.0)
 PER_TOKEN = 0.42 / 1e6
 
 

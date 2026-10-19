@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from factory import make_db
+from factory import FLAT, FLAT_RATE, V4_PRO, make_db
 from hermes_tuner import policy
 from hermes_tuner.__main__ import main
 from hermes_tuner.bridge import FakeBridge as _FakeBridge
@@ -65,8 +65,8 @@ def triage_calls(n):
 
 
 def tok(usd):
-    """Token count whose priced cost (policy.USD_PER_MTOK) is `usd`."""
-    return round(usd * 1e6 / policy.USD_PER_MTOK)
+    """Token count whose priced cost at FLAT (FakeBridge's default list) is `usd`."""
+    return round(usd * 1e6 / FLAT_RATE)
 
 
 def triage_runs(days=range(1, 13), cost=0.10, start_hour=7, raw=0.0, tokens=None, base=None):
@@ -177,18 +177,21 @@ def kept_cal_fix(cfg):
               "seq:cal")
     add_record(cfg, FixRecord(fix.id, fix.kind, CAL, fix.candidate_key, "kept",
                               NOW - 20 * DAY, applied_at=NOW - 20 * DAY,
-                              baseline_cost=0.50, live_from=NOW - 20 * DAY), fix)
+                              baseline_runs=[brk(0.50, 500)] * 10, live_from=NOW - 20 * DAY), fix)
     return cal_runs(range(21, 41), 0.50) + cal_runs(range(1, 20), 0.10)
 
 
-def config_trial(cfg, applied_days_ago=8):
+def config_trial(cfg, applied_days_ago=8, baseline_runs=None):
+    """A config trial whose stored baseline is 20 runs at $0.10 (triage_runs' price)."""
     fix = Fix("20261011-dddd0001", "config", CFG_KEY, {"key": CFG_KEY, "value": 0.7},
               "schema_lookup")
     led = add_record(cfg, FixRecord(fix.id, "config", CFG_KEY, fix.candidate_key, "trial",
                                     NOW - applied_days_ago * DAY,
                                     applied_at=NOW - applied_days_ago * DAY,
                                     needs_restart=True,
-                                    live_from=NOW - applied_days_ago * DAY), fix)
+                                    live_from=NOW - applied_days_ago * DAY,
+                                    baseline_runs=([brk(0.10)] * 20 if baseline_runs is None
+                                                   else baseline_runs)), fix)
     vdir = led.version_dir(fix.id)
     (vdir / "before.json").write_text(json.dumps({"key": CFG_KEY, "value": 0.5}))
     (vdir / "after.json").write_text(json.dumps({"key": CFG_KEY, "value": 0.7}))
@@ -350,22 +353,22 @@ def test_weekly_saving_is_baseline_minus_actual(tmp_path, live_days_ago, saved):
     led = Ledger(tmp_path)
     applied = NOW - 10 * DAY
     led.records.append(FixRecord("20261009-abcd0001", "job_prompt", TRIAGE, "seq:x", "kept",
-                                 applied, applied_at=applied, baseline_cost=0.12,
+                                 applied, applied_at=applied, baseline_runs=[brk(0.12, 0)] * 5,
                                  decided_at=NOW - 2 * DAY, live_from=NOW - live_days_ago * DAY))
     # waiting for a restart: never counted
     led.records.append(FixRecord("20261009-abcd0003", "job_prompt", CAL, "seq:c", "trial",
                                  applied, applied_at=applied, needs_restart=True))
-    # runs before applied_at priced at $0.30: the saving uses the baseline stored at go-live
-    # ($0.12), not a recomputed one (the history window no longer reaches back for it)
+    # runs before applied_at priced at $0.30: the saving uses the baseline runs stored at
+    # go-live ($0.12), not a recomputed one (the history window no longer reaches back)
     sessions = [run_session(TRIAGE, applied - d * DAY, 0.30) for d in range(1, 6)]
     sessions += [run_session(TRIAGE, NOW - d * DAY, 0.05) for d in (8, 9)]  # before the week
     sessions += [run_session(TRIAGE, NOW - d * DAY, 0.05) for d in (1, 2, 3)]  # this week
     sessions += [run_session(TRIAGE, NOW - 4 * DAY, 0.30, n_calls=0)]  # outage: not a run
     sessions += [run_session(CAL, applied - d * DAY, 0.05) for d in range(1, 6)]
     sessions += [run_session(CAL, NOW - DAY, 0.01)]  # its fix awaits a restart: not counted
-    line = weekly_line(led, sessions, NOW)
-    assert line == (f"Hermes tuner: saved ~${saved} this week (ESTIMATE), 0 applied, 1 kept, "
-                    "0 rolled back; tuner spent $0.00")
+    line = weekly_line(led, sessions, NOW, FLAT)
+    assert line == (f"Hermes tuner: saved ~${saved} this week (ESTIMATE at fake-model list "
+                    "prices, fake-flat), 0 applied, 1 kept, 0 rolled back; tuner spent $0.00")
 
 
 def test_tuner_spend_prices_shadow_runs_from_tokens(tmp_path):
@@ -375,7 +378,7 @@ def test_tuner_spend_prices_shadow_runs_from_tokens(tmp_path):
     shadow = Session(id=sid(SHADOW_JOB, NOW - DAY), source="cron", job_id=SHADOW_JOB,
                      started_at=NOW - DAY, est_cost=0.0, prompt_tokens=tok(0.05),
                      output_tokens=0, calls=(), input_tokens=tok(0.05))
-    line = weekly_line(led, [shadow], NOW, shadow_ids={SHADOW_JOB})
+    line = weekly_line(led, [shadow], NOW, FLAT, shadow_ids={SHADOW_JOB})
     assert line.endswith("; tuner spent $0.08")  # 0.03 drafting + 0.05 shadow (billed $0)
 
 
@@ -384,10 +387,10 @@ def test_weekly_line_counts_errors(tmp_path):
     led.records.append(FixRecord("20261018-abcd0002", "config", CFG_KEY, "k", "bridge_error",
                                  NOW - DAY, spend_usd=0.03))
     # the cycle logs each failure once, bridge_error records included: not counted twice
-    line = weekly_line(led, [], NOW, errors=1)
+    line = weekly_line(led, [], NOW, FLAT, errors=1)
     assert line.endswith("; tuner spent $0.03; errors: 1 "
                          "(see ~/.hermes/tuner/cycle_state.json and ledger.json)")
-    assert "errors" not in weekly_line(led, [], NOW, errors=0)
+    assert "errors" not in weekly_line(led, [], NOW, FLAT, errors=0)
 
 
 # --- spec 4.3: nothing from results or argument values reaches the drafting model -------------
@@ -518,14 +521,38 @@ def test_cli_scrub_then_detect_from_fixture(env, capsys):
     assert main(["scrub", "--db", str(env.db), "--out", str(out)]) == 0
     raw = gzip.decompress(out.read_bytes())
     assert RESULT_SENTINEL.encode() not in raw and ARG_SENTINEL.encode() not in raw
-    assert main(["detect", "--db", str(env.db), "--fixture", str(out),
-                 "--now", "2026-10-19"]) == 0
+    bridge = FakeBridge()
+    assert main(["detect", "--fixture", str(out), "--now", "2026-10-19"], bridge=bridge) == 0
     lines = capsys.readouterr().out.splitlines()
     assert 1 <= len(lines) <= 10
     assert all(json.loads(x)["job_id"] == TRIAGE for x in lines)
+    assert bridge.calls == [("pricing", ())]  # no --pricing: the price list comes from Hermes
     # anchored a year later, the 28-day window is empty
-    assert main(["detect", "--db", str(env.db), "--now", "2027-10-19"]) == 0
+    assert main(["detect", "--db", str(env.db), "--now", "2027-10-19"], bridge=bridge) == 0
     assert capsys.readouterr().out == ""
+
+
+def test_cli_detect_prices_from_a_pricing_file(env, capsys, tmp_path):
+    build(env, triage_runs())
+    flat, doubled = tmp_path / "flat.json", tmp_path / "doubled.json"
+    flat.write_text(json.dumps(FLAT.to_dict()))
+    doubled.write_text(json.dumps(FLAT.to_dict() | {"input_per_m": 2 * FLAT_RATE,
+                                                    "output_per_m": 2 * FLAT_RATE}))
+    bridge = FakeBridge(fail={"pricing"})
+    usd = []
+    for f in (flat, doubled):
+        assert main(["detect", "--db", str(env.db), "--now", "2026-10-19", "--pricing", str(f)],
+                    bridge=bridge) == 0
+        usd.append(json.loads(capsys.readouterr().out.splitlines()[0])["est_monthly_usd"])
+    assert usd[1] == pytest.approx(2 * usd[0]) and usd[0] > 0
+    assert bridge.calls == []  # the file is used; Hermes is not asked
+    with pytest.raises(SystemExit):
+        main(["detect", "--now", "2026-10-19", "--pricing", str(flat)], bridge=bridge)
+
+
+def test_cli_pricing_prints_the_resolved_list(capsys):
+    assert main(["pricing"], bridge=FakeBridge(price=V4_PRO.to_dict())) == 0
+    assert json.loads(capsys.readouterr().out) == V4_PRO.to_dict()
 
 
 # --- restart-aware shadows and trials (spec 4.5, 4.7) ------------------------------------
@@ -605,7 +632,7 @@ def test_trial_counts_runs_from_live_from(env, live_from):
     fix = Fix("20261009-aaaa0002", "job_prompt", TRIAGE, {"prompt": "p", "add_toolsets": []},
               "seq:x")
     add_record(env, FixRecord(fix.id, fix.kind, TRIAGE, "seq:x", "trial", NOW - 10 * DAY,
-                              applied_at=NOW - 10 * DAY, baseline_cost=0.20,
+                              applied_at=NOW - 10 * DAY, baseline_runs=[brk(0.20)] * 10,
                               needs_restart=True, live_from=live_from), fix)
     run_cycle(env, FakeBridge(jobs=jobs()), NOW)
     assert Ledger.load(env.root).get(fix.id).state == "trial"
@@ -892,7 +919,7 @@ def test_unexpected_error_after_drafting_still_records_the_spend(env, monkeypatc
     assert any("limits exploded" in e for e in report.errors)
     (rec,) = Ledger.load(env.root).records
     assert rec.state == "rejected"
-    assert rec.spend_usd == pytest.approx(12_000 * policy.USD_PER_MTOK / 1e6)
+    assert rec.spend_usd == pytest.approx(12_000 * FLAT_RATE / 1e6)
     assert report.spend_usd == pytest.approx(rec.spend_usd)
     assert (env.root / "outbox" / "weekly-2026-W43.txt").exists()
 
@@ -924,7 +951,7 @@ def test_job_trial_short_of_runs_is_rolled_back_after_21_days(env, age, rolled):
     fix = Fix("20260928-aaaa0009", "job_prompt", TRIAGE, {"prompt": "p", "add_toolsets": []},
               "seq:x")
     led = add_record(env, FixRecord(fix.id, fix.kind, TRIAGE, "seq:x", "trial", NOW - age,
-                                    applied_at=NOW - age, baseline_cost=0.10,
+                                    applied_at=NOW - age, baseline_runs=[brk(0.10)] * 10,
                                     live_from=NOW - age), fix)
     vdir = led.version_dir(fix.id)
     (vdir / "before.json").write_text(json.dumps(
@@ -940,3 +967,165 @@ def test_job_trial_short_of_runs_is_rolled_back_after_21_days(env, age, rolled):
         assert bridge.jobs[TRIAGE]["prompt"] == "Triage the inbox."
     else:
         assert rec.state == "trial" and bridge.jobs[TRIAGE]["prompt"] == "p"
+
+
+# --- model pricing (amendment 2026-10-19-hermes-tuner-pricing) -------------------------------
+
+def brk(usd, out=1000):
+    """A stored baseline run [input, cache read, cache write, output] priced `usd` at FLAT."""
+    return [tok(usd) - out, 0, 0, out]
+
+
+@pytest.mark.parametrize("priced", [False, True])
+def test_no_pricing_skips_drafting_and_verdicts_but_runs_safety_steps(env, priced):
+    build(env, triage_runs(range(1, 30)) + cal_runs(range(1, 10), 0.05))
+    # a calendar trial live 10 days: 9 runs at $0.05 against a $0.50 baseline ("keep")
+    cal = Fix("20261009-cccc0002", "job_prompt", CAL, {"prompt": "p", "add_toolsets": []},
+              "seq:cal")
+    add_record(env, FixRecord(cal.id, cal.kind, CAL, cal.candidate_key, "trial", NOW - 10 * DAY,
+                              applied_at=NOW - 10 * DAY, live_from=NOW - 10 * DAY,
+                              baseline_runs=[brk(0.50, 500)] * 10), cal)
+    cfg_fix = config_trial(env, applied_days_ago=22)  # past the 21-day deadline
+    bridge = FakeBridge(jobs=jobs(), config={CFG_KEY: 0.7},
+                        oneshot_script=[reply(JOB_PROMPT_REPLY)],
+                        fail=set() if priced else {"pricing"})
+    report = run_cycle(env, bridge, NOW)
+    led = Ledger.load(env.root)
+    line = (env.root / "outbox" / "weekly-2026-W43.txt").read_text()
+    assert led.get(cfg_fix.id).state == "rolled_back" and bridge.config[CFG_KEY] == 0.5
+    if priced:  # the control: the same run with a price list drafts and judges
+        assert len(oneshots(bridge)) == 1
+        assert led.get(cal.id).state == "kept"
+        assert led.get(cfg_fix.id).reason == "trial: not cheaper than baseline"
+        assert "pricing unavailable" not in line and "no model pricing" not in report.errors
+    else:
+        assert oneshots(bridge) == []
+        assert led.get(cal.id).state == "trial"
+        assert led.get(cfg_fix.id).reason == "no verdict in 21 days"
+        assert "pricing unavailable" in line and "$" not in line
+        assert "no model pricing" in report.errors
+
+
+@pytest.mark.parametrize("extra, used", [(0, True), (1, False)])
+def test_cached_pricing_used_within_max_age_not_after(env, extra, used):
+    build(env, triage_runs())
+    fetched = NOW - policy.PRICING_MAX_AGE_S - extra
+    env.root.mkdir(parents=True, exist_ok=True)
+    cached = FLAT.to_dict() | {"fetched_at": fetched}
+    (env.root / "cycle_state.json").write_text(json.dumps({"pricing": cached}))
+    bridge = FakeBridge(jobs=jobs(), oneshot_script=[reply(JOB_PROMPT_REPLY)], fail={"pricing"})
+    report = run_cycle(env, bridge, NOW)
+    day = datetime.fromtimestamp(fetched, timezone.utc).strftime("%Y-%m-%d")
+    if used:
+        assert len(oneshots(bridge)) == 1
+        assert f"pricing lookup failed; using cached list from {day}" in report.errors
+        assert "no model pricing" not in report.errors
+    else:
+        assert oneshots(bridge) == [] and "no model pricing" in report.errors
+    assert state(env)["pricing"]["fetched_at"] == fetched  # a failed lookup stores nothing
+
+
+def test_pricing_lookup_is_stored_with_its_fetch_time(env):
+    build(env, triage_runs())
+    bridge = FakeBridge(jobs=jobs(), price=V4_PRO.to_dict() | {"fetched_at": 5.0})
+    report = run_cycle(env, bridge, NOW)
+    assert state(env)["pricing"] == V4_PRO.to_dict() | {"fetched_at": NOW}
+    assert report.pricing == V4_PRO.to_dict() | {"fetched_at": NOW}
+    assert bridge.calls.count(("pricing", ())) == 1
+
+
+def test_dry_run_reports_pricing_and_its_failure(env):
+    build(env, triage_runs())
+    report = run_cycle(CycleConfig(**{**env.__dict__, "dry_run": True}),
+                       FakeBridge(jobs=jobs(), price=V4_PRO.to_dict()), NOW)
+    assert report.pricing["model"] == "deepseek-v4-pro" and not (env.root / "cycle_state.json").exists()
+    bad = run_cycle(CycleConfig(**{**env.__dict__, "dry_run": True}),
+                    FakeBridge(jobs=jobs(), fail={"pricing"}), NOW)
+    assert bad.pricing is None and "no model pricing" in bad.errors
+
+
+def test_pricing_change_rebases_baseline(env):
+    """Live under list A (baseline_runs stored); trial runs have exactly the baseline's
+    tokens; then list B halves every rate. B on both sides: equal cost -> rollback. A
+    baseline priced under A against runs under B would look 50% cheaper -> keep."""
+    list_a = FLAT.to_dict()
+    list_b = FLAT.to_dict() | {"input_per_m": FLAT_RATE / 2, "output_per_m": FLAT_RATE / 2,
+                               "pricing_version": "halved"}
+    fix = shadow_setup(env, old_mod=[], new_mod=[],
+                       base_runs=triage_runs(range(2, 30), cost=0.10))
+    bridge = FakeBridge(jobs=jobs(), price=list_a)
+    run_cycle(env, bridge, NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    # days 2..28 lie inside [applied_at - 28 d, applied_at), plus yesterday's live run
+    assert rec.state == "trial" and len(rec.baseline_runs) == 28
+    assert brk(0.10) in rec.baseline_runs
+    later = triage_runs(range(-5, 0), cost=0.10)  # the 5 days after NOW, same tokens
+    env.db.unlink()
+    build(env, SETUP_SESSIONS[env.root] + later)
+    bridge.price = list_b
+    report = run_cycle(env, bridge, NOW + 6 * DAY)
+    assert Ledger.load(env.root).get(fix.id).state == "rolled_back"
+    assert fix.id in report.rolled_back
+
+
+def test_savings_use_stored_baseline_runs_without_history(tmp_path):
+    """A kept fix applied 400 days ago: its baseline window is far outside the loaded
+    history, so the saving can only come from the stored baseline_runs."""
+    led = Ledger(tmp_path)
+    applied = NOW - 400 * DAY
+    led.records.append(FixRecord("20250915-abcd0001", "job_prompt", TRIAGE, "seq:x", "kept",
+                                 applied, applied_at=applied, live_from=applied,
+                                 decided_at=applied + 10 * DAY,
+                                 baseline_runs=[brk(0.12, 0)] * 5))
+    sessions = [run_session(TRIAGE, NOW - d * DAY, 0.05) for d in (1, 2, 3)]
+    assert weekly_line(led, sessions, NOW, FLAT).startswith("Hermes tuner: saved ~$0.21 ")
+
+
+def test_weekly_line_names_price_source(tmp_path):
+    led = Ledger(tmp_path)
+    assert weekly_line(led, [], NOW, V4_PRO) == (
+        "Hermes tuner: saved ~$0.00 this week (ESTIMATE at deepseek-v4-pro list prices, "
+        "deepseek-pricing-2026-07), 0 applied, 0 kept, 0 rolled back; tuner spent $0.00")
+    assert weekly_line(led, [], NOW, None) == (
+        "Hermes tuner: savings unknown this week (pricing unavailable), 0 applied, "
+        "0 kept, 0 rolled back; tuner spend unknown")
+
+
+def test_global_fix_stores_baseline_runs_at_go_live(env):
+    """A drafted config fix goes live with the chat and editable-job runs of the 28 days
+    before it as token counts (what its verdict is priced from); other jobs' runs and
+    runs without tool calls are not in it."""
+    sessions = []
+    for d in range(1, 22):  # 21 chat sessions with two tool_describe calls each
+        sessions.append({"id": f"2026{d:04d}_000000_ab12cd", "source": "telegram",
+                         "started_at": NOW - d * DAY, "cost": 0.05, "in": 1000 + d,
+                         "cache": 7, "cw": 3, "out": 10,
+                         "calls": [("tool_describe", {"name": "a"}, "s" * 300),
+                                   ("tool_describe", {"name": "b"}, "s" * 300)]})
+    sessions.append({"id": sid("0123456789ab", NOW - DAY), "source": "cron",
+                     "started_at": NOW - DAY, "in": 5, "out": 5,
+                     "calls": [("web_search", {}, "r")]})                 # not an editable job
+    sessions.append({"id": "20261018_000000_cd34ef", "source": "telegram",
+                     "started_at": NOW - DAY, "in": 9, "out": 9})          # no tool calls
+    sessions += cal_runs([2], 0.05)
+    build(env, sessions)
+    cfg_reply = {"kind": "config", "target": CFG_KEY, "payload": {"key": CFG_KEY, "value": 0.7}}
+    bridge = FakeBridge(jobs=jobs(), config={CFG_KEY: 0.5}, oneshot_script=[reply(cfg_reply)])
+    run_cycle(env, bridge, NOW)
+    (rec,) = [r for r in Ledger.load(env.root).records if r.kind == "config"]
+    assert rec.state == "trial"
+    chats = sorted([1000 + d, 7, 3, 10] for d in range(1, 22))
+    assert sorted(rec.baseline_runs) == sorted(chats + [[tok(0.05) - 500, 0, 0, 500]])
+
+
+def test_global_record_without_baseline_runs_waits_for_the_deadline(env):
+    """A config trial saved before baseline_runs existed is due for a verdict (8 days
+    live) but has nothing to be priced against: it continues; the deadline decides."""
+    build(env, triage_runs(range(1, 30)))
+    fix = config_trial(env)
+    led = Ledger.load(env.root)
+    led.get(fix.id).baseline_runs = None
+    led.save()
+    bridge = FakeBridge(jobs=jobs(), config={CFG_KEY: 0.7})
+    run_cycle(env, bridge, NOW)
+    assert Ledger.load(env.root).get(fix.id).state == "trial" and bridge.config[CFG_KEY] == 0.7

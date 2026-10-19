@@ -13,10 +13,11 @@ from hermes_tuner.bridge import FakeBridge
 from hermes_tuner.ledger import FixRecord
 from hermes_tuner.measure import JobStats
 from hermes_tuner.model import Fix, Session, ToolCall
+from hermes_tuner.model import Pricing
 from hermes_tuner.trial import (
-    Verdict, baseline_stats, calendar_events, cleanup_shadows, compare_calendar,
-    compare_triage, read_intents, schedule_shadow, trial_stats, triage_decisions,
-    trial_verdict)
+    BASELINE_MAX_RUNS, Verdict, baseline_runs, calendar_events, cleanup_shadows,
+    compare_calendar, compare_triage, read_intents, schedule_shadow, trial_stats,
+    triage_decisions, trial_verdict)
 
 LIVE = "3bc4e11d29b1"
 GET = "mcp__google__get_gmail_message_content"
@@ -148,9 +149,20 @@ def test_calendar_title_case_and_space_insensitive():
 
 # --- trial verdict --------------------------------------------------------------
 
+# $1 per million for every token kind: a run of N fresh input tokens costs N / 1e6.
+UNIT = Pricing(model="unit", input_per_m=1.0, output_per_m=1.0, cache_read_per_m=None,
+               cache_write_per_m=None, source="test", source_url=None, version="unit",
+               fetched_at=0.0)
+
+
+def runs_at(usd, n=10):
+    """`n` baseline breakdowns [input, cache read, cache write, output] costing `usd` at UNIT."""
+    return [[round(usd * 1e6), 0, 0, 0]] * n
+
+
 def rec(**kw):
     base = dict(id="f1", kind="job_prompt", target=LIVE, candidate_key="k", state="trial",
-                created_at=1.0, applied_at=1000.0, baseline_cost=0.10)
+                created_at=1.0, applied_at=1000.0, baseline_runs=runs_at(0.10))
     base.update(kw)
     return FixRecord(**base)
 
@@ -160,31 +172,43 @@ def stats(runs=5, cost=0.05, tokens=1000.0):
 
 
 def test_trial_continue_until_five_runs_then_judges():
-    assert trial_verdict(rec(), None, 1000.0) == "continue"
-    assert trial_verdict(rec(), stats(runs=4, cost=0.01), 1000.0) == "continue"
-    assert trial_verdict(rec(), stats(runs=5, cost=0.09), 1000.0) == "keep"
-    assert trial_verdict(rec(), stats(runs=5, cost=0.10), 1000.0) == "rollback"
-    assert trial_verdict(rec(), stats(runs=5, cost=0.11), 1000.0) == "rollback"
+    assert trial_verdict(rec(), None, UNIT) == "continue"
+    assert trial_verdict(rec(), stats(runs=4, cost=0.01), UNIT) == "continue"
+    assert trial_verdict(rec(), stats(runs=5, cost=0.09), UNIT) == "keep"
+    assert trial_verdict(rec(), stats(runs=5, cost=0.10), UNIT) == "rollback"
+    assert trial_verdict(rec(), stats(runs=5, cost=0.11), UNIT) == "rollback"
+
+
+def test_baseline_is_the_median_of_stored_runs_at_the_given_prices():
+    r = rec(baseline_runs=[[100_000, 0, 0, 0], [80_000, 0, 0, 0], [900_000, 0, 0, 0]])
+    assert trial_verdict(r, stats(cost=0.099), UNIT) == "keep"      # median 0.10, not mean
+    assert trial_verdict(r, stats(cost=0.101), UNIT) == "rollback"
+    double = Pricing(**{**UNIT.to_dict(), "input_per_m": 2.0})
+    assert trial_verdict(r, stats(cost=0.199), double) == "keep"     # priced at `pricing`
+
+
+def test_record_without_baseline_runs_continues():
+    """Older records (no baseline_runs) are not judged on cost: the deadline decides."""
+    assert trial_verdict(rec(baseline_runs=None), stats(cost=0.0001), UNIT) == "continue"
 
 
 def test_zero_priced_medians_fall_back_to_tokens():
-    r = rec(baseline_cost=0.0)
-    assert trial_verdict(r, stats(cost=0.0, tokens=600.0), 1000.0) == "keep"
-    assert trial_verdict(r, stats(cost=0.0, tokens=1400.0), 1000.0) == "rollback"
-    assert trial_verdict(r, stats(cost=0.0, tokens=1000.0), 1000.0) == "rollback"
+    free = Pricing(**{**UNIT.to_dict(), "input_per_m": 0.0, "output_per_m": 0.0})
+    r = rec(baseline_runs=[[1000, 0, 0, 0]] * 3)
+    assert trial_verdict(r, stats(cost=0.0, tokens=600.0), free) == "keep"
+    assert trial_verdict(r, stats(cost=0.0, tokens=1400.0), free) == "rollback"
+    assert trial_verdict(r, stats(cost=0.0, tokens=1000.0), free) == "rollback"
 
 
 def test_prompt_fallback_only_when_both_priced_medians_are_zero():
-    # baseline priced at 0 but trial runs priced above 0: dearer, whatever the prompt tokens
-    assert trial_verdict(rec(baseline_cost=0.0), stats(cost=0.01, tokens=1.0), 1000.0) \
-        == "rollback"
-    assert trial_verdict(rec(baseline_cost=None), stats(cost=0.01, tokens=1.0), 1000.0) \
+    # no baseline runs (priced 0) but trial runs priced above 0: dearer, whatever the tokens
+    assert trial_verdict(rec(baseline_runs=[]), stats(cost=0.01, tokens=1.0), UNIT) \
         == "rollback"
 
 
 def sess(i, t, cost=0.1, job=LIVE, ncalls=2, tokens=None, raw=0.0):
-    """`cost` sets the priced cost (prompt tokens; output 0); `raw` is the billing figure."""
-    prompt = round(cost * 1e6 / policy.USD_PER_MTOK) if tokens is None else tokens
+    """`cost` sets the priced cost at UNIT (fresh input; output 0); `raw` is the billing figure."""
+    prompt = round(cost * 1e6) if tokens is None else tokens
     return Session(f"s{i}", "cron", job, t, raw, prompt, 0,
                    tuple(ToolCall(f"c{j}", "web_search", (), None, 5) for j in range(ncalls)),
                    input_tokens=prompt)
@@ -194,22 +218,32 @@ def test_runs_before_applied_at_not_counted():
     applied = 1000.0
     old_runs = [sess(i, applied - 10 - i, cost=1.0) for i in range(5)]
     new_runs = [sess(10 + i, applied + 10 + i, cost=0.01) for i in range(4)]
-    s = trial_stats(old_runs + new_runs, LIVE, applied)
-    assert s.runs == 4 and s.median_priced_cost == pytest.approx(0.01, rel=1e-4)
-    assert trial_verdict(rec(applied_at=applied), s, 1000.0) == "continue"
+    s = trial_stats(old_runs + new_runs, LIVE, applied, UNIT)
+    assert s.runs == 4 and s.median_priced_cost == pytest.approx(0.01)
+    assert trial_verdict(rec(applied_at=applied), s, UNIT) == "continue"
     boundary = sess(99, applied)  # started at the apply instant: not the new version's
-    assert trial_stats([boundary], LIVE, applied) is None
+    assert trial_stats([boundary], LIVE, applied, UNIT) is None
 
 
-def test_baseline_stats_window_is_28_days_before_applied_at():
+def test_baseline_runs_window_is_28_days_before_applied_at():
     applied = 100 * 86400.0
     inside = sess(1, applied - 28 * 86400, cost=0.2)       # window start is inclusive
     too_old = sess(2, applied - 28 * 86400 - 1, cost=9.0)
     at_apply = sess(3, applied, cost=9.0)                   # window end is exclusive
+    no_calls = sess(5, applied - 9, cost=9.0, ncalls=0)     # an outage, not a run
     other = sess(4, applied - 5, cost=9.0, job="other")
-    s = baseline_stats([inside, too_old, at_apply, other], LIVE, applied)
-    assert s.runs == 1 and s.median_priced_cost == pytest.approx(0.2, rel=1e-5)
-    assert baseline_stats([], LIVE, applied) is None
+    got = baseline_runs([inside, too_old, at_apply, no_calls, other], applied,
+                        lambda s: s.job_id == LIVE)
+    assert got == [[200_000, 0, 0, 0]]
+    assert baseline_runs([], applied, lambda s: True) == []
+
+
+def test_baseline_runs_keeps_the_60_most_recent():
+    assert BASELINE_MAX_RUNS == 60
+    applied = 100 * 86400.0
+    ss = [sess(i, applied - 1000 - i, tokens=i) for i in range(61)]  # s0 is the newest
+    got = baseline_runs(list(reversed(ss)), applied, lambda s: True)
+    assert len(got) == 60 and sorted(b[0] for b in got) == list(range(60))
 
 
 def test_billing_change_does_not_keep_a_dearer_fix():
@@ -220,10 +254,9 @@ def test_billing_change_does_not_keep_a_dearer_fix():
     trial_runs = [sess(20 + i, applied + (i + 1) * 3600, tokens=150_000, raw=0.0)
                   for i in range(5)]
     sessions = base_runs + trial_runs
-    base = baseline_stats(sessions, LIVE, applied)
-    r = rec(applied_at=applied, live_from=applied, baseline_cost=base.median_priced_cost)
-    assert trial_verdict(r, trial_stats(sessions, LIVE, applied),
-                         base.median_prompt_tokens) == "rollback"
+    r = rec(applied_at=applied, live_from=applied,
+            baseline_runs=baseline_runs(sessions, applied, lambda s: s.job_id == LIVE))
+    assert trial_verdict(r, trial_stats(sessions, LIVE, applied, UNIT), UNIT) == "rollback"
 
 
 # --- fake bridge ids ------------------------------------------------------------

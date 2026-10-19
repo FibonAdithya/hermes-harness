@@ -3,16 +3,23 @@ from __future__ import annotations
 from dataclasses import dataclass
 from statistics import median
 
-from hermes_tuner import policy
 from hermes_tuner.model import Pricing, Session
 
 
-# Task 1 interim: the old flat rate as a Pricing, for callers not yet given the
-# model's list (Task 2 wires the real one through and removes this).
-INTERIM_FLAT_PRICING = Pricing(model="flat-estimate", input_per_m=policy.USD_PER_MTOK,
-                               output_per_m=policy.USD_PER_MTOK, cache_read_per_m=None,
-                               cache_write_per_m=None, source="tuner-flat-estimate",
-                               source_url=None, version=None, fetched_at=0.0)
+def breakdown(session: Session) -> list[int]:
+    """[input, cache read, cache write, output] tokens: what a ledger record stores
+    of a baseline run (FixRecord.baseline_runs)."""
+    return [session.input_tokens, session.cache_read_tokens, session.cache_write_tokens,
+            session.output_tokens]
+
+
+def priced_breakdown(tokens: list[int], pricing: Pricing) -> float:
+    """`breakdown` output priced like priced_cost."""
+    fresh, read_t, write_t, out = tokens
+    p = pricing
+    read = p.cache_read_per_m if p.cache_read_per_m is not None else p.input_per_m
+    write = p.cache_write_per_m if p.cache_write_per_m is not None else p.input_per_m
+    return (fresh * p.input_per_m + read_t * read + write_t * write + out * p.output_per_m) / 1e6
 
 
 def priced_cost(session: Session, pricing: Pricing) -> float:
@@ -22,11 +29,7 @@ def priced_cost(session: Session, pricing: Pricing) -> float:
 
     The raw `est_cost` is never used for a decision or a figure. Every comparison
     prices both sides with the same Pricing. An ESTIMATE."""
-    p = pricing
-    read = p.cache_read_per_m if p.cache_read_per_m is not None else p.input_per_m
-    write = p.cache_write_per_m if p.cache_write_per_m is not None else p.input_per_m
-    return (session.input_tokens * p.input_per_m + session.cache_read_tokens * read
-            + session.cache_write_tokens * write + session.output_tokens * p.output_per_m) / 1e6
+    return priced_breakdown(breakdown(session), pricing)
 
 
 @dataclass(frozen=True)

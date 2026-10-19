@@ -10,8 +10,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from .measure import INTERIM_FLAT_PRICING, priced_cost
-from .model import Session
+from .measure import priced_cost
+from .model import Pricing, Session
 
 DAY = 86400.0
 WINDOW_DAYS = 28
@@ -40,18 +40,21 @@ def _total_chars(s: Session) -> int:
     return sum(c.result_chars for c in s.calls)
 
 
-def _money(per_session: Mapping[str, int], by_id: Mapping[str, Session]) -> float:
+def _money(per_session: Mapping[str, int], by_id: Mapping[str, Session],
+           pricing: Pricing) -> float:
     """Sum of priced_cost x (candidate chars / all chars) over sessions, scaled to
-    30 days. Priced from tokens: the raw billing figure reads $0 on a subscription."""
+    30 days. Priced from the token breakdown at the model's list prices: the raw
+    billing figure reads $0 on a subscription."""
     usd = 0.0
     for sid, chars in per_session.items():
         total = _total_chars(by_id[sid])
         if total > 0:
-            usd += priced_cost(by_id[sid], INTERIM_FLAT_PRICING) * chars / total
+            usd += priced_cost(by_id[sid], pricing) * chars / total
     return usd * MONTH_DAYS / WINDOW_DAYS
 
 
-def _sequences(sessions: list[Session], by_id: Mapping[str, Session]) -> list[Candidate]:
+def _sequences(sessions: list[Session], by_id: Mapping[str, Session],
+               pricing: Pricing) -> list[Candidate]:
     # (job, gram) -> {session id: (covered chars, matches)}
     seen: dict[tuple[str | None, tuple[str, ...]], dict[str, tuple[int, int]]] = defaultdict(dict)
     for s in sessions:
@@ -84,11 +87,12 @@ def _sequences(sessions: list[Session], by_id: Mapping[str, Session]) -> list[Ca
             kind="sequence", key="seq:" + ">".join(g), job_id=job, sessions=len(per),
             occurrences=sum(m for _c, m in per.values()),
             result_chars=sum(c for c, _m in per.values()),
-            est_monthly_usd=_money({sid: c for sid, (c, _m) in per.items()}, by_id)))
+            est_monthly_usd=_money({sid: c for sid, (c, _m) in per.items()}, by_id, pricing)))
     return out
 
 
-def _rereads(sessions: list[Session], by_id: Mapping[str, Session]) -> list[Candidate]:
+def _rereads(sessions: list[Session], by_id: Mapping[str, Session],
+             pricing: Pricing) -> list[Candidate]:
     jobs: dict[str, list[Session]] = defaultdict(list)
     for s in sessions:
         if s.job_id is not None:
@@ -115,11 +119,12 @@ def _rereads(sessions: list[Session], by_id: Mapping[str, Session]) -> list[Cand
             out.append(Candidate(
                 kind="reread", key="reread:" + job, job_id=job, sessions=len(per_session),
                 occurrences=occurrences, result_chars=sum(per_session.values()),
-                est_monthly_usd=_money(per_session, by_id)))
+                est_monthly_usd=_money(per_session, by_id, pricing)))
     return out
 
 
-def _schema_lookups(sessions: list[Session], by_id: Mapping[str, Session]) -> list[Candidate]:
+def _schema_lookups(sessions: list[Session], by_id: Mapping[str, Session],
+                    pricing: Pricing) -> list[Candidate]:
     per_session = {}
     for s in sessions:
         d = [c for c in s.calls if c.name == SCHEMA_TOOL]
@@ -130,11 +135,12 @@ def _schema_lookups(sessions: list[Session], by_id: Mapping[str, Session]) -> li
     return [Candidate(
         kind="schema_lookup", key="schema_lookup", job_id=None, sessions=len(per_session),
         occurrences=sum(1 for s in sessions for c in s.calls if c.name == SCHEMA_TOOL),
-        result_chars=sum(per_session.values()), est_monthly_usd=_money(per_session, by_id))]
+        result_chars=sum(per_session.values()),
+        est_monthly_usd=_money(per_session, by_id, pricing))]
 
 
 def _skill_loads(sessions: list[Session], by_id: Mapping[str, Session],
-                 skill_names: Mapping[str, Sequence[str]]) -> list[Candidate]:
+                 skill_names: Mapping[str, Sequence[str]], pricing: Pricing) -> list[Candidate]:
     loads: dict[str, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
     for s in sessions:
         views = [c for c in s.calls if c.name == SKILL_TOOL]
@@ -151,17 +157,19 @@ def _skill_loads(sessions: list[Session], by_id: Mapping[str, Session],
             out.append(Candidate(
                 kind="skill_load", key="skill_load:" + name, job_id=None, sessions=len(per),
                 occurrences=n, result_chars=total,
-                est_monthly_usd=_money({sid: sum(v) for sid, v in per.items()}, by_id)))
+                est_monthly_usd=_money({sid: sum(v) for sid, v in per.items()}, by_id, pricing)))
     return out
 
 
-def detect(sessions: list[Session], now: float,
+def detect(sessions: list[Session], now: float, pricing: Pricing,
            skill_names: Mapping[str, Sequence[str]] | None = None) -> list[Candidate]:
+    """Candidates ranked by estimated monthly cost at `pricing`'s list prices."""
     window = [s for s in sessions if now - WINDOW_DAYS * DAY <= s.started_at <= now]
     by_id = {s.id: s for s in window}
-    cands = _sequences(window, by_id) + _rereads(window, by_id) + _schema_lookups(window, by_id)
+    cands = (_sequences(window, by_id, pricing) + _rereads(window, by_id, pricing)
+             + _schema_lookups(window, by_id, pricing))
     if skill_names is not None:
-        cands += _skill_loads(window, by_id, skill_names)
+        cands += _skill_loads(window, by_id, skill_names, pricing)
     cands = [c for c in cands if c.est_monthly_usd > 0]  # worth nothing: not a candidate
     cands.sort(key=lambda c: (-c.est_monthly_usd, c.kind, c.key, c.job_id or ""))
     return cands

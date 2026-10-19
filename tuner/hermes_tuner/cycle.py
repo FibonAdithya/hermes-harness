@@ -1,8 +1,13 @@
 """One daily tuner run (spec 4, 6), held under a lock on `root/.lock`.
 
-Order: clean up shadows -> evaluate shadows -> judge trials -> apply approved
-proposals -> budget check -> detect -> draft / validate / shadow / apply / propose
--> restart if allowed -> weekly line.
+Order: resolve the model's price list -> clean up shadows -> evaluate shadows ->
+judge trials -> apply approved proposals -> budget check -> detect -> draft /
+validate / shadow / apply / propose -> restart if allowed -> weekly line.
+
+Without a price list (lookup failed and no cached list at most PRICING_MAX_AGE_S
+old) the run still cleans up, checks shadow quality, applies approved proposals,
+rolls back trials past their deadline, restarts and writes the weekly line (with
+"pricing unavailable"); it skips drafting and cost-based trial verdicts.
 
 `now` is a parameter; nothing here reads the clock. A BridgeError in any step is
 recorded in the report and the cycle moves on; the ledger guarantees nothing is
@@ -11,7 +16,8 @@ and writes nothing under `root`; it lists what it would do in `planned`.
 
 Besides the ledger, `root/cycle_state.json` holds {"pending_restart": bool,
 "restart_times": [epoch, ... last 28 days], "weekly_written": "YYYY-Www",
-"weekly_written_at": epoch,
+"weekly_written_at": epoch, "pricing": Pricing.to_dict() of the last successful lookup
+(fetched_at = that run's now),
 "errors": [{"at": epoch, "error": str}]} (errors from the last 28 days; each failure
 is logged once and the weekly line counts the log).
 """
@@ -21,7 +27,7 @@ import fcntl
 import json
 import os
 import shutil
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
@@ -34,8 +40,8 @@ from .fingerprint import CopyIndex
 from .history import History, HistoryUnavailable
 from .ledger import (APPLIED_STATES, FixRecord, Ledger, _tool_files, apply, atomic_write,
                      is_shadow_tool, rollback)
-from .measure import INTERIM_FLAT_PRICING, priced_cost
-from .model import Fix, Session
+from .measure import priced_cost
+from .model import Fix, Pricing, Session
 from .proposals import apply_approved, approved, dropped
 from .restart import restart_allowed
 
@@ -49,6 +55,11 @@ RESTART_KEEP_S = 28 * DAY
 STATE_FILE = "cycle_state.json"
 HEARTBEAT_FILE = "plugin_heartbeat.json"   # written by the plugin at register()
 PLUGIN_NAME = "hermes-tuner"
+
+
+def _global_run(s: Session) -> bool:
+    """A run a config or skill fix is judged on: a chat session or an editable job's run."""
+    return s.source == "telegram" or s.job_id in policy.EDITABLE_JOBS
 
 
 @dataclass(frozen=True)
@@ -76,6 +87,7 @@ class CycleReport:
     restarted: bool = False
     skipped: str = ""
     dry_run: bool = False
+    pricing: dict | None = None   # the price list this run used (Pricing.to_dict)
 
 
 def run_cycle(cfg: CycleConfig, bridge: Bridge, now: float) -> CycleReport:
@@ -108,6 +120,7 @@ class _Cycle(DraftSteps):
         self.sessions: list[Session] = []
         self._copy_index: CopyIndex | None = None
         self._plugin_ok: bool | None = None
+        self.pricing: Pricing | None = None
 
     # --- plumbing -----------------------------------------------------------------
 
@@ -183,6 +196,7 @@ class _Cycle(DraftSteps):
             self.err(f"ledger unreadable, nothing done: {exc}")
             return
         self.state = self._load_state()
+        self._step("pricing", self.resolve_pricing)
         self._step("cleanup", self.cleanup)
         self.entries = self._shadow_entries()
         self.shadow_ids = set(self.entries)
@@ -215,9 +229,9 @@ class _Cycle(DraftSteps):
 
     def _history_since(self) -> float:
         """The detection window, widened only for records still being judged: a
-        trial needs the 28 days before its applied_at (job prompt-token fallback,
-        global baseline), a shadow_pending fix its shadow and live runs. Kept and
-        applied records carry their priced baseline (baseline_cost), so they never
+        trial reaches back to the 28 days before its applied_at, a shadow_pending fix
+        its shadow and live runs (whose go-live stores baseline_runs from the 28 days
+        before it). Kept and applied records carry their baseline_runs, so they never
         widen it; a trial ends within TRIAL_DEADLINE_DAYS, so the window is bounded."""
         since = self.now - HISTORY_DAYS * DAY
         for r in self.ledger.records:
@@ -234,6 +248,35 @@ class _Cycle(DraftSteps):
                and isinstance(e.get("at"), (int, float)) and self.now - e["at"] < ERROR_KEEP_S]
         log += [{"at": self.now, "error": m[:500]} for m in self.report.errors]
         self.state["errors"] = log
+
+    # 0. pricing ------------------------------------------------------------------------
+
+    def resolve_pricing(self) -> None:
+        """The model's price list for this run: the bridge's lookup (stored in
+        cycle_state with fetched_at = now), else the stored list if fetched at most
+        PRICING_MAX_AGE_S ago, else none ("no model pricing")."""
+        try:
+            self.pricing = replace(Pricing.from_dict(self.bridge.pricing()), fetched_at=self.now)
+            self.state["pricing"] = self.pricing.to_dict()
+        except (BridgeError, ValueError) as exc:
+            cached = self._cached_pricing()
+            if cached is not None:
+                self.pricing = cached
+                day = datetime.fromtimestamp(cached.fetched_at, timezone.utc).strftime("%Y-%m-%d")
+                self.err(f"pricing lookup failed; using cached list from {day}")
+            else:
+                self.err(f"pricing lookup failed: {exc}")
+        if self.pricing is None:
+            self.err("no model pricing")
+        else:
+            self.report.pricing = self.pricing.to_dict()
+
+    def _cached_pricing(self) -> Pricing | None:
+        try:
+            cached = Pricing.from_dict(self.state.get("pricing"))
+        except ValueError:
+            return None
+        return cached if self.now - cached.fetched_at <= policy.PRICING_MAX_AGE_S else None
 
     # 1. cleanup ------------------------------------------------------------------------
 
@@ -392,12 +435,18 @@ class _Cycle(DraftSteps):
         self._went_live(out)
 
     def _went_live(self, rec: FixRecord) -> None:
+        """Store the runs the trial will be judged against (token breakdowns, priced
+        at judgement time under the then-current list); baseline_cost is the display
+        value under this run's list (None without one or with no runs)."""
         if rec.state != "trial":
             self.err(f"apply {rec.id}: {rec.reason}")
             return
-        if rec.kind in JOB_KINDS:
-            base = trial.baseline_stats(self.sessions, rec.target, rec.applied_at)
-            rec.baseline_cost = base.median_priced_cost if base is not None else None
+        if rec.kind in JOB_KINDS or rec.kind in GLOBAL_KINDS:
+            keep = ((lambda s: s.job_id == rec.target) if rec.kind in JOB_KINDS
+                    else _global_run)
+            rec.baseline_runs = trial.baseline_runs(self.sessions, rec.applied_at, keep)
+            rec.baseline_cost = (trial.baseline_medians(rec.baseline_runs, self.pricing)[0]
+                                 if self.pricing is not None and rec.baseline_runs else None)
             self.ledger.save()
         self.report.applied.append(rec.id)
         self.restart_wanted |= rec.needs_restart
@@ -409,19 +458,17 @@ class _Cycle(DraftSteps):
             if rec.applied_at is None:
                 continue
             verdict = "continue"
-            if rec.live_from is None:
-                pass  # waiting for the gateway restart that makes it live (spec 4.7)
-            elif rec.kind in JOB_KINDS:
-                # baseline: before applied_at; trial runs: after the fix went live
-                base = trial.baseline_stats(self.sessions, rec.target, rec.applied_at)
-                verdict = trial.trial_verdict(
-                    rec, trial.trial_stats(self.sessions, rec.target, rec.live_from),
-                    base.median_prompt_tokens if base is not None else 0.0)
-            elif rec.kind in GLOBAL_KINDS:
-                if self.now - rec.live_from >= policy.GLOBAL_TRIAL_DAYS * DAY:
-                    verdict = self._global_verdict(rec.applied_at, rec.live_from)
-            else:
+            if rec.kind not in JOB_KINDS and rec.kind not in GLOBAL_KINDS:
                 continue
+            if rec.live_from is None or self.pricing is None:
+                pass  # waiting for the restart (spec 4.7), or no price list: deadline only
+            elif rec.kind in JOB_KINDS:
+                # baseline: stored runs before applied_at; trial runs: after it went live
+                verdict = trial.trial_verdict(
+                    rec, trial.trial_stats(self.sessions, rec.target, rec.live_from,
+                                           self.pricing), self.pricing)
+            elif self.now - rec.live_from >= policy.GLOBAL_TRIAL_DAYS * DAY:
+                verdict = self._global_verdict(rec, rec.live_from)
             start = rec.live_from if rec.live_from is not None else rec.applied_at
             if verdict == "keep":
                 self._keep(rec)
@@ -430,22 +477,22 @@ class _Cycle(DraftSteps):
             elif self.now - start >= policy.TRIAL_DEADLINE_DAYS * DAY:
                 self._rollback(rec, f"no verdict in {policy.TRIAL_DEADLINE_DAYS} days")
 
-    def _global_verdict(self, applied_at: float, live_from: float) -> str:
+    def _global_verdict(self, rec: FixRecord, live_from: float) -> str:
         """keep only if the median priced_cost over chat sessions and editable-job runs
-        since live_from is strictly below the 28 days before applied_at (prompt
-        tokens when both medians are 0)."""
-        def runs(lo: float, hi: float) -> list[Session]:
-            return [s for s in self.sessions if lo <= s.started_at < hi and s.calls
-                    and (s.source == "telegram" or s.job_id in policy.EDITABLE_JOBS)]
-        after = [s for s in runs(live_from, float("inf")) if s.started_at > live_from]
-        before = runs(applied_at - 28 * DAY, applied_at)
-        if not after or not before:
+        since live_from is strictly below the median of the record's baseline_runs
+        (the same runs from the 28 days before applied_at, stored at go-live), both
+        priced with this run's list (prompt tokens when both medians are 0). No
+        baseline_runs (an older record): continue until the deadline."""
+        if rec.baseline_runs is None:
+            return "continue"
+        after = [s for s in self.sessions if s.started_at > live_from and s.calls
+                 and _global_run(s)]
+        if not after or not rec.baseline_runs:
             return "rollback"
-        ca = median(priced_cost(s, INTERIM_FLAT_PRICING) for s in after)
-        cb = median(priced_cost(s, INTERIM_FLAT_PRICING) for s in before)
+        ca = median(priced_cost(s, self.pricing) for s in after)
+        cb, prompt_before = trial.baseline_medians(rec.baseline_runs, self.pricing)
         if ca == 0 and cb == 0:
-            better = (median(s.prompt_tokens for s in after)
-                      < median(s.prompt_tokens for s in before))
+            better = median(s.prompt_tokens for s in after) < prompt_before
         else:
             better = ca < cb
         return "keep" if better else "rollback"
@@ -558,8 +605,8 @@ class _Cycle(DraftSteps):
         else:
             recent = sum(1 for e in self.state.get("errors", []) if isinstance(e, dict)
                          and isinstance(e.get("at"), (int, float)) and since < e["at"] <= self.now)
-        line = weekly_line(self.ledger, self.sessions, self.now, self.shadow_ids, errors=recent,
-                           since=since)
+        line = weekly_line(self.ledger, self.sessions, self.now, self.pricing, self.shadow_ids,
+                           errors=recent, since=since)
         self.report.weekly = line
         if self.dry:
             self.plan(f"weekly line {tag}")

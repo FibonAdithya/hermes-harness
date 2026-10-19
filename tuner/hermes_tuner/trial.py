@@ -27,12 +27,16 @@ from typing import Literal
 from . import policy
 from .bridge import CREATE_JOB_EXTRA_KEYS, Bridge, BridgeError
 from .ledger import FixRecord, atomic_write, job_after_for
-from .measure import INTERIM_FLAT_PRICING, JobStats, job_stats
-from .model import Fix, Session
+from collections.abc import Callable
+from statistics import median
+
+from .measure import JobStats, breakdown, job_stats, priced_breakdown
+from .model import Fix, Pricing, Session
 
 SHADOW_FILE = "shadow_jobs.json"
 STALE_AFTER_S = 3600
 BASELINE_DAYS = 28
+BASELINE_MAX_RUNS = 60  # baseline runs stored per record: the most recent
 READ_TOOL = "mcp__google__get_gmail_message_content"
 MODIFY_TOOL = "mcp__google__modify_gmail_message_labels"
 EVENT_TOOL = "mcp__google__manage_event"
@@ -293,32 +297,48 @@ def compare_calendar(old: set, new: set) -> Verdict:
 
 # --- trial ---------------------------------------------------------------------------
 
-def trial_stats(sessions: list[Session], job_id: str, applied_at: float) -> JobStats | None:
+def trial_stats(sessions: list[Session], job_id: str, applied_at: float,
+                pricing: Pricing) -> JobStats | None:
     """job_stats over the runs that started after `applied_at` (the new version's)."""
-    return job_stats([s for s in sessions if s.started_at > applied_at], job_id,
-                     INTERIM_FLAT_PRICING)
+    return job_stats([s for s in sessions if s.started_at > applied_at], job_id, pricing)
 
 
-def baseline_stats(sessions: list[Session], job_id: str, applied_at: float) -> JobStats | None:
-    """job_stats over runs in [applied_at - 28 days, applied_at): the old version's."""
+def baseline_runs(sessions: list[Session], applied_at: float,
+                  keep: Callable[[Session], bool]) -> list[list[int]]:
+    """Token breakdowns (measure.breakdown) of the runs a fix is judged against: runs
+    with at least one tool call in [applied_at - 28 days, applied_at) for which
+    `keep` is true, at most the BASELINE_MAX_RUNS (60) most recent, oldest first."""
     start = applied_at - BASELINE_DAYS * 86400
-    return job_stats([s for s in sessions if start <= s.started_at < applied_at], job_id,
-                     INTERIM_FLAT_PRICING)
+    runs = sorted((s for s in sessions if start <= s.started_at < applied_at and s.calls
+                   and keep(s)), key=lambda s: (s.started_at, s.id))
+    return [breakdown(s) for s in runs[-BASELINE_MAX_RUNS:]]
+
+
+def baseline_medians(runs: list[list[int]], pricing: Pricing) -> tuple[float, float]:
+    """(median priced cost, median prompt tokens) of stored baseline runs under
+    `pricing`; (0.0, 0.0) for no runs."""
+    if not runs:
+        return 0.0, 0.0
+    return (median(priced_breakdown(r, pricing) for r in runs),
+            median(r[0] + r[1] + r[2] for r in runs))
 
 
 def trial_verdict(record: FixRecord, stats_now: JobStats | None,
-                  prompt_baseline: float) -> Literal["continue", "keep", "rollback"]:
+                  pricing: Pricing) -> Literal["continue", "keep", "rollback"]:
     """`stats_now` covers only runs after `record.live_from` (when the fix took
-    effect: applied_at, or the gateway restart for a fix that needs one).
+    effect: applied_at, or the gateway restart for a fix that needs one), priced
+    with `pricing`.
 
-    continue until JOB_TRIAL_RUNS runs; then keep only if the median priced cost is
-    strictly below `record.baseline_cost` (the priced median stored at go-live; a
-    missing one counts as 0). Only when both priced medians are 0 does it fall back
-    to median prompt tokens strictly below `prompt_baseline`.
+    continue until JOB_TRIAL_RUNS runs, or while the record has no baseline_runs
+    (saved before they existed: the trial deadline decides); then keep only if the
+    median priced cost is strictly below the median of baseline_runs priced with the
+    SAME `pricing` (no runs count as 0). Only when both priced medians are 0 does it
+    fall back to median prompt tokens strictly below the baseline's.
     """
-    if stats_now is None or stats_now.runs < policy.JOB_TRIAL_RUNS:
+    if (stats_now is None or stats_now.runs < policy.JOB_TRIAL_RUNS
+            or record.baseline_runs is None):
         return "continue"
-    base = record.baseline_cost or 0.0
+    base, prompt_baseline = baseline_medians(record.baseline_runs, pricing)
     if base == 0 and stats_now.median_priced_cost == 0:
         better = stats_now.median_prompt_tokens < prompt_baseline
     else:
