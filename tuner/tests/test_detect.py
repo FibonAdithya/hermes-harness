@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import pytest
+
+from hermes_tuner import policy
 from hermes_tuner.detect import Candidate, detect
+from hermes_tuner.measure import priced_cost
 from hermes_tuner.model import Session, ToolCall
 
 DAY = 86400.0
@@ -14,9 +18,12 @@ def call(i, name, chars=10, ref=None):
     return ToolCall(call_id=f"c{i}", name=name, arg_keys=("k",), ref=ref, result_chars=chars)
 
 
-def sess(sid, calls, job=None, age_days=1.0, cost=0.1, source="cron"):
+def sess(sid, calls, job=None, age_days=1.0, cost=0.1, source="cron", raw=0.0):
+    """`cost` sets the priced cost through the token count; `raw` is the billing figure
+    (subscription billing reads $0), which the detector must ignore."""
     return Session(id=sid, source=source, job_id=job, started_at=NOW - age_days * DAY,
-                   est_cost=cost, prompt_tokens=100, output_tokens=1, calls=tuple(calls))
+                   est_cost=raw, prompt_tokens=round(cost * 1e6 / policy.USD_PER_MTOK),
+                   output_tokens=0, calls=tuple(calls))
 
 
 def briefing_runs(n=12, job="3bc4e11d29b1"):
@@ -71,15 +78,25 @@ def test_sequence_money_uses_session_share_scaled_to_30_days():
     c = detect(briefing_runs(), NOW)[0]
     total = 500 + 20 * 10_000 + 20 * 20
     share = 20 * 10_000 / total
-    expected = 12 * 0.12 * share * 30 / 28
+    expected = 12 * priced_cost(briefing_runs()[0]) * share * 30 / 28
     assert abs(c.est_monthly_usd - expected) < 1e-9
+    assert c.est_monthly_usd == pytest.approx(12 * 0.12 * share * 30 / 28, rel=1e-5)
 
 
-def test_zero_result_chars_session_contributes_zero():
+def test_zero_result_chars_candidate_is_skipped():
     ss = [sess(f"z{i}", [call(0, "a", 0), call(1, "b", 0), call(2, "c", 0)], job="j", age_days=i + 1)
           for i in range(10)]
-    cands = detect(ss, NOW)
-    assert len(cands) == 1 and cands[0].est_monthly_usd == 0.0
+    assert detect(ss, NOW) == []
+
+
+def test_money_is_priced_from_tokens_not_raw_billing():
+    """F2: subscription billing reads $0. A candidate is valued on its tokens; one with
+    no tokens is worth nothing (and skipped) whatever the raw figure says."""
+    billed_zero = briefing_runs()  # raw $0, tokens priced at $0.12 a run
+    assert detect(billed_zero, NOW)[0].est_monthly_usd > 0
+    no_tokens = [sess(s.id, s.calls, job=s.job_id, age_days=(NOW - s.started_at) / DAY,
+                      cost=0.0, raw=0.12) for s in billed_zero]
+    assert detect(no_tokens, NOW) == []
 
 
 def test_reread_found_for_calendar_job():

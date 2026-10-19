@@ -1,17 +1,16 @@
 """Tuner spend, measured savings and the weekly line (spec 4.8, 6).
 
-Every dollar figure here is an ESTIMATE: costs come from Hermes's estimated
-cost, or the token fallback in `measure.run_cost` when billing reads $0.
-Nothing here reads the clock: `now` is always a parameter.
+Every dollar figure here is an ESTIMATE: runs are priced from their tokens
+(`measure.priced_cost`), drafting from the reply's tokens, never from Hermes's
+estimated cost (which reads $0 under subscription billing). Nothing here reads
+the clock: `now` is always a parameter.
 """
 from __future__ import annotations
 
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
-from statistics import median
-
 from .ledger import Ledger
-from .measure import run_cost
+from .measure import priced_cost
 from .model import Session
 
 DAY = 86400.0
@@ -33,49 +32,42 @@ def job_runs(sessions: Iterable[Session], job_id: str) -> list[Session]:
     return [s for s in sessions if s.job_id == job_id and s.calls]
 
 
-def job_cost_baseline(sessions: Iterable[Session], job_id: str, applied_at: float) -> float | None:
-    """Median run_cost of the job's runs in [applied_at - 28 d, applied_at)."""
-    start = applied_at - BASELINE_DAYS * DAY
-    costs = [run_cost(s) for s in job_runs(sessions, job_id) if start <= s.started_at < applied_at]
-    return median(costs) if costs else None
-
-
 def tuner_spend(ledger: Ledger, sessions: Iterable[Session], shadow_ids: Iterable[str],
                 since: float, until: float | None = None) -> float:
-    """Drafting spend on records created in (since, until] plus run_cost of shadow-job
-    sessions started in that window."""
+    """Drafting spend on records created in (since, until] plus priced_cost of
+    shadow-job sessions started in that window."""
     shadows = set(shadow_ids)
 
     def inside(t: float) -> bool:
         return t > since and (until is None or t <= until)
 
     drafting = sum(r.spend_usd for r in ledger.records if inside(r.created_at))
-    shadow = sum(run_cost(s) for s in sessions if s.job_id in shadows and inside(s.started_at))
+    shadow = sum(priced_cost(s) for s in sessions if s.job_id in shadows and inside(s.started_at))
     return drafting + shadow
 
 
 def savings(ledger: Ledger, sessions: list[Session], since: float, until: float) -> float:
     """Σ over jobs with a job fix in trial or kept, of Σ over that job's runs in
-    (since, until] after the fix went live (`live_from`), of (baseline − run_cost(run)).
+    (since, until] after the fix went live (`live_from`), of (baseline − priced_cost(run)).
 
     Per job the fix used is the EARLIEST applied one that is live, so two fixes kept
-    one after the other on the same job are not counted twice; its baseline is the 28
-    days before its applied_at. Records with live_from None (waiting for a restart)
-    are skipped. Config and skill fixes have no dollar figure (chat sessions differ
-    too much to attribute).
+    one after the other on the same job are not counted twice; its baseline is
+    `baseline_cost`, the priced median of the 28 days before applied_at stored at
+    go-live (the history read is not widened to recompute it). Records with
+    live_from None (waiting for a restart) or no baseline are skipped. Config and
+    skill fixes have no dollar figure (chat sessions differ too much to attribute).
     """
-    first: dict[str, tuple[float, float]] = {}  # job -> (applied_at, live_from)
+    first: dict[str, tuple[float, float, float | None]] = {}  # job -> (applied_at, live_from, base)
     for r in ledger.records:
         if (r.kind in JOB_KINDS and r.state in SAVING_STATES and r.applied_at is not None
                 and r.live_from is not None):
             if r.target not in first or r.applied_at < first[r.target][0]:
-                first[r.target] = (r.applied_at, r.live_from)
+                first[r.target] = (r.applied_at, r.live_from, r.baseline_cost)
     total = 0.0
-    for job, (applied_at, live_from) in first.items():
-        base = job_cost_baseline(sessions, job, applied_at)
+    for job, (_applied_at, live_from, base) in first.items():
         if base is None:
             continue
-        total += sum(base - run_cost(s) for s in job_runs(sessions, job)
+        total += sum(base - priced_cost(s) for s in job_runs(sessions, job)
                      if since < s.started_at <= until and s.started_at > live_from)
     return total
 

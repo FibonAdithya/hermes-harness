@@ -226,3 +226,20 @@ def test_chain_ids_root_then_continuations(tmp_path):
 def test_chain_ids_stops_at_non_compression_parent(tmp_path):
     h = History.open(_chain_db(tmp_path, child_parent_reason="branched"))
     assert h.chain_ids(ROOT) == [ROOT, CHILD]
+
+
+def test_sessions_read_result_lengths_without_fetching_content(tmp_path):
+    """F7: sessions() selects length(content) in SQL; message text is fetched only by
+    untrusted_texts (the copy index)."""
+    db = make_db(tmp_path / "s.db", [_sess("a", [(G, {"message_id": "m1"}, "é" * 300)])])
+    h = History.open(db)
+    seen: list[str] = []
+    h._conn.set_trace_callback(seen.append)
+    (call,) = h.sessions(0)[0].calls
+    assert call.result_chars == 300  # characters, as len() counts them
+    msg_queries = [q for q in seen if "from messages" in q]
+    assert msg_queries and all("length(content)" in q for q in msg_queries)
+    assert not any("content," in q.replace("length(content)", "") for q in msg_queries)
+    seen.clear()
+    assert list(h.untrusted_texts(0)) == ["é" * 300]
+    assert any("content" in q.replace("length(content)", "") for q in seen)

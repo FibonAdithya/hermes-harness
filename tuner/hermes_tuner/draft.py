@@ -132,12 +132,15 @@ def parse_draft(text: str, candidate: Candidate, now: float) -> Fix | None:
                candidate_key=candidate.key)
 
 
+def _count(v: Any) -> int:
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+
+
 def _spend(reply: dict) -> float:
-    cost = reply.get("estimated_cost_usd")
-    if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost > 0:
-        return float(cost)
-    tokens = (reply.get("input_tokens") or 0) + (reply.get("output_tokens") or 0)
-    return tokens * policy.FALLBACK_USD_PER_MTOK / 1e6
+    """Priced from the reply's token counts at USD_PER_MTOK, like every run
+    (measure.priced_cost); the reply's estimated_cost_usd is ignored."""
+    tokens = _count(reply.get("input_tokens")) + _count(reply.get("output_tokens"))
+    return tokens * policy.USD_PER_MTOK / 1e6
 
 
 def draft(candidate: Candidate, job: dict | None, skill_text: str | None,

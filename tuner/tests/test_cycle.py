@@ -50,17 +50,26 @@ def triage_calls(n):
     ]
 
 
-def triage_runs(days=range(1, 13), cost=0.10, start_hour=7):
-    """Daily triage runs at 07:00 UTC, `days` days before NOW's date."""
-    base = NOW - 3 * 3600 + start_hour * 3600  # 07:00 on NOW's date
+def tok(usd):
+    """Token count whose priced cost (policy.USD_PER_MTOK) is `usd`."""
+    return round(usd * 1e6 / policy.USD_PER_MTOK)
+
+
+def triage_runs(days=range(1, 13), cost=0.10, start_hour=7, raw=0.0, tokens=None, base=None):
+    """Daily triage runs at 07:00 UTC, `days` days before NOW's date (after it for
+    negative days). `cost` is the priced cost (set through tokens); `raw` is the
+    billing figure, $0 under subscription billing, which the tuner ignores."""
+    tokens = tok(cost) if tokens is None else tokens
+    base = NOW - 3 * 3600 + start_hour * 3600 if base is None else base
     return [{"id": sid(TRIAGE, base - d * DAY), "source": "cron", "started_at": base - d * DAY,
-             "cost": cost, "in": 100_000, "out": 1000, "calls": triage_calls(d)} for d in days]
+             "cost": raw, "in": tokens - 1000, "out": 1000, "calls": triage_calls(d)}
+            for d in days]
 
 
 def cal_runs(days, cost):
     base = NOW - 3 * 3600 + 6 * 3600
     return [{"id": sid(CAL, base - d * DAY), "source": "cron", "started_at": base - d * DAY,
-             "cost": cost, "in": 50_000, "out": 500,
+             "cost": 0.0, "in": tok(cost) - 500, "out": 500,
              "calls": [("mcp__google__get_events", {"calendar_id": "primary"}, "events")]}
             for d in days]
 
@@ -177,7 +186,7 @@ def test_budget_exhausted_skips_drafting_but_still_evaluates(env, week_spend, dr
     bridge = FakeBridge(jobs=jobs(), config={CFG_KEY: 0.7},
                         oneshot_script=[reply(JOB_PROMPT_REPLY)])
     report = run_cycle(env, bridge, NOW)
-    # projected = DRAFT_EST_USD 0.02 + triage median run_cost 0.10 = 0.12
+    # projected = DRAFT_EST_USD 0.02 + triage median priced cost 0.10 = 0.12
     assert bool(oneshots(bridge)) is drafts
     assert Ledger.load(env.root).get(fix.id).state == "rolled_back"
     assert bridge.config[CFG_KEY] == 0.5
@@ -307,8 +316,9 @@ def test_weekly_line_once_per_iso_week(env):
 
 
 def run_session(job, t, cost, n_calls=1):
-    return Session(id=sid(job, t), source="cron", job_id=job, started_at=t, est_cost=cost,
-                   prompt_tokens=1000, output_tokens=10,
+    """`cost` is the priced cost (through prompt tokens); the raw billing figure is $0."""
+    return Session(id=sid(job, t), source="cron", job_id=job, started_at=t, est_cost=0.0,
+                   prompt_tokens=tok(cost), output_tokens=0,
                    calls=tuple(ToolCall(f"c{i}", GET, ("message_id",), None, 10)
                                for i in range(n_calls)))
 
@@ -325,7 +335,9 @@ def test_weekly_saving_is_baseline_minus_actual(tmp_path, live_days_ago, saved):
     # waiting for a restart: never counted
     led.records.append(FixRecord("20261009-abcd0003", "job_prompt", CAL, "seq:c", "trial",
                                  applied, applied_at=applied, needs_restart=True))
-    sessions = [run_session(TRIAGE, applied - d * DAY, 0.12) for d in range(1, 6)]  # baseline
+    # runs before applied_at priced at $0.30: the saving uses the baseline stored at go-live
+    # ($0.12), not a recomputed one (the history window no longer reaches back for it)
+    sessions = [run_session(TRIAGE, applied - d * DAY, 0.30) for d in range(1, 6)]
     sessions += [run_session(TRIAGE, NOW - d * DAY, 0.05) for d in (8, 9)]  # before the week
     sessions += [run_session(TRIAGE, NOW - d * DAY, 0.05) for d in (1, 2, 3)]  # this week
     sessions += [run_session(TRIAGE, NOW - 4 * DAY, 0.30, n_calls=0)]  # outage: not a run
@@ -334,6 +346,17 @@ def test_weekly_saving_is_baseline_minus_actual(tmp_path, live_days_ago, saved):
     line = weekly_line(led, sessions, NOW)
     assert line == (f"Hermes tuner: saved ~${saved} this week (ESTIMATE), 0 applied, 1 kept, "
                     "0 rolled back; tuner spent $0.00")
+
+
+def test_tuner_spend_prices_shadow_runs_from_tokens(tmp_path):
+    led = Ledger(tmp_path)
+    led.records.append(FixRecord("20261018-abcd0004", "job_prompt", TRIAGE, "k", "rejected",
+                                 NOW - DAY, spend_usd=0.03))
+    shadow = Session(id=sid(SHADOW_JOB, NOW - DAY), source="cron", job_id=SHADOW_JOB,
+                     started_at=NOW - DAY, est_cost=0.0, prompt_tokens=tok(0.05),
+                     output_tokens=0, calls=())
+    line = weekly_line(led, [shadow], NOW, shadow_ids={SHADOW_JOB})
+    assert line.endswith("; tuner spent $0.08")  # 0.03 drafting + 0.05 shadow (billed $0)
 
 
 def test_weekly_line_counts_errors(tmp_path):
@@ -374,13 +397,16 @@ TOOL = {"name": "tuned_triage", "description": "search and read in one step",
         "program": "def main(args, call):\n    return 1\n", "job_prompt": "new prompt"}
 
 
-def shadow_setup(env, old_mod, new_mod, composed=False, live=True):
+SETUP_SESSIONS: dict = {}  # env.root -> the sessions shadow_setup built
+
+
+def shadow_setup(env, old_mod, new_mod, composed=False, live=True, base_runs=None):
     """A shadow-pending triage fix whose shadow ran at 06:40 yesterday and (if `live`)
     a live run at 07:00. `composed`: a composed_tool fix needing a restart, with the
     tool dir written as at shadow scheduling."""
     shadow_t = SHADOW_T
     live_t = shadow_t + 20 * 60
-    sessions = triage_runs(range(2, 30))
+    sessions = triage_runs(range(2, 30)) if base_runs is None else list(base_runs)
     sessions.append({"id": sid(SHADOW_JOB, shadow_t), "source": "cron", "started_at": shadow_t,
                      "cost": 0.08, "in": 80_000, "out": 800,
                      "calls": [(GET, {"message_id": "m1"}, "b"), (GET, {"message_id": "m2"}, "b")]})
@@ -390,6 +416,7 @@ def shadow_setup(env, old_mod, new_mod, composed=False, live=True):
                          "calls": [(GET, {"message_id": "m1"}, "b"),
                                    (GET, {"message_id": "m2"}, "b")] + old_mod})
     build(env, sessions)
+    SETUP_SESSIONS[env.root] = sessions
     if composed:
         fix = Fix("20261018-bbbb0002", "composed_tool", TRIAGE, dict(TOOL), "seq:x")
         spec, program = _tool_files(fix.payload)
@@ -409,17 +436,36 @@ def shadow_setup(env, old_mod, new_mod, composed=False, live=True):
     return fix
 
 
-def test_shadow_pass_applies_with_raw_baseline_cost(env):
+def test_shadow_pass_applies_with_priced_baseline_cost(env):
+    # raw billing says $0.50 a run; tokens say $0.10: the baseline is the priced figure
     fix = shadow_setup(env, old_mod=[(MOD, {"message_id": "m2", "add_label_ids": ["TRASH"]}, "ok")],
-                       new_mod=[{"message_id": "m2", "add_label_ids": ["TRASH"]}])
+                       new_mod=[{"message_id": "m2", "add_label_ids": ["TRASH"]}],
+                       base_runs=triage_runs(range(2, 30), cost=0.10, raw=0.50))
     bridge = FakeBridge(jobs=jobs())
     report = run_cycle(env, bridge, NOW)
     rec = Ledger.load(env.root).get(fix.id)
     assert rec.state == "trial" and rec.applied_at == NOW
     assert rec.live_from == NOW  # a job_prompt fix needs no restart: live at once
-    assert rec.baseline_cost == pytest.approx(0.10)
+    assert rec.baseline_cost == pytest.approx(0.10, rel=1e-5)
     assert bridge.jobs[TRIAGE]["prompt"] == "new prompt"
     assert fix.id in report.applied
+
+
+def test_billing_change_rolls_back_a_fix_that_costs_more_tokens(env):
+    """Reviewer scenario (F1): baseline runs billed $0.12 raw (DeepInfra), trial runs
+    billed $0 (subscription) with 50% more tokens. Raw dollars would keep it."""
+    base = triage_runs(range(2, 30), tokens=100_000, raw=0.12)
+    fix = shadow_setup(env, old_mod=[], new_mod=[], base_runs=base)
+    bridge = FakeBridge(jobs=jobs())
+    run_cycle(env, bridge, NOW)
+    assert Ledger.load(env.root).get(fix.id).state == "trial"
+    later = triage_runs(range(-5, 0), tokens=150_000, raw=0.0)  # the 5 days after NOW
+    env.db.unlink()
+    build(env, SETUP_SESSIONS[env.root] + later)
+    report = run_cycle(env, bridge, NOW + 6 * DAY)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert rec.state == "rolled_back" and fix.id in report.rolled_back
+    assert bridge.jobs[TRIAGE]["prompt"] == "Triage the inbox."
 
 
 def test_shadow_flip_fails_without_applying(env):
@@ -529,6 +575,42 @@ def test_trial_counts_runs_from_live_from(env, live_from):
                               needs_restart=True, live_from=live_from), fix)
     run_cycle(env, FakeBridge(jobs=jobs()), NOW)
     assert Ledger.load(env.root).get(fix.id).state == "trial"
+
+
+def history_since(env, monkeypatch):
+    """Run a cycle and return the `since` it read the history from."""
+    from hermes_tuner.history import History
+    seen = []
+    real = History.sessions
+
+    def spy(self, since, until=None):
+        seen.append(since)
+        return real(self, since, until)
+    monkeypatch.setattr(History, "sessions", spy)
+    run_cycle(env, FakeBridge(jobs=jobs()), NOW)
+    return seen[0]
+
+
+def test_history_window_not_widened_by_old_kept_record(env, monkeypatch):
+    """F7: a kept fix carries its priced baseline; it must not drag the read back."""
+    build(env, triage_runs())
+    for i, state_ in enumerate(("kept", "applied")):
+        fix = Fix(f"20250601-aaaa000{i}", "job_prompt", CAL, {"prompt": "p", "add_toolsets": []},
+                  "seq:old")
+        add_record(env, FixRecord(fix.id, fix.kind, CAL, "seq:old", state_, NOW - 400 * DAY,
+                                  applied_at=NOW - 400 * DAY, baseline_cost=0.1,
+                                  live_from=NOW - 400 * DAY, decided_at=NOW - 390 * DAY), fix)
+    assert history_since(env, monkeypatch) == NOW - 35 * DAY
+
+
+def test_history_window_covers_a_trial_baseline(env, monkeypatch):
+    build(env, triage_runs())
+    fix = Fix("20261001-aaaa0003", "job_prompt", CAL, {"prompt": "p", "add_toolsets": []},
+              "seq:c")
+    add_record(env, FixRecord(fix.id, fix.kind, CAL, "seq:c", "trial", NOW - 18 * DAY,
+                              applied_at=NOW - 18 * DAY, baseline_cost=0.1,
+                              live_from=NOW - 18 * DAY), fix)
+    assert history_since(env, monkeypatch) == NOW - 46 * DAY
 
 
 def test_ledger_load_backfills_live_from(tmp_path):

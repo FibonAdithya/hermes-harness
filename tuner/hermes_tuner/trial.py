@@ -302,14 +302,16 @@ def trial_verdict(record: FixRecord, stats_now: JobStats | None,
     """`stats_now` covers only runs after `record.live_from` (when the fix took
     effect: applied_at, or the gateway restart for a fix that needs one).
 
-    continue until JOB_TRIAL_RUNS runs; then keep only if strictly cheaper than
-    `record.baseline_cost`, or, when that is missing or zero (billing reads $0),
-    if median prompt tokens are strictly below `prompt_baseline`.
+    continue until JOB_TRIAL_RUNS runs; then keep only if the median priced cost is
+    strictly below `record.baseline_cost` (the priced median stored at go-live; a
+    missing one counts as 0). Only when both priced medians are 0 does it fall back
+    to median prompt tokens strictly below `prompt_baseline`.
     """
     if stats_now is None or stats_now.runs < policy.JOB_TRIAL_RUNS:
         return "continue"
-    if record.baseline_cost is not None and record.baseline_cost > 0:
-        better = stats_now.median_cost < record.baseline_cost
-    else:
+    base = record.baseline_cost or 0.0
+    if base == 0 and stats_now.median_priced_cost == 0:
         better = stats_now.median_prompt_tokens < prompt_baseline
+    else:
+        better = stats_now.median_priced_cost < base
     return "keep" if better else "rollback"

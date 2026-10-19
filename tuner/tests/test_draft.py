@@ -149,26 +149,26 @@ def call_draft(bridge):
     return D.draft(CAND, None, None, {}, [("a", ("k",))], bridge, NOW)
 
 
-def test_draft_returns_fix_and_cost():
-    fix, spend = call_draft(FakeBridge(oneshot_script=[script(reply())]))
-    assert fix is not None and spend == 0.01
+def test_draft_returns_fix_and_priced_spend():
+    fix, spend = call_draft(FakeBridge(oneshot_script=[script(reply(), i=100, o=50)]))
+    assert fix is not None and spend == pytest.approx(150 * policy.USD_PER_MTOK / 1e6)
 
 
 def test_draft_returns_spend_even_when_unparseable():
-    fix, spend = call_draft(FakeBridge(oneshot_script=[script("sorry, no", cost=0.03)]))
-    assert fix is None and spend == 0.03
+    fix, spend = call_draft(FakeBridge(oneshot_script=[script("sorry, no", i=2000, o=1000)]))
+    assert fix is None and spend == pytest.approx(3000 * policy.USD_PER_MTOK / 1e6)
 
 
-@pytest.mark.parametrize("cost", [0.0, None, -1.0])
-def test_spend_falls_back_to_tokens(cost):
+@pytest.mark.parametrize("cost", [0.0, None, -1.0, 0.03, 5.0])
+def test_spend_is_priced_from_tokens_whatever_the_billing_says(cost):
     _fix, spend = call_draft(FakeBridge(oneshot_script=[script("x", cost=cost, i=1_000_000, o=0)]))
-    assert spend == pytest.approx(policy.FALLBACK_USD_PER_MTOK)
+    assert spend == pytest.approx(policy.USD_PER_MTOK)
 
 
-def test_spend_fallback_adds_input_and_output():
+def test_spend_adds_input_and_output():
     _f, spend = call_draft(FakeBridge(oneshot_script=[
         script("x", cost=None, i=500_000, o=500_000)]))
-    assert spend == pytest.approx(policy.FALLBACK_USD_PER_MTOK)
+    assert spend == pytest.approx(policy.USD_PER_MTOK)
 
 
 def test_bridge_error_propagates():

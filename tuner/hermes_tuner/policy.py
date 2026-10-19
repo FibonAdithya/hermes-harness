@@ -87,7 +87,11 @@ NEVER_TOUCH_JOBS = frozenset({"8da9a6857256"})
 # Spend and trials.
 WEEKLY_CAP_USD = 1.0
 DRAFT_EST_USD = 0.02  # ESTIMATE
-FALLBACK_USD_PER_MTOK = 0.42  # ESTIMATE: spec §2 Sept median $0.123 / 293.3k tokens
+# Every tuner decision and figure prices a run from its tokens at this one rate
+# (measure.priced_cost), never from Hermes's estimated_cost_usd: that changed regime
+# when billing moved to a subscription (~2026-10-17, $0/NULL), so dollars before and
+# after the change are not comparable.
+USD_PER_MTOK = 0.42  # ESTIMATE: spec §2 Sept median $0.123 / 293.3k tokens
 JOB_TRIAL_RUNS = 5
 GLOBAL_TRIAL_DAYS = 7
 TRIAGE_AGREEMENT_MIN = 0.90

@@ -83,8 +83,13 @@ class History:
         except sqlite3.Error as e:
             raise HistoryUnavailable(str(e)) from e
 
-    def _calls(self, session_ids: list[str] | None, since: float | None = None):
-        """Yield (session_id, ToolCall, args, result_text) for every tool row."""
+    def _calls(self, session_ids: list[str] | None, since: float | None = None,
+               with_text: bool = False):
+        """Yield (session_id, ToolCall, args, result_text) for every tool row.
+
+        result_chars comes from length(content) in SQL; the text itself is fetched
+        only `with_text` (else result_text is None), so a session read does not pull
+        every tool result into memory."""
         where, params = "", ()
         if session_ids is not None:
             where = f"where session_id in ({','.join('?' * len(session_ids))})"
@@ -92,8 +97,10 @@ class History:
         elif since is not None:
             where = "where session_id in (select session_id from messages where role = 'tool' and timestamp >= ?)"
             params = (since,)
+        text_col = "content, " if with_text else ""
         rows = self._q(
-            "select id, session_id, role, content, tool_call_id, tool_calls, tool_name, timestamp "
+            f"select id, session_id, role, {text_col}length(content) as clen, tool_call_id, "
+            "tool_calls, tool_name, timestamp "
             f"from messages {where}{' and' if where else ' where'} role in ('assistant', 'tool') "
             "order by id", params)
         issued: dict[tuple[str, str], tuple[str, dict]] = {}
@@ -108,14 +115,14 @@ class History:
                 name, args = issued.get((r["session_id"], cid), ("?", {})) if cid else ("?", {})
                 if r["tool_name"]:
                     name = r["tool_name"]
-                text = r["content"] or ""
+                text = (r["content"] or "") if with_text else None
                 ref = args.get("message_id")
                 yield r["session_id"], ToolCall(
                     call_id=cid or "",
                     name=name,
                     arg_keys=tuple(sorted(args)),
                     ref=ref if isinstance(ref, str) else None,
-                    result_chars=len(text),
+                    result_chars=r["clen"] or 0,
                 ), args, text
 
     def _chains(self, roots: list[sqlite3.Row]) -> dict[str, list[str]]:
@@ -216,6 +223,6 @@ class History:
         return self._chains([{"id": root_id}])[root_id]
 
     def untrusted_texts(self, since: float) -> Iterator[str]:
-        for _s, c, a, text in self._calls(None, since):
+        for _s, c, a, text in self._calls(None, since, with_text=True):
             if _is_untrusted(c.name, a):
                 yield text

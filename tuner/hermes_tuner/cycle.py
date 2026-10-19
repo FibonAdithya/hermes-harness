@@ -34,7 +34,7 @@ from .fingerprint import CopyIndex
 from .history import History, HistoryUnavailable
 from .ledger import (APPLIED_STATES, FixRecord, Ledger, _tool_files, _tool_matches, apply, atomic_write,
                      rollback)
-from .measure import run_cost
+from .measure import priced_cost
 from .model import Fix, Session
 from .proposals import apply_approved, approved, dropped
 from .restart import restart_allowed
@@ -175,10 +175,17 @@ class _Cycle(DraftSteps):
         self._save_state()
 
     def _history_since(self) -> float:
+        """The detection window, widened only for records still being judged: a
+        trial needs the 28 days before its applied_at (job prompt-token fallback,
+        global baseline), a shadow_pending fix its shadow and live runs. Kept and
+        applied records carry their priced baseline (baseline_cost), so they never
+        widen it; a trial ends within TRIAL_DEADLINE_DAYS, so the window is bounded."""
         since = self.now - HISTORY_DAYS * DAY
         for r in self.ledger.records:
-            if r.applied_at is not None and r.state in ("trial", "kept", "applied"):
+            if r.state == "trial" and r.applied_at is not None:
                 since = min(since, r.applied_at - 28 * DAY)
+            elif r.state == "shadow_pending":
+                since = min(since, r.created_at - DAY)
         return since
 
     def _finish_errors(self) -> None:
@@ -323,7 +330,7 @@ class _Cycle(DraftSteps):
             return
         if rec.kind in JOB_KINDS:
             base = trial.baseline_stats(self.sessions, rec.target, rec.applied_at)
-            rec.baseline_cost = base.median_cost if base is not None else None
+            rec.baseline_cost = base.median_priced_cost if base is not None else None
             self.ledger.save()
         self.report.applied.append(rec.id)
         self.restart_wanted |= rec.needs_restart
@@ -354,7 +361,7 @@ class _Cycle(DraftSteps):
                 self._rollback(rec)
 
     def _global_verdict(self, applied_at: float, live_from: float) -> str:
-        """keep only if the median run_cost over chat sessions and editable-job runs
+        """keep only if the median priced_cost over chat sessions and editable-job runs
         since live_from is strictly below the 28 days before applied_at (prompt
         tokens when both medians are 0)."""
         def runs(lo: float, hi: float) -> list[Session]:
@@ -364,7 +371,7 @@ class _Cycle(DraftSteps):
         before = runs(applied_at - 28 * DAY, applied_at)
         if not after or not before:
             return "rollback"
-        ca, cb = median(map(run_cost, after)), median(map(run_cost, before))
+        ca, cb = median(map(priced_cost, after)), median(map(priced_cost, before))
         if ca == 0 and cb == 0:
             better = (median(s.prompt_tokens for s in after)
                       < median(s.prompt_tokens for s in before))

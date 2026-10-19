@@ -10,6 +10,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+from .measure import priced_cost
 from .model import Session
 
 DAY = 86400.0
@@ -40,12 +41,13 @@ def _total_chars(s: Session) -> int:
 
 
 def _money(per_session: Mapping[str, int], by_id: Mapping[str, Session]) -> float:
-    """Sum of est_cost x (candidate chars / all chars) over sessions, scaled to 30 days."""
+    """Sum of priced_cost x (candidate chars / all chars) over sessions, scaled to
+    30 days. Priced from tokens: the raw billing figure reads $0 on a subscription."""
     usd = 0.0
     for sid, chars in per_session.items():
         total = _total_chars(by_id[sid])
         if total > 0:
-            usd += by_id[sid].est_cost * chars / total
+            usd += priced_cost(by_id[sid]) * chars / total
     return usd * MONTH_DAYS / WINDOW_DAYS
 
 
@@ -160,5 +162,6 @@ def detect(sessions: list[Session], now: float,
     cands = _sequences(window, by_id) + _rereads(window, by_id) + _schema_lookups(window, by_id)
     if skill_names is not None:
         cands += _skill_loads(window, by_id, skill_names)
+    cands = [c for c in cands if c.est_monthly_usd > 0]  # worth nothing: not a candidate
     cands.sort(key=lambda c: (-c.est_monthly_usd, c.kind, c.key, c.job_id or ""))
     return cands

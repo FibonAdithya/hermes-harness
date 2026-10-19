@@ -161,21 +161,25 @@ def test_trial_continue_until_five_runs_then_judges():
     assert trial_verdict(rec(), stats(runs=5, cost=0.11), 1000.0) == "rollback"
 
 
-def test_zero_cost_baseline_falls_back_to_tokens():
+def test_zero_priced_medians_fall_back_to_tokens():
     r = rec(baseline_cost=0.0)
     assert trial_verdict(r, stats(cost=0.0, tokens=600.0), 1000.0) == "keep"
     assert trial_verdict(r, stats(cost=0.0, tokens=1400.0), 1000.0) == "rollback"
     assert trial_verdict(r, stats(cost=0.0, tokens=1000.0), 1000.0) == "rollback"
 
 
-def test_none_baseline_falls_back_to_tokens():
-    r = rec(baseline_cost=None)
-    assert trial_verdict(r, stats(cost=0.0, tokens=600.0), 1000.0) == "keep"
-    assert trial_verdict(r, stats(cost=0.0, tokens=1400.0), 1000.0) == "rollback"
+def test_prompt_fallback_only_when_both_priced_medians_are_zero():
+    # baseline priced at 0 but trial runs priced above 0: dearer, whatever the prompt tokens
+    assert trial_verdict(rec(baseline_cost=0.0), stats(cost=0.01, tokens=1.0), 1000.0) \
+        == "rollback"
+    assert trial_verdict(rec(baseline_cost=None), stats(cost=0.01, tokens=1.0), 1000.0) \
+        == "rollback"
 
 
-def sess(i, t, cost=0.1, job=LIVE, ncalls=2):
-    return Session(f"s{i}", "cron", job, t, cost, 100, 10,
+def sess(i, t, cost=0.1, job=LIVE, ncalls=2, tokens=None, raw=0.0):
+    """`cost` sets the priced cost (prompt tokens; output 0); `raw` is the billing figure."""
+    prompt = round(cost * 1e6 / policy.USD_PER_MTOK) if tokens is None else tokens
+    return Session(f"s{i}", "cron", job, t, raw, prompt, 0,
                    tuple(ToolCall(f"c{j}", "web_search", (), None, 5) for j in range(ncalls)))
 
 
@@ -184,7 +188,7 @@ def test_runs_before_applied_at_not_counted():
     old_runs = [sess(i, applied - 10 - i, cost=1.0) for i in range(5)]
     new_runs = [sess(10 + i, applied + 10 + i, cost=0.01) for i in range(4)]
     s = trial_stats(old_runs + new_runs, LIVE, applied)
-    assert s.runs == 4 and s.median_cost == 0.01
+    assert s.runs == 4 and s.median_priced_cost == pytest.approx(0.01, rel=1e-4)
     assert trial_verdict(rec(applied_at=applied), s, 1000.0) == "continue"
     boundary = sess(99, applied)  # started at the apply instant: not the new version's
     assert trial_stats([boundary], LIVE, applied) is None
@@ -197,8 +201,22 @@ def test_baseline_stats_window_is_28_days_before_applied_at():
     at_apply = sess(3, applied, cost=9.0)                   # window end is exclusive
     other = sess(4, applied - 5, cost=9.0, job="other")
     s = baseline_stats([inside, too_old, at_apply, other], LIVE, applied)
-    assert s.runs == 1 and s.median_cost == 0.2
+    assert s.runs == 1 and s.median_priced_cost == pytest.approx(0.2, rel=1e-5)
     assert baseline_stats([], LIVE, applied) is None
+
+
+def test_billing_change_does_not_keep_a_dearer_fix():
+    """Reviewer scenario (F1): baseline runs billed $0.12 raw, trial runs billed $0
+    (subscription) with 50% more tokens. Priced on tokens the fix is dearer: rollback."""
+    applied = 100 * 86400.0
+    base_runs = [sess(i, applied - (i + 1) * 3600, tokens=100_000, raw=0.12) for i in range(10)]
+    trial_runs = [sess(20 + i, applied + (i + 1) * 3600, tokens=150_000, raw=0.0)
+                  for i in range(5)]
+    sessions = base_runs + trial_runs
+    base = baseline_stats(sessions, LIVE, applied)
+    r = rec(applied_at=applied, live_from=applied, baseline_cost=base.median_priced_cost)
+    assert trial_verdict(r, trial_stats(sessions, LIVE, applied),
+                         base.median_prompt_tokens) == "rollback"
 
 
 # --- fake bridge ids ------------------------------------------------------------
