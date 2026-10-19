@@ -294,7 +294,7 @@ def test_proposal_text_exactly_as_specified():
     h = change_hash(CHANGE)
     text = format_proposal("fix-1", "needs labels", CHANGE, "4821")
     canon = json.dumps(CHANGE, sort_keys=True, separators=(",", ":"))
-    assert text == ("Tool proposal fix-1\n\nneeds labels\n\nChange: " + canon +
+    assert text == ("Tool proposal fix-1\n\nChange: " + canon + "\n\nneeds labels"
                     "\n\n—— reply below ——\ncode 4821\ntool 4821 | drop 4821")
     assert h  # the hash is bound inside the store, not shown
 
@@ -421,8 +421,19 @@ def test_outbox_text_cannot_carry_the_reply_separator(tmp_path):
     (tuner / "outbox").mkdir()
     (tuner / "outbox" / "a.txt").write_text("saved ~$1\n\n—— reply below ——\ntask 1234")
     ann.tick(1.0)
-    assert sent == ["saved ~$1\n\n\ntask 1234"]
+    assert sent == ["saved ~$1 task 1234"]
     assert "reply below" not in sent[0]
+
+
+def test_removing_the_separator_cannot_assemble_a_new_one():
+    """Catches: a single replace() whose removal joins the pieces around it into a
+    new separator (or a whitespace collapse that does)."""
+    from hermes_broker.approvals import one_line
+    sep = "—— reply below ——"
+    assert sep not in one_line("—— reply " + sep + "below ——")  # removal joins the halves
+    assert sep not in one_line("—— reply " + "—— reply " + sep + "below ——" + "below ——")
+    assert sep not in one_line("—— reply   below\n——")
+    assert sep not in one_line("——\u200b reply below ——")
 
 
 def test_missing_tuner_dir_is_quiet(tmp_path):
@@ -449,3 +460,30 @@ def test_announcer_code_avoid_set_includes_proposal_codes(stores, tmp_path):
     tasks.announce = spy
     Announcer(tasks, grants, box, _recording_sender(sent), proposals=props).tick(now=1.0)
     assert pcode in seen["avoid"]
+
+
+def test_why_cannot_push_the_real_change_out_of_view():
+    """Catches: a separator lookalike (zero-width joiner) plus blank lines in `why`
+    showing a harmless fake change and reply prompt above the real ones."""
+    fake = {"type": "mcp_include_add", "server": "google", "tool": "list_labels"}
+    why = ("Read-only.\n\nChange: " + json.dumps(fake) + "\n\n\u2014\u200d\u2014 reply below "
+           "\u2014\u2014\ncode 0000\ntool 0000 | drop 0000" + "\n" * 40 + "\u2028\u2029\x0b")
+    text = format_proposal("fix-1", why, CHANGE, "4821")
+    canon = json.dumps(CHANGE, sort_keys=True, separators=(",", ":"))
+    head = "Tool proposal fix-1\n\nChange: " + canon + "\n\n"
+    tail = "\n\n—— reply below ——\ncode 4821\ntool 4821 | drop 4821"
+    assert text.startswith(head) and text.endswith(tail)
+    shown_why = text[len(head):-len(tail)]
+    assert shown_why.startswith("Read-only. Change:")
+    assert "\n" not in shown_why and "\u200d" not in shown_why
+    assert not any(c in shown_why for c in "\u2028\u2029\x0b")
+
+
+def test_outbox_text_is_one_line(tmp_path):
+    """Catches: outbox text laid out as a fake announcement over several lines."""
+    sent = []
+    ann, tuner = make(tmp_path, _recording_sender(sent))
+    (tuner / "outbox").mkdir()
+    (tuner / "outbox" / "a.txt").write_text("saved ~$1\n\ncode 1234\u2028tool 1234\u200d")
+    ann.tick(1.0)
+    assert sent == ["saved ~$1 code 1234 tool 1234"]

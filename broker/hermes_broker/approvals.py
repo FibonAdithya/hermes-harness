@@ -13,6 +13,7 @@ import json
 import logging
 import re
 import time
+import unicodedata
 from pathlib import Path
 from typing import Callable
 
@@ -252,23 +253,37 @@ def _avoid_codes(grants: GrantStore, tasks: TaskStore | None, proposals: Proposa
 TELEGRAM_MAX = 4096
 
 
+def one_line(text: str) -> str:
+    """`text` as one line: control, format (zero-width), line/paragraph separator
+    and space characters become single spaces, then the reply separator is
+    removed. Tuner text cannot lay out a fake announcement or reply prompt."""
+    out = "".join(" " if unicodedata.category(c) in _FLATTEN else c for c in text)
+    while True:  # a removal or a collapse can join pieces into a new separator
+        prev, out = out, " ".join(out.split()).replace(_TAIL_SEPARATOR, "")
+        if out == prev:
+            return out.strip()
+
+
+_FLATTEN = frozenset({"Cc", "Cf", "Zl", "Zp", "Zs"})
+
+
 def format_proposal(proposal_id: str, why: str, change: dict, code: str) -> str:
-    """Announcement for a tool proposal. `why` is the tuner's text: the separator is
-    removed from it (so it cannot fake reply instructions) and it is trimmed first
-    when the whole text would pass Telegram's limit. The change is never trimmed:
-    the owner approves exactly what is shown. Raises ValueError when the change
-    alone does not fit, or itself contains the separator."""
+    """Announcement for a tool proposal: the exact change first, then the tuner's
+    `why` on one line (see one_line), then the reply instructions. `why` is
+    trimmed first when the whole text would pass Telegram's limit. The change is
+    never trimmed: the owner approves exactly what is shown. Raises ValueError when
+    the change alone does not fit, or itself contains the separator."""
     canon = json.dumps(change, sort_keys=True, separators=(",", ":"))
     if _TAIL_SEPARATOR in canon:
         raise ValueError("change contains the reply separator")
-    head = f"Tool proposal {proposal_id}\n\n"
-    tail = f"\n\nChange: {canon}\n\n{_TAIL_SEPARATOR}\ncode {code}\ntool {code} | drop {code}"
+    head = f"Tool proposal {proposal_id}\n\nChange: {canon}\n\n"
+    tail = f"\n\n{_TAIL_SEPARATOR}\ncode {code}\ntool {code} | drop {code}"
     room = TELEGRAM_MAX - len(head) - len(tail)
     if room < 0:
         raise ValueError("change is too long to show in full")
-    why = why.replace(_TAIL_SEPARATOR, "")
+    why = one_line(why)
     if len(why) > room:
-        mark = "\n[… trimmed]"
+        mark = " [… trimmed]"
         why = why[:max(room - len(mark), 0)] + mark[:room]
     return head + why + tail
 
@@ -317,9 +332,9 @@ class TunerAnnouncer:
     def _send_outbox(self, now: float) -> None:
         for path in sorted((self.tuner_dir / "outbox").glob("*.txt")):
             try:
-                # The reply separator is stripped, as in format_announcement, so the
-                # text cannot put fake reply instructions in front of the owner.
-                text = path.read_text(encoding="utf-8").replace(_TAIL_SEPARATOR, "")[:TELEGRAM_MAX]
+                # One line with no reply separator (as in format_proposal), so the
+                # text cannot lay out fake reply instructions in front of the owner.
+                text = one_line(path.read_text(encoding="utf-8"))[:TELEGRAM_MAX]
             except (OSError, ValueError):
                 logger.warning("skipping unreadable outbox file %s", path.name)
                 continue

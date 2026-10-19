@@ -59,8 +59,16 @@ class ProposalStore:
                 data = json.load(fh)
         except (FileNotFoundError, json.JSONDecodeError):
             data = {}
-        data.setdefault("codes", {})
-        data.setdefault("settled", [])
+        # Valid JSON of the wrong shape reads like a corrupt file: as empty. Raising
+        # here would escape the listener's dispatch and crash-loop it.
+        if not isinstance(data, dict):
+            data = {}
+        codes = data.get("codes")
+        data["codes"] = {c: e for c, e in codes.items()
+                         if isinstance(e, dict) and isinstance(e.get("expires_at"), (int, float))
+                         } if isinstance(codes, dict) else {}
+        if not isinstance(data.get("settled"), list):
+            data["settled"] = []
         return data
 
     @staticmethod

@@ -352,7 +352,7 @@ Instructions (fixed text, in the module) state:
   - `parse_command` returns `("tool", "NNNN")` for `^tool\s+(\d{4})$` (case-insensitive).
   - `drop NNNN`: if the code is a live `ProposalStore` code → proposal dropped, otherwise → existing task path.
   - Codes avoid `grants.pending_codes ∪ tasks.live_codes ∪ proposals.live_codes`.
-  - Announcement: `Tool proposal <id>\n\n<why>\n\nChange: <canonical change JSON>\n\n—— reply below ——\ncode NNNN\ntool NNNN | drop NNNN`, with any `—— reply below ——` inside `why` removed, as `format_announcement` does.
+  - Announcement: `Tool proposal <id>\n\nChange: <canonical change JSON>\n\n<why>\n\n—— reply below ——\ncode NNNN\ntool NNNN | drop NNNN`. `why` is flattened to one line (control, zero-width and separator characters become spaces) and any `—— reply below ——` is removed until none is left, so it cannot lay out a fake change or reply prompt (PR #19 review).
   - Outbox: each `tuner_dir/outbox/*.txt` is sent once, then renamed to `*.sent`. It is resent next tick when `_send` returns False.
 
 - [ ] **Step 1: Failing tests:**

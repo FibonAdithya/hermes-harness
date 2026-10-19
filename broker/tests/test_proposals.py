@@ -108,3 +108,15 @@ def test_corrupt_record_file_is_not_overwritten(tmp_path):
     with pytest.raises(ValueError):
         record_approval(path, "p1", H1, now=1.0)
     assert path.read_text() == "{not json"
+
+
+@pytest.mark.parametrize("content", ['[]', '{"codes": []}', '{"codes": {"1234": "x"}}',
+                                     '{"codes": {"1234": {}}}', '{"settled": {}}'])
+def test_wrong_shape_store_reads_as_empty_instead_of_raising(tmp_path, content):
+    """Catches: valid JSON of the wrong shape raising out of live_codes, which runs
+    outside the listener's try and crash-loops approve/deploy/revoke too."""
+    path = tmp_path / "proposals.json"
+    path.write_text(content)
+    store = ProposalStore(path)
+    assert store.live_codes(1.0) == set()
+    assert store.announce("p1", "h", 1.0, avoid=set()) is not None
