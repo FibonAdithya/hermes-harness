@@ -281,6 +281,14 @@ network), `model`/provider/`auxiliary` routing, `platform_toolsets`,
 `~/.hermes/broker/`. The allowlist lives in the tuner's code, not in a file the
 tuner writes.
 
+A config fix must also name a setting Hermes already has. Each cycle the tuner
+reads Hermes's resolved settings under the allowed prefixes (strings, numbers
+and booleans only, the values it can set and roll back), sends them with their
+current values in the drafting request, and rejects any other key when the fix
+is drafted. If the settings cannot be read, every config fix is rejected.
+*Added 2026-10-21:* the first run's model proposed
+`tools.tool_search.cache_schemas`, which does not exist.
+
 ### 5.2 Composed tools add no reach
 
 - The program runs **in the Docker sandbox** (no network, no credentials), not
@@ -345,9 +353,15 @@ points at the tool for the mechanics.
 - **Scale of the prize** (ESTIMATE): the two email jobs cost about $8/month at
   September usage. A 50% saving is about $4/month, so the tuner must stay well
   under that. Detection costs nothing, which is why it is deterministic.
-- If its trailing four-week spend exceeds the trailing four-week measured
-  savings, it stops drafting new fixes. It keeps measuring and still reports in
-  the weekly line.
+- If its trailing four-week spend exceeds both the trailing four-week measured
+  savings and a $1 starting allowance (ESTIMATE, the size of the weekly cap), it
+  stops drafting new fixes. It keeps measuring and still reports in the weekly
+  line. A tuner that never saves anything therefore costs about $1 per four
+  weeks.
+  - *Amended 2026-10-21.* The rule first read "spend exceeds savings" alone.
+    Any spend before the first fix succeeds trips that rule, so the first run's
+    two failed drafts ($0.04, ESTIMATE) would have paused drafting until they
+    aged out four weeks later.
 
 ## 7. Verification
 

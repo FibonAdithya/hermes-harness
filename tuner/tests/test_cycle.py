@@ -27,7 +27,8 @@ MOD = "mcp__google__modify_gmail_message_labels"
 RESULT_SENTINEL = "ZZ_SENTINEL_9f2c"
 ARG_SENTINEL = "ZZ_SENTINEL_q"
 ALL_METHODS = {"scan", "get_job", "list_jobs", "update_job", "create_job", "remove_job",
-               "config_get", "config_set", "config_set_json", "oneshot", "restart_gateway"}
+               "config_get", "config_set", "config_set_json", "oneshot", "restart_gateway",
+               "config_settings"}
 CFG_KEY = "compression.threshold"
 PLUGINS = "plugins.enabled"
 
@@ -218,19 +219,114 @@ def test_budget_exhausted_skips_drafting_but_still_evaluates(env, week_spend, dr
     assert bridge.calls.count(("restart_gateway", ())) == 1
 
 
-@pytest.mark.parametrize("with_savings, drafts", [(False, False), (True, True)])
-def test_spend_exceeding_savings_pauses_drafting(env, with_savings, drafts):
+@pytest.mark.parametrize("spent, with_savings, drafts", [
+    (0.04, False, True),   # the 2026-10-21 run: failed drafts alone must not pause drafting
+    (1.00, False, True),   # at the allowance, not over it
+    (1.10, False, False),  # over the allowance with nothing saved: paused
+    (1.10, True, True),    # over the allowance but savings cover it
+])
+def test_spend_exceeding_savings_and_allowance_pauses_drafting(env, spent, with_savings, drafts):
+    """Catches: pausing on spend > savings alone (any spend before the first saving
+    then pauses the tuner for four weeks), or ignoring savings above the allowance."""
     sessions = triage_runs()
     if with_savings:
         sessions += kept_cal_fix(env)
     build(env, sessions)
-    # $0.10 spent 10 days ago: last ISO week, so this week's spend is 0 (cap not hit).
+    # spent 10 days ago: last ISO week, so this week's spend is 0 (cap not hit).
     old = Fix("20261009-ffff0001", "job_prompt", CAL, {}, "seq:old")
     add_record(env, FixRecord(old.id, "job_prompt", CAL, "seq:old", "rejected",
-                              NOW - 10 * DAY, spend_usd=0.10), old)
+                              NOW - 10 * DAY, spend_usd=spent), old)
     bridge = FakeBridge(jobs=jobs(), oneshot_script=[reply(JOB_PROMPT_REPLY)])
-    run_cycle(env, bridge, NOW)
+    report = run_cycle(env, bridge, NOW)
     assert bool(oneshots(bridge)) is drafts
+    if not drafts:
+        assert report.budget == ("paused: 28-day spend $1.1000 > 28-day savings $0.0000 "
+                                 "and > $1.00 starting allowance (ESTIMATE)")
+
+
+def test_pause_allowance_matches_the_weekly_cap():
+    """The allowance is the weekly cap's size (spec 6). Catches: a changed constant."""
+    assert policy.PAUSE_ALLOWANCE_USD == policy.WEEKLY_CAP_USD == 1.0
+
+
+# --- real setting names ------------------------------------------------------------------
+
+def chat_schema_sessions():
+    """21 chat sessions with two tool_describe calls each: a schema_lookup candidate."""
+    out = []
+    for d in range(1, 22):
+        out.append({"id": f"2026{d:04d}_000000_ab12cd", "source": "telegram",
+                    "started_at": NOW - d * DAY, "cost": 0.05, "in": 1000, "out": 10,
+                    "calls": [("tool_describe", {"name": "a"}, "s" * 300),
+                              ("tool_describe", {"name": "b"}, "s" * 300)]})
+    return out
+
+
+SETTINGS_CONFIG = {CFG_KEY: 0.5, "tools.tool_search.enabled": "auto",
+                   "compression.threshold_tokens": None, "display.x": 1,
+                   "terminal.backend": "local"}
+
+
+def test_draft_request_lists_the_changeable_settings(env):
+    """Catches: the model shown no setting names (it guessed one on 2026-10-21)."""
+    build(env, chat_schema_sessions())
+    cfg_reply = {"kind": "config", "target": CFG_KEY, "payload": {"key": CFG_KEY, "value": 0.7}}
+    bridge = FakeBridge(jobs=jobs(), config=SETTINGS_CONFIG, oneshot_script=[reply(cfg_reply)])
+    run_cycle(env, bridge, NOW)
+    ((_m, (_i, user, _mt)),) = oneshots(bridge)
+    assert json.loads(user)["settings"] == {CFG_KEY: 0.5, "tools.tool_search.enabled": "auto"}
+
+
+def test_cycle_filters_the_settings_the_bridge_returns(env):
+    """The tuner does not trust the bridge's filtering: a forbidden key or a
+    non-finite value it returns is neither shown to the model nor accepted.
+    Catches: the cycle using the bridge's result unfiltered."""
+    class Loose(_FakeBridge):
+        def config_settings(self, prefixes):
+            self._enter("config_settings", list(prefixes))
+            return {CFG_KEY: 0.5, "compression.nan": float("nan"), "mcp_servers.g.x": 1}
+
+    build(env, chat_schema_sessions())
+    bad = "mcp_servers.g.x"
+    cfg_reply = {"kind": "config", "target": bad, "payload": {"key": bad, "value": 2}}
+    bridge = Loose(jobs=jobs(), config={PLUGINS: ["hermes-tuner"], CFG_KEY: 0.5},
+                   oneshot_script=[reply(cfg_reply)])
+    run_cycle(env, bridge, NOW)
+    ((_m, (_i, user, _mt)),) = oneshots(bridge)
+    assert json.loads(user)["settings"] == {CFG_KEY: 0.5}
+    (rec,) = Ledger.load(env.root).records
+    assert rec.state == "rejected"
+
+
+def test_unknown_setting_is_rejected_when_drafted(env):
+    """The 2026-10-21 run: tools.tool_search.cache_schemas reached apply, which refused
+    it only for having no value to roll back to. Now limits reject it, before any
+    config read or write, with the reason in the ledger."""
+    build(env, chat_schema_sessions())
+    bad = "tools.tool_search.cache_schemas"
+    cfg_reply = {"kind": "config", "target": bad, "payload": {"key": bad, "value": True}}
+    bridge = FakeBridge(jobs=jobs(), config=SETTINGS_CONFIG, oneshot_script=[reply(cfg_reply)])
+    report = run_cycle(env, bridge, NOW)
+    (rec,) = Ledger.load(env.root).records
+    assert rec.state == "rejected"
+    assert f"config key {bad!r} is not an existing Hermes setting" in rec.reason
+    assert not [c for c in bridge.calls if c[0] in ("config_get", "config_set")]
+    assert report.errors == [] and report.applied == []
+
+
+def test_unreadable_settings_reject_config_fixes(env):
+    """Fail closed: with no settings list, no config fix passes, and the failure is
+    reported once."""
+    build(env, chat_schema_sessions())
+    cfg_reply = {"kind": "config", "target": CFG_KEY, "payload": {"key": CFG_KEY, "value": 0.7}}
+    bridge = FakeBridge(jobs=jobs(), config=SETTINGS_CONFIG, oneshot_script=[reply(cfg_reply)],
+                        fail={"config_settings"})
+    report = run_cycle(env, bridge, NOW)
+    (rec,) = Ledger.load(env.root).records
+    assert rec.state == "rejected" and "not an existing Hermes setting" in rec.reason
+    assert bridge.config[CFG_KEY] == 0.5
+    assert [e for e in report.errors if e.startswith("config_settings:")] and \
+        len(report.errors) == 1
 
 
 # --- bridge failure ----------------------------------------------------------------------
@@ -1171,14 +1267,18 @@ def test_rollback_pending_is_retried_by_the_cycle(env):
     assert fix.id in report.rolled_back
 
 
-def test_failed_drafting_call_is_charged_and_not_retried_daily(env):
-    """Catches: a oneshot that times out (possibly billed) costing $0 to the budget,
-    so the same candidate is drafted again every day."""
+def test_failed_drafting_call_is_charged_and_counts_toward_the_pause(env):
+    """Catches: a oneshot that times out (possibly billed) costing $0 to the budget.
+    $0.99 spent last week leaves the 28-day spend just under the $1 allowance; the
+    failed call's charge takes it over, so the next day does not draft."""
     build(env, triage_runs())
+    old = Fix("20261009-ffff0002", "job_prompt", CAL, {}, "seq:old")
+    add_record(env, FixRecord(old.id, "job_prompt", CAL, "seq:old", "rejected",
+                              NOW - 10 * DAY, spend_usd=0.99), old)
     bridge = FakeBridge(jobs=jobs(), fail={"oneshot"})
     report = run_cycle(env, bridge, NOW)
     assert len(oneshots(bridge)) == 1
-    (rec,) = Ledger.load(env.root).records
+    (rec,) = [r for r in Ledger.load(env.root).records if r.id != old.id]
     assert rec.state == "rejected" and rec.spend_usd == policy.DRAFT_EST_USD
     assert "oneshot" in rec.reason
     assert any("oneshot" in e for e in report.errors)

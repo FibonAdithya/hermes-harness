@@ -91,6 +91,10 @@ NEVER_TOUCH_JOBS = frozenset({"8da9a6857256"})
 
 # Spend and trials.
 WEEKLY_CAP_USD = 1.0
+# Drafting pauses only when 28-day spend exceeds both 28-day savings and this allowance
+# (spec 6). Without it, any spend before the first saving (a failed draft) paused
+# drafting until that spend aged out. ESTIMATE, same size as the weekly cap.
+PAUSE_ALLOWANCE_USD = 1.0
 DRAFT_EST_USD = 0.02  # ESTIMATE
 # Every tuner decision and figure prices a run from its token breakdown at the
 # configured model's list prices (bridge `pricing` -> model.Pricing, then

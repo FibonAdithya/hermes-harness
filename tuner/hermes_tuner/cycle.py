@@ -126,6 +126,7 @@ class _Cycle(DraftSteps):
         self.history: History | None = None
         self.sessions: list[Session] = []
         self._copy_index: CopyIndex | None = None
+        self._config_settings: dict | None = None
         self._plugin_ok: bool | None = None
         self.pricing: Pricing | None = None
 

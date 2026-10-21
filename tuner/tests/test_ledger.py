@@ -1007,7 +1007,7 @@ def test_bridge_entry_oneshot_returns_token_breakdown(monkeypatch):
                       ("agent.usage_pricing", up), ("hermes_cli", types.ModuleType("hermes_cli")),
                       ("hermes_cli.config", cfg)):
         monkeypatch.setitem(sys.modules, name, mod)
-    got = bridge_entry.oneshot("i", "u", 10)
+    got = bridge_entry.oneshot("i", "u", 10, timeout=300)
     assert (got["input_tokens"], got["cache_read_tokens"], got["cache_write_tokens"],
             got["output_tokens"]) == (5, 300, 20, 7)
     assert got["text"] == "hi"

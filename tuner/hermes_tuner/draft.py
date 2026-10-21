@@ -24,7 +24,7 @@ JOB_FIELDS = ("id", "name", "schedule", "prompt", "enabled_toolsets")
 CANDIDATE_FIELDS = ("kind", "key", "job_id", "sessions", "occurrences", "result_chars",
                     "est_monthly_usd")
 
-INSTRUCTIONS = f"""You draft one fix that reduces wasted work in a scheduled agent. The user message is a JSON document: statistics for one detected pattern (candidate), the job it occurs in (job), optionally the text of a skill (skill_text), the schemas of tools involved (tool_schemas), and call_shape, the sequence of tool calls as [tool name, [argument keys]]. It contains no tool results and no argument values.
+INSTRUCTIONS = f"""You draft one fix that reduces wasted work in a scheduled agent. The user message is a JSON document: statistics for one detected pattern (candidate), the job it occurs in (job), optionally the text of a skill (skill_text), the schemas of tools involved (tool_schemas), the settings a config fix may change with their current values (settings), and call_shape, the sequence of tool calls as [tool name, [argument keys]]. It contains no tool results and no argument values.
 
 Reply with a single JSON object and nothing else: no prose, no code fence. Shape: {{"kind": ..., "target": ..., "payload": {{...}}}}. Choose exactly one kind.
 
@@ -38,7 +38,7 @@ Reply with a single JSON object and nothing else: no prose, no code fence. Shape
    - If the program calls a mutating tool ({", ".join(sorted(policy.MUTATING_TOOLS & policy.CALLABLE_TOOLS))}), set mutating to true and add a boolean "dry_run" argument to parameters; the program must not perform effects when it is set (calls are recorded instead).
    - job_prompt is optional new job prompt text telling the agent to use the tool, or null.
 2. "job_prompt": rewrite a job's prompt. target is the job id from the request. payload: {{"prompt": str, "add_toolsets": [str]}}. add_toolsets may only be ["{policy.TOOLSET}"] or [].
-3. "config": change one setting. target is the key. payload: {{"key": str, "value": string, number or boolean}}. Keys are allowed only under these prefixes: {", ".join(policy.CONFIG_ALLOW_PREFIXES)}.
+3. "config": change one setting. target is the key. payload: {{"key": str, "value": string, number or boolean}}. The request's "settings" object maps every setting you may change to its current value. key must be one of its keys, copied exactly; any other key is refused. Keep the type of the current value. If "settings" is empty, do not choose this kind.
 4. "skill": shrink a skill that is loaded often and is large. target is the skill path. payload: {{"path": str, "text": str}}. A skill fix may only rewrite an existing SKILL.md that is not bundled with the agent, and must keep its frontmatter block (the leading --- block) byte-identical. Shrink the body, keep the decision guidance, and point at the tool for mechanics.
 5. "new_reach": use only when the fix truly needs a tool outside the allowed list. payload: {{"change": {{"type": "mcp_include_add", "server": str, "tool": str}} or {{"type": "callable_add", "tool": str}}, "why": str}}. target is the tool name. The owner must approve it.
 
@@ -119,7 +119,10 @@ def _safe_key(key: str) -> str:
 
 def build_request(candidate: Candidate, job: dict | None, skill_text: str | None,
                   tool_schemas: dict[str, dict],
-                  call_shape: list[tuple[str, tuple[str, ...]]]) -> tuple[str, str]:
+                  call_shape: list[tuple[str, tuple[str, ...]]],
+                  settings: dict[str, Any] | None = None) -> tuple[str, str]:
+    """`settings`: the changeable settings (limits.changeable_settings), sent so the
+    model names a real key instead of guessing one under an allowed prefix."""
     doc: dict[str, Any] = {"candidate": {f: getattr(candidate, f) for f in CANDIDATE_FIELDS}}
     doc["candidate"]["key"] = _safe_key(candidate.key)
     if job is not None:
@@ -127,6 +130,7 @@ def build_request(candidate: Candidate, job: dict | None, skill_text: str | None
     if skill_text is not None:
         doc["skill_text"] = skill_text
     doc["tool_schemas"] = tool_schemas
+    doc["settings"] = dict(settings or {})
     doc["call_shape"] = [[_safe(name, _NAME), [_safe(k, _ARG_KEY) for k in keys]]
                          for name, keys in call_shape[:MAX_SHAPE_CALLS]]
     return INSTRUCTIONS, json.dumps(doc, sort_keys=True)
@@ -184,9 +188,11 @@ def _spend(reply: dict, pricing: Pricing) -> float:
 def draft(candidate: Candidate, job: dict | None, skill_text: str | None,
           tool_schemas: dict[str, dict], call_shape: list[tuple[str, tuple[str, ...]]],
           bridge: Bridge, now: float, pricing: Pricing,
-          max_tokens: int = 4000) -> tuple[Fix | None, float]:
+          max_tokens: int = 4000,
+          settings: dict[str, Any] | None = None) -> tuple[Fix | None, float]:
     """One model call. A BridgeError propagates; spend is reported for bad replies too."""
-    instructions, user_input = build_request(candidate, job, skill_text, tool_schemas, call_shape)
+    instructions, user_input = build_request(candidate, job, skill_text, tool_schemas,
+                                             call_shape, settings)
     reply = bridge.oneshot(instructions, user_input, max_tokens)
     text = reply.get("text")
     fix = parse_draft(text, candidate, now) if isinstance(text, str) else None
