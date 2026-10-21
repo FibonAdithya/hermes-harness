@@ -214,6 +214,25 @@ def test_build_request_omits_other_job_fields():
     assert "skill_text" not in doc
 
 
+def test_build_request_carries_the_settings():
+    """Catches: the settings fetched but never sent, so the model guesses key names."""
+    settings = {"compression.threshold": 0.5, "tools.tool_search.enabled": "auto"}
+    _i, user = D.build_request(CAND, None, None, {}, [], settings=settings)
+    assert json.loads(user)["settings"] == settings
+
+
+def test_build_request_without_settings_sends_an_empty_object():
+    _i, user = D.build_request(CAND, None, None, {}, [])
+    assert json.loads(user)["settings"] == {}
+
+
+def test_draft_forwards_settings():
+    b = FakeBridge(oneshot_script=[script(reply())])
+    D.draft(CAND, None, None, {}, [], b, NOW, FLAT, settings={"compression.enabled": True})
+    (_m, (_instr, user, _mt)), = b.calls
+    assert json.loads(user)["settings"] == {"compression.enabled": True}
+
+
 def test_build_request_without_job():
     _i, user = D.build_request(CAND, None, None, {}, [])
     assert "job" not in json.loads(user)
@@ -223,8 +242,10 @@ def test_instructions_state_the_contract():
     t = D.INSTRUCTIONS
     for name in sorted(policy.CALLABLE_TOOLS):
         assert name in t
+    # config keys come from the request's settings, not from guessing under a prefix
     for prefix in policy.CONFIG_ALLOW_PREFIXES:
-        assert prefix in t
+        assert prefix not in t
+    assert '"settings"' in t
     for kind in ("composed_tool", "job_prompt", "config", "skill", "new_reach"):
         assert kind in t
     for phrase in ("def main(args: dict, call)", "dry_run", "mutating", "byte-identical",

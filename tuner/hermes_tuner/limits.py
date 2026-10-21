@@ -1,12 +1,15 @@
 """Deterministic gate on model-drafted fixes (spec 5). Empty list = allowed."""
 from __future__ import annotations
 
+import math
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from . import policy
+from .bridge import is_setting_value
 from .fingerprint import CopyIndex
 from .model import Fix
 
@@ -19,6 +22,9 @@ class LimitContext:
     skills_root: Path
     approved_callables: frozenset[str]
     existing_tools: frozenset[str]
+    # Hermes's current settings the tuner may change (changeable_settings); a config
+    # fix must name one of these keys. Empty when they could not be read: fail closed.
+    config_settings: Mapping[str, Any]
 
 
 def _strings(obj: object, path: str = "payload") -> Iterator[tuple[str, str]]:
@@ -37,14 +43,34 @@ def _strings(obj: object, path: str = "payload") -> Iterator[tuple[str, str]]:
             stack.extend((f"{p}[{i}]", v) for i, v in enumerate(o))
 
 
-def _check_config(payload: dict) -> list[str]:
+def _key_reason(key: str) -> str | None:
+    if any(key.startswith(p) for p in policy.CONFIG_FORBIDDEN_PREFIXES):
+        return f"config key {key!r} is forbidden"
+    if not any(key.startswith(p) for p in policy.CONFIG_ALLOW_PREFIXES):
+        return f"config key {key!r} is not on the allowlist"
+    return None
+
+
+def changeable_settings(raw: object) -> dict[str, Any]:
+    """The settings a config fix may change: entries of `raw` (the bridge's
+    config_settings result) whose key passes the allow and forbid prefixes and whose
+    value is a finite string, number or boolean."""
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in raw.items()
+            if isinstance(k, str) and _key_reason(k) is None and is_setting_value(v)
+            and not (isinstance(v, float) and not math.isfinite(v))}
+
+
+def _check_config(payload: dict, settings: Mapping[str, Any]) -> list[str]:
     key = payload.get("key")
     if not isinstance(key, str) or "value" not in payload:
         return ["config payload needs a string key and a value"]
-    if any(key.startswith(p) for p in policy.CONFIG_FORBIDDEN_PREFIXES):
-        return [f"config key {key!r} is forbidden"]
-    if not any(key.startswith(p) for p in policy.CONFIG_ALLOW_PREFIXES):
-        return [f"config key {key!r} is not on the allowlist"]
+    reason = _key_reason(key)
+    if reason is not None:
+        return [reason]
+    if key not in settings:
+        return [f"config key {key!r} is not an existing Hermes setting"]
     return []
 
 
@@ -162,7 +188,7 @@ def check_fix(fix: Fix, ctx: LimitContext) -> list[str]:
     if not isinstance(fix.target, str):
         return ["target must be a string"]
     if fix.kind == "config":
-        reasons = _check_config(fix.payload)
+        reasons = _check_config(fix.payload, ctx.config_settings)
     elif fix.kind == "job_prompt":
         reasons = _check_job_prompt(fix)
     elif fix.kind == "composed_tool":

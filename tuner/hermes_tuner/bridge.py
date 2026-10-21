@@ -17,6 +17,14 @@ from typing import Any, Protocol
 HERMES_PY = "/home/hermes/.hermes/hermes-agent/venv/bin/python"
 ENTRY = Path(__file__).with_name("bridge_entry.py")
 CALL_TIMEOUT_S = 120
+# The drafting call. Hermes's call_llm waits 30 s by default and deepseek-v4-pro needs
+# longer (MEASURED 2026-10-21: 139.2 s and 64.7 s for two real drafts), so the tuner
+# passes its own per-attempt timeout. The tuner waits for one full attempt plus a margin,
+# not for Hermes's retries (up to 3 attempts): a cycle drafts up to 3 fixes in sequence
+# and the service has 1800 s (droplet/units/hermes-tuner.service). A draft that times out
+# once is charged and reported; the next cycle tries again.
+ONESHOT_TIMEOUT_S = 300
+ONESHOT_WAIT_S = 360
 RESTART_TIMEOUT_S = 60
 STDERR_TAIL = 500
 # Live-job fields a shadow job copies so it runs like the live one (spec 4.5).
@@ -69,6 +77,12 @@ def hermes_coerce(value_str: str, default_is_str: bool) -> Any:
 CONFIG_JSON_KEY = re.compile(r"mcp_servers\.[A-Za-z0-9_-]+\.tools\.include")
 
 
+def is_setting_value(v: Any) -> bool:
+    """A value `hermes config set` can write and the tuner can roll back: a string,
+    number or boolean. None (unset), lists and dicts are not."""
+    return isinstance(v, (str, int, float, bool))
+
+
 def check_config_json_key(key: object) -> None:
     if not isinstance(key, str) or not CONFIG_JSON_KEY.fullmatch(key):
         raise ValueError(f"config_set_json refuses key {key!r}")
@@ -98,6 +112,7 @@ class Bridge(Protocol):
     def config_default_is_str(self, key: str) -> bool: ...
     def config_set(self, key: str, value: Any) -> None: ...
     def config_set_json(self, key: str, value: Any) -> None: ...
+    def config_settings(self, prefixes: list[str]) -> dict[str, Any]: ...
     def oneshot(self, instructions: str, user_input: str, max_tokens: int) -> dict: ...
     def pricing(self) -> dict: ...
     def restart_gateway(self) -> None: ...
@@ -114,12 +129,13 @@ class HermesBridge:
                  timeout: float = CALL_TIMEOUT_S, runner: Callable = subprocess.run):
         self.hermes_py, self.entry, self.timeout, self._run = hermes_py, str(entry), timeout, runner
 
-    def _call(self, op: str, **args: Any) -> Any:
+    def _call(self, op: str, _wait: float | None = None, **args: Any) -> Any:
+        wait = self.timeout if _wait is None else _wait
         try:
             p = self._run([self.hermes_py, self.entry, op], input=json.dumps(args),
-                          capture_output=True, text=True, timeout=self.timeout)
+                          capture_output=True, text=True, timeout=wait)
         except subprocess.TimeoutExpired as exc:
-            raise BridgeError(f"{op} timed out after {self.timeout}s") from exc
+            raise BridgeError(f"{op} timed out after {wait}s") from exc
         except OSError as exc:
             raise BridgeError(f"{op}: cannot run {self.hermes_py}: {exc}") from exc
         try:
@@ -172,9 +188,15 @@ class HermesBridge:
         check_config_json_key(key)
         self._call("config_set_json", key=key, value=value)
 
+    def config_settings(self, prefixes):
+        """Read-only: {key: value} for Hermes's resolved settings under `prefixes`
+        (see bridge_entry.config_settings)."""
+        return self._call("config_settings", prefixes=list(prefixes))
+
     def oneshot(self, instructions, user_input, max_tokens):
-        return self._call("oneshot", instructions=instructions, user_input=user_input,
-                          max_tokens=max_tokens)
+        return self._call("oneshot", _wait=ONESHOT_WAIT_S, instructions=instructions,
+                          user_input=user_input, max_tokens=max_tokens,
+                          timeout=ONESHOT_TIMEOUT_S)
 
     def pricing(self):
         """The configured main model's list prices (see bridge_entry.pricing)."""
@@ -280,6 +302,12 @@ class FakeBridge:
         self._enter("config_set_json", key, value)
         check_config_json_key(key)
         self.config[key] = copy.deepcopy(value)
+
+    def config_settings(self, prefixes):
+        """Like bridge_entry.config_settings over the flat `config` dict."""
+        self._enter("config_settings", list(prefixes))
+        return {k: copy.deepcopy(v) for k, v in self.config.items()
+                if any(k.startswith(p) for p in prefixes) and is_setting_value(v)}
 
     def oneshot(self, instructions, user_input, max_tokens):
         self._enter("oneshot", instructions, user_input, max_tokens)

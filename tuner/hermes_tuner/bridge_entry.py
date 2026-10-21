@@ -83,6 +83,27 @@ def config_default_is_str(key):
     return isinstance(_default_value_for_key(key), str)
 
 
+def _leaves(d, prefix=""):
+    for k, v in d.items():
+        if isinstance(v, dict) and v:
+            yield from _leaves(v, f"{prefix}{k}.")
+        else:
+            yield f"{prefix}{k}", v
+
+
+def config_settings(prefixes):
+    """Read-only. {dotted key: value} for every leaf of the resolved config (defaults
+    merged with config.yaml) under one of `prefixes`, keeping only strings, numbers and
+    booleans: the values `config set` can write and the tuner can roll back."""
+    from hermes_cli.config import load_config
+    out = {}
+    for key, value in _leaves(load_config()):
+        if (any(key.startswith(p) for p in prefixes)
+                and isinstance(value, (str, int, float, bool))):
+            out[key] = value
+    return out
+
+
 def config_set(key, value):
     """`value` is a string (see bridge.encode_config_value); Hermes coerces it."""
     from hermes_cli.config import set_config_value
@@ -127,15 +148,16 @@ def _main_model():
     return model, provider, base_url
 
 
-def oneshot(instructions, user_input, max_tokens):
-    """One LLM call on the main provider/model from config. Subscription billing
-    reports $0 ("included"), so the raw token counts are returned too, split as
-    Hermes's CanonicalUsage splits them: input_tokens is FRESH input (not the
-    prompt total), cache reads and writes are separate."""
+def oneshot(instructions, user_input, max_tokens, timeout):
+    """One LLM call on the main provider/model from config, with a per-attempt
+    `timeout` in seconds (call_llm's default is 30 s). The raw token counts are
+    returned so the tuner prices the call itself, split as Hermes's CanonicalUsage
+    splits them: input_tokens is FRESH input (not the prompt total), cache reads and
+    writes are separate."""
     from agent.auxiliary_client import call_llm
     from agent.usage_pricing import estimate_usage_cost, normalize_usage
     model, provider, base_url = _main_model()
-    resp = call_llm(provider=provider, model=model, max_tokens=max_tokens,
+    resp = call_llm(provider=provider, model=model, max_tokens=max_tokens, timeout=timeout,
                     messages=[{"role": "system", "content": instructions},
                               {"role": "user", "content": user_input}])
     usage = normalize_usage(getattr(resp, "usage", None), provider=provider)
@@ -226,7 +248,7 @@ def pricing():
 
 OPS = {f.__name__: f for f in (scan, get_job, list_jobs, update_job, create_job,
                                remove_job, config_get, config_default_is_str,
-                               config_set, config_set_json, oneshot,
+                               config_set, config_set_json, config_settings, oneshot,
                                pricing)}
 
 

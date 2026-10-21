@@ -9,7 +9,7 @@ import pytest
 
 from hermes_tuner import policy
 from hermes_tuner.fingerprint import CopyIndex
-from hermes_tuner.limits import LimitContext, check_fix
+from hermes_tuner.limits import LimitContext, changeable_settings, check_fix
 from hermes_tuner.model import Fix
 
 GET = "mcp__google__get_gmail_message_content"
@@ -32,6 +32,7 @@ def ctx(tmp_path, **kw):
         skills_root=tmp_path / "skills",
         approved_callables=frozenset(),
         existing_tools=frozenset({"web_search", "tuned_old"}),
+        config_settings={"tools.tool_search.enabled": "auto", "compression.threshold": 0.5},
     )
     base.update(kw)
     return LimitContext(**base)
@@ -73,8 +74,43 @@ def test_config_key_must_be_allowlisted(tmp_path):
 
 def test_forbidden_beats_allowlist(tmp_path, monkeypatch):
     monkeypatch.setattr(policy, "CONFIG_ALLOW_PREFIXES", ("",))
-    assert check_fix(cfg("mcp_servers.x"), ctx(tmp_path))
-    assert check_fix(cfg("display.foo"), ctx(tmp_path)) == []
+    c = ctx(tmp_path, config_settings={"mcp_servers.x": 1, "display.foo": 1})
+    assert check_fix(cfg("mcp_servers.x"), c)
+    assert check_fix(cfg("display.foo"), c) == []
+
+
+def test_config_key_must_be_an_existing_setting(tmp_path):
+    """The 2026-10-21 run: the model proposed tools.tool_search.cache_schemas, which
+    Hermes does not have. Catches: an allowed-prefix key accepted without a setting."""
+    reasons = check_fix(cfg("tools.tool_search.cache_schemas", True), ctx(tmp_path))
+    assert reasons == ["config key 'tools.tool_search.cache_schemas' is not an existing "
+                       "Hermes setting"]
+    assert check_fix(cfg("compression.threshold", 0.6), ctx(tmp_path)) == []
+
+
+def test_no_known_settings_rejects_every_config_fix(tmp_path):
+    """Fail closed when the settings could not be read."""
+    assert check_fix(cfg("compression.threshold", 0.6), ctx(tmp_path, config_settings={}))
+
+
+def test_changeable_settings_keeps_allowed_scalar_settings_only():
+    raw = {"compression.threshold": 0.5, "compression.enabled": True,
+           "tools.tool_search.enabled": "auto", "compression.threshold_tokens": None,
+           "compression.model_thresholds": {}, "compression.l": [1],
+           "compression.inf": float("inf"), "display.x": 1, "mcp_servers.g.x": 1, 7: 1}
+    assert changeable_settings(raw) == {"compression.threshold": 0.5,
+                                        "compression.enabled": True,
+                                        "tools.tool_search.enabled": "auto"}
+
+
+def test_changeable_settings_applies_forbidden_prefixes(monkeypatch):
+    """Catches: the filter checking only the allow list."""
+    monkeypatch.setattr(policy, "CONFIG_ALLOW_PREFIXES", ("",))
+    assert changeable_settings({"terminal.backend": "x", "display.y": 1}) == {"display.y": 1}
+
+
+def test_changeable_settings_of_junk_is_empty():
+    assert changeable_settings(None) == {} and changeable_settings(["a"]) == {}
 
 
 def test_composed_tool_calls_must_be_callable(tmp_path):

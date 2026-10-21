@@ -19,7 +19,7 @@ from .detect import SCHEMA_TOOL, SKILL_TOOL, Candidate, detect
 from .draft import draft
 from .fingerprint import CopyIndex
 from .ledger import FixRecord, _Failed, apply, needs_restart, write_shadow_tool
-from .limits import LimitContext, check_fix
+from .limits import LimitContext, changeable_settings, check_fix
 from .measure import priced_cost
 from .model import Fix, Session
 from .proposals import approved_callables, write_proposal
@@ -89,9 +89,11 @@ class DraftSteps:
         spend28 = tuner_spend(self.ledger, self.sessions, self.shadow_ids, now - 28 * DAY,
                               pricing)
         saved28 = savings(self.ledger, self.sessions, now - 28 * DAY, now, pricing)
-        if spend28 > saved28:
+        allowance = policy.PAUSE_ALLOWANCE_USD
+        if spend28 > saved28 and spend28 > allowance:
             self.report.budget = (f"paused: 28-day spend ${spend28:.4f} > 28-day savings "
-                                  f"${saved28:.4f} (ESTIMATE)")
+                                  f"${saved28:.4f} and > ${allowance:.2f} starting allowance "
+                                  "(ESTIMATE)")
             return
         window = [s for s in self.sessions if s.started_at >= now - 28 * DAY]
         self.skill_names = self._skill_names(window)
@@ -150,6 +152,18 @@ class DraftSteps:
                      key=lambda s: (s.started_at, s.id), default=None)
         return [] if recent is None else [(c.name, c.arg_keys) for c in recent.calls]
 
+    def _settings(self) -> dict:
+        """The settings a config fix may change, read once per cycle. On a bridge
+        failure: {} (no config fix passes) and one error."""
+        if self._config_settings is None:
+            try:
+                raw = self.bridge.config_settings(list(policy.CONFIG_ALLOW_PREFIXES))
+            except BridgeError as exc:
+                self.err(f"config_settings: {exc}")
+                raw = {}
+            self._config_settings = changeable_settings(raw)
+        return self._config_settings
+
     def _bundled(self) -> frozenset[str] | None:
         return bundled_skills(self.cfg.skills_root)
 
@@ -187,7 +201,7 @@ class DraftSteps:
             skill_text = path.read_text(encoding="utf-8", errors="replace")
         try:
             fix, spend = draft(cand, job, skill_text, {}, self._call_shape(cand),
-                               self.bridge, self.now, self.pricing)
+                               self.bridge, self.now, self.pricing, settings=self._settings())
         except BridgeError as exc:
             # The call may have been billed before it failed (e.g. a timeout), and
             # all spend counts (spec 6): charge the drafting estimate.
@@ -278,7 +292,7 @@ class DraftSteps:
             copy_index=self.copy_index(), scan=self.bridge.scan,
             bundled_skills=bundled or frozenset(), skills_root=Path(self.cfg.skills_root),
             approved_callables=approved_callables(self.root, self.cfg.broker_state),
-            existing_tools=existing)
+            existing_tools=existing, config_settings=self._settings())
         return reasons + check_fix(fix, ctx)
 
     def _shadow(self, fix: Fix, job: dict | None, spend: float) -> bool:
