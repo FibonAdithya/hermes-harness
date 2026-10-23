@@ -3,8 +3,9 @@
 Before a fix to a mutating job goes live, `schedule_shadow` runs a one-shot
 copy of the job with the fix's new prompt shortly before the live run,
 delivering locally. The plugin blocks and records its mutations as intents.
-The cycle compares the shadow's decisions with the live run's, and after the
-fix is live judges the trial on cost.
+The cycle checks the shadow's composed-tool calls (`tool_check`), compares the
+shadow's decisions with the live run's, and after the fix is live judges the
+trial on cost.
 
 Nothing here reads the clock: `now` is always a parameter.
 
@@ -211,6 +212,51 @@ def read_intents(root: Path, session_ids: Iterable[str]) -> list[dict]:
             if isinstance(entry, dict):
                 out.append(entry)
     return out
+
+
+# --- composed-tool calls ----------------------------------------------------------
+
+def call_failed(text: object) -> bool:
+    """True unless `text` is a composed tool's success output, {"result": ...} with a
+    result that is not itself an {"error": ...} object. Text Hermes cut short counts
+    as success when it starts as a result."""
+    if not isinstance(text, str):
+        return True
+    try:
+        out = json.loads(text)
+    except ValueError:
+        return not text.lstrip().startswith('{"result"')
+    if not isinstance(out, dict) or "result" not in out or "error" in out:
+        return True
+    result = out["result"]
+    return isinstance(result, dict) and "error" in result
+
+
+def tool_check(results: list[tuple[str, object]], own: str | None,
+               live: frozenset[str]) -> str | None:
+    """Why the shadow fails on its composed-tool calls, or None.
+
+    `results` are the shadow's (tool name, result text) pairs; `own` is the fix's
+    composed tool (None for a fix without one); `live` the composed tools live now.
+    Fails when the shadow never called `own`, when any call to `own` failed, or when
+    a call to another composed tool that is not live succeeded: the shadow's decisions
+    would rest on a tool that does not go live with this fix.
+    """
+    if own is not None:
+        calls = [text for name, text in results if name == own]
+        if not calls:
+            return f"shadow never called {own}"
+        failed = sum(call_failed(text) for text in calls)
+        if failed:
+            return f"{own} failed {failed} of {len(calls)} calls"
+    foreign = sorted({name for name, text in results
+                      if isinstance(name, str) and name.startswith(policy.TOOL_PREFIX)
+                      and name != own and name not in live and not call_failed(text)})
+    if foreign:
+        verb = "is" if len(foreign) == 1 else "are"
+        return (f"shadow used {', '.join(foreign)}, which {verb} not live and not "
+                "this fix's tool")
+    return None
 
 
 # --- decisions ----------------------------------------------------------------------

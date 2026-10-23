@@ -312,7 +312,7 @@ class DraftSteps:
         files = self._shadow_tool(fix)
         try:
             if files is not None:  # the shadow run needs the tool; shadow-only until go-live
-                write_shadow_tool(self.root / "tools", fix.payload)
+                write_shadow_tool(self.root / "tools", fix.payload, fix.id)
             trial.schedule_shadow(fix, job, self.bridge, self.root, self.now)
         except (ValueError, OSError) as exc:
             self._remove_shadow_tool(rec)

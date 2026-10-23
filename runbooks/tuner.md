@@ -30,7 +30,7 @@ All under `~/.hermes/tuner/` (mode 700, files 600):
 | `versions/<id>/fix.json` | the full fix as drafted |
 | `versions/<id>/before.json` | live values before the fix was applied (the rollback source) |
 | `versions/<id>/after.json` | the values the fix wrote |
-| `tools/<name>/` | composed tools (`tool.json`, `program.py`), read by the plugin. A `tool.json` with `"shadow_only": true` is waiting for its shadow check: the plugin runs it only in shadow sessions until go-live rewrites it without the flag |
+| `tools/<name>/` | composed tools (`tool.json`, `program.py`), read by the plugin. A `tool.json` with `"shadow_only": true` is waiting for its shadow check: the plugin runs it only in the shadow session of the fix named in `"shadow_fix"` (refused everywhere, other fixes' shadows included, when that is missing) until go-live rewrites it without the flags. Hermes still lists it to sessions that see the `tuner` toolset; a call from any of them is refused |
 | `plugin_heartbeat.json` | written by the plugin when the gateway loads it (`pid`, `registered_at`). The tuner schedules shadows and applies composed tools only when `plugins.enabled` lists `hermes-tuner` and this is newer than the last restart it recorded; otherwise it logs `plugin not loaded; shadow not scheduled` |
 | `shadow_jobs.json` | shadow runs scheduled and not yet evaluated |
 | `shadow/<session>.jsonl` | what a shadow session tried to do (one intent per line) |
@@ -51,7 +51,7 @@ with `date -d @1754400000`). States:
 | State | Meaning |
 |---|---|
 | `shadow_pending` | drafted; waiting for its shadow run to be compared |
-| `shadow_failed` | the shadow run did not match or did not run; nothing was applied |
+| `shadow_failed` | the shadow run did not match or did not run; nothing was applied. For a composed tool it also fails when the shadow never called the fix's tool (`shadow never called <tool>`) or any call to it failed (`<tool> failed N of M calls`). Any shadow fails when another composed tool that is not live served it (`shadow used <tool>, which is not live and not this fix's tool`) |
 | `rejected` | the draft broke a rule; see `reason` |
 | `proposed` | `new_reach` change waiting for your `tool` or `drop` reply |
 | `approved` | you approved it; the next run applies it |

@@ -9,9 +9,13 @@
   blocks tools that would change anything and records them (spec 4.5).
   `ctx.dispatch_tool` skips that hook, so the composed-tool handler forces a
   dry run itself in shadow sessions.
-- A tool whose tool.json has `"shadow_only": true` (written when its shadow run
-  is scheduled, before its quality check) runs only in shadow sessions; anywhere
-  else the handler refuses it. Go-live rewrites tool.json without the flag.
+- A tool whose tool.json has `"shadow_only": true` and `"shadow_fix": "<fix id>"`
+  (written when its shadow run is scheduled, before its quality check) runs only
+  in that fix's shadow session; anywhere else, other fixes' shadows included, the
+  handler refuses it. Without `shadow_fix` it is refused everywhere. Go-live
+  rewrites tool.json without the flags. Hermes still lists the tool to every
+  session that has the `tuner` toolset (or no toolset list): a refusal costs that
+  session one wasted call.
 - `on_session_start` -> re-scan the tools dir (spec 4.7).
 - `register` writes `$HERMES_HOME/tuner/plugin_heartbeat.json` =
   {"pid", "registered_at"}; the cycle schedules shadows and applies composed
@@ -145,6 +149,27 @@ def _shadow_due_now() -> bool:
     return False
 
 
+def _shadow_fix_id(root: str) -> str | None:
+    """The fix whose shadow job ran the cron session `root`: its shadow_jobs.json
+    entry's fix_id, else the job's name after the shadow prefix. None if unknown."""
+    job_id = _shadow_job_id(root)
+    if job_id is None:
+        return None
+    ledger = _read_json(tuner_root() / "shadow_jobs.json")
+    entry = ledger.get(job_id) if isinstance(ledger, dict) else None
+    if isinstance(entry, dict) and isinstance(entry.get("fix_id"), str):
+        return entry["fix_id"]
+    jobs = _read_json(jobs_path())
+    if isinstance(jobs, dict):
+        jobs = jobs.get("jobs")
+    for job in jobs if isinstance(jobs, list) else []:
+        if (isinstance(job, dict) and job.get("id") == job_id
+                and isinstance(job.get("name"), str)
+                and job["name"].startswith(policy.SHADOW_PREFIX)):
+            return job["name"][len(policy.SHADOW_PREFIX):] or None
+    return None
+
+
 def _is_shadow_job(job_id: str) -> bool:
     ledger = _read_json(tuner_root() / "shadow_jobs.json")
     if isinstance(ledger, dict) and job_id in ledger:
@@ -237,16 +262,18 @@ def load_tool(tool_dir: Path) -> dict | None:
     desc, params = spec.get("description"), spec.get("parameters")
     calls, mutating = spec.get("calls"), spec.get("mutating")
     shadow_only = spec.get("shadow_only", False)
+    shadow_fix = spec.get("shadow_fix")
     if (not isinstance(desc, str) or not isinstance(params, dict)
             or not isinstance(calls, list) or not all(isinstance(c, str) for c in calls)
-            or not isinstance(mutating, bool) or not isinstance(shadow_only, bool)):
+            or not isinstance(mutating, bool) or not isinstance(shadow_only, bool)
+            or not (shadow_fix is None or isinstance(shadow_fix, str))):
         logger.warning("hermes-tuner: skipping %s: tool.json fields invalid", name)
         return None
     # A tool that may call a mutating tool is mutating whatever it declares.
     mutating = mutating or any(c in policy.MUTATING_TOOLS for c in calls)
     return {"name": name, "description": desc, "parameters": params,
             "calls": frozenset(calls), "mutating": mutating, "program": program,
-            "shadow_only": shadow_only}
+            "shadow_only": shadow_only, "shadow_fix": shadow_fix}
 
 
 def _schema(spec: dict) -> dict:
@@ -274,6 +301,11 @@ def _make_handler(ctx, tool_dir: Path):
             if spec["shadow_only"] and shadow is None:
                 return json.dumps({"error": f"{tool_dir.name} is in a shadow trial and "
                                             "runs only in shadow sessions"})
+            if spec["shadow_only"] and (spec["shadow_fix"] is None
+                                        or _shadow_fix_id(shadow) != spec["shadow_fix"]):
+                return json.dumps({"error": f"{tool_dir.name} is in another fix's shadow "
+                                            "trial and runs only in that fix's shadow "
+                                            "session"})
             dry_run = shadow is not None or (spec["mutating"] and wants_dry)
             callable_now = policy.CALLABLE_TOOLS | proposals.approved_callables(
                 tuner_root(), broker_state())

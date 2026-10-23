@@ -525,3 +525,71 @@ def test_new_version_trashing_a_message_old_left_alone_is_a_flip():
     assert compare_triage(old, {"m1": "KEEP", "m2": "KEEP", "m3": "KEEP"}).ok
     v = compare_triage({}, {"m9": "TRASH"})  # old decided nothing at all
     assert not v.ok and v.flips == ["m9"]
+
+
+# --- the shadow's composed-tool calls ----------------------------------------------
+
+OK = json.dumps({"result": {"messages": []}})
+ERR = json.dumps({"error": "output exceeds 50000 bytes"})
+
+
+@pytest.mark.parametrize("text, failed", [
+    (OK, False),
+    (json.dumps({"result": [1, 2]}), False),
+    ('{"result": [{"message_id": "m1", "content": "cut sh', False),  # Hermes truncated it
+    (ERR, True),
+    (json.dumps({"result": {"error": "mcp__x is not callable"}}), True),
+    ("", True),
+    (None, True),
+    ("Unknown tool: tuned_a", True),
+    (json.dumps(["result"]), True),
+])
+def test_call_failed(text, failed):
+    from hermes_tuner.trial import call_failed
+    assert call_failed(text) is failed
+
+
+def test_tool_check_fails_a_shadow_that_never_called_its_tool():
+    """A composed tool that is never called proves nothing, however well the shadow's
+    decisions agree with the live run's."""
+    from hermes_tuner.trial import tool_check
+    assert tool_check([(GET, "b"), (MOD, "ok")], "tuned_a", frozenset()) == \
+        "shadow never called tuned_a"
+
+
+def test_tool_check_fails_on_any_failed_call_to_its_tool():
+    from hermes_tuner.trial import tool_check
+    results = [("tuned_a", OK), ("tuned_a", ERR), (GET, "b"), ("tuned_a", OK)]
+    assert tool_check(results, "tuned_a", frozenset()) == "tuned_a failed 1 of 3 calls"
+
+
+def test_tool_check_passes_when_every_call_to_its_tool_succeeded():
+    from hermes_tuner.trial import tool_check
+    assert tool_check([("tuned_a", OK), (GET, "b"), ("tuned_a", OK)], "tuned_a",
+                      frozenset()) is None
+
+
+def test_tool_check_fails_when_the_shadow_used_another_fixs_shadow_tool():
+    """The 2026-10-23 07:40 shadow: one call to its own tool, seven to the calendar
+    fix's shadow-only tool. Its decisions rest on a tool that does not go live."""
+    from hermes_tuner.trial import tool_check
+    results = [("tuned_a", OK)] + [("tuned_b", OK)] * 7
+    assert tool_check(results, "tuned_a", frozenset()) == \
+        "shadow used tuned_b, which is not live and not this fix's tool"
+
+
+@pytest.mark.parametrize("own", ["tuned_a", None])  # None: a job_prompt fix's shadow
+def test_tool_check_ignores_refused_and_live_composed_tools(own):
+    from hermes_tuner.trial import tool_check
+    refused = json.dumps({"error": "tuned_b is in another fix's shadow trial"})
+    results = [("tuned_b", refused), ("tuned_live", OK)]
+    if own is not None:
+        results.append((own, OK))
+    assert tool_check(results, own, frozenset({"tuned_live"})) is None
+
+
+def test_tool_check_names_every_foreign_tool_once_sorted():
+    from hermes_tuner.trial import tool_check
+    results = [("tuned_c", OK), ("tuned_b", OK), ("tuned_c", OK)]
+    assert tool_check(results, None, frozenset()) == \
+        "shadow used tuned_b, tuned_c, which are not live and not this fix's tool"
