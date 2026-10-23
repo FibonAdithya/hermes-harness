@@ -365,7 +365,10 @@ class _Cycle(DraftSteps):
         called and never failed, and no composed tool that is neither live nor the fix's
         own served the shadow."""
         own = None
-        fix = self.ledger.fix(rec.id)
+        try:
+            fix = self.ledger.fix(rec.id)
+        except (OSError, ValueError, TypeError) as exc:
+            return f"fix unreadable: {type(exc).__name__}"
         if fix.kind == "composed_tool":
             files = self._shadow_tool(fix)
             if files is None:

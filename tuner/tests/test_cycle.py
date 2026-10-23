@@ -1386,3 +1386,17 @@ def test_failed_drafting_call_is_charged_and_counts_toward_the_pause(env):
     bridge2 = FakeBridge(jobs=jobs(), fail={"oneshot"})
     run_cycle(env, bridge2, NOW + DAY)
     assert oneshots(bridge2) == []  # the charged spend counts against the budget
+
+
+@pytest.mark.parametrize("composed", [False, True])
+def test_shadow_with_an_unreadable_fix_fails_without_stopping_the_step(env, composed):
+    """The tool check loads fix.json. An unreadable one fails that shadow; it must not
+    raise out of evaluate_shadows and leave every later shadow unevaluated."""
+    fix = shadow_setup(env, old_mod=[], new_mod=[], composed=composed,
+                       tool_results=(TOOL_OK,))
+    restarted_before_shadow(env)
+    (env.root / "versions" / fix.id / "fix.json").write_text("{not json")
+    report = run_cycle(env, FakeBridge(jobs=jobs()), NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert rec.state == "shadow_failed" and rec.reason.startswith("fix unreadable")
+    assert not [e for e in report.errors if "evaluate_shadows" in e]
