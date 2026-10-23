@@ -324,6 +324,10 @@ class _Cycle(DraftSteps):
             if not shadow.calls:
                 self._shadow_failed(rec, "shadow run made no tool calls")
                 continue
+            reason = self._tool_check(rec, shadow)
+            if reason is not None:
+                self._shadow_failed(rec, reason)
+                continue
             old = next((s for s in by_start if s.job_id == live and s.calls
                         and s.started_at > shadow.started_at), None)
             if old is None:
@@ -355,6 +359,33 @@ class _Cycle(DraftSteps):
         if scheduled_at is None:
             return False
         return any(scheduled_at <= r <= shadow_start for r in self._restart_times())
+
+    def _tool_check(self, rec: FixRecord, shadow: Session) -> str | None:
+        """trial.tool_check on the shadow's calls: a composed_tool fix's own tool was
+        called and never failed, and no composed tool that is neither live nor the fix's
+        own served the shadow."""
+        own = None
+        fix = self.ledger.fix(rec.id)
+        if fix.kind == "composed_tool":
+            files = self._shadow_tool(fix)
+            if files is None:
+                return "fix has no valid composed tool"
+            own = files[0]["name"]
+        return trial.tool_check(self.history.call_results(shadow.id), own, self._live_tools())
+
+    def _live_tools(self) -> frozenset[str]:
+        """Names of the composed tools of applied, trial and kept fixes."""
+        names = set()
+        for r in self.ledger.records:
+            if r.kind != "composed_tool" or r.state not in APPLIED_STATES:
+                continue
+            try:
+                files = self._shadow_tool(self.ledger.fix(r.id))
+            except (OSError, ValueError, TypeError):
+                continue
+            if files is not None:
+                names.add(files[0]["name"])
+        return frozenset(names)
 
     def _compare(self, live: object, shadow: Session, old: Session):
         rule = policy.EDITABLE_JOBS.get(live) if isinstance(live, str) else None
@@ -398,7 +429,7 @@ class _Cycle(DraftSteps):
         if files is None:
             return
         tools = self.root / "tools"
-        if is_shadow_tool(tools, fix.payload):
+        if is_shadow_tool(tools, fix.payload, fix.id):
             shutil.rmtree(tools / files[0]["name"], ignore_errors=True)
 
     def _owner_changed_job(self, fix: Fix) -> bool | None:

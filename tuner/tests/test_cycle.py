@@ -520,17 +520,27 @@ TOOL = {"name": "tuned_triage", "description": "search and read in one step",
 SETUP_SESSIONS: dict = {}  # env.root -> the sessions shadow_setup built
 
 
+TOOL_OK = json.dumps({"result": {"messages": ["m1", "m2"]}})
+TOOL_ERR = json.dumps({"error": "output exceeds 50000 bytes"})
+
+
 def shadow_setup(env, old_mod, new_mod, composed=False, live=True, base_runs=None,
-                 shadow_ids=("m1", "m2")):
+                 shadow_ids=("m1", "m2"), tool_results=(TOOL_OK,), extra_calls=(),
+                 legacy_tool=False):
     """A shadow-pending triage fix whose shadow ran at 06:40 yesterday and (if `live`)
     a live run at 07:00. `composed`: a composed_tool fix needing a restart, with the
-    tool dir written as at shadow scheduling."""
+    tool dir written as at shadow scheduling, whose shadow called tuned_triage once per
+    `tool_results` entry (each the text the call returned). `extra_calls` go on the
+    end of the shadow's calls. `legacy_tool`: the tool dir as written before tool.json
+    named its fix."""
     shadow_t = SHADOW_T
     live_t = shadow_t + 20 * 60
     sessions = triage_runs(range(2, 30)) if base_runs is None else list(base_runs)
+    own = [("tuned_triage", {}, r) for r in tool_results] if composed else []
     sessions.append({"id": sid(SHADOW_JOB, shadow_t), "source": "cron", "started_at": shadow_t,
                      "cost": 0.08, "in": 80_000, "out": 800,
-                     "calls": [(GET, {"message_id": m}, "b") for m in shadow_ids]})
+                     "calls": own + [(GET, {"message_id": m}, "b") for m in shadow_ids]
+                     + list(extra_calls)})
     if live:
         sessions.append({"id": sid(TRIAGE, live_t), "source": "cron", "started_at": live_t,
                          "cost": 0.10, "in": 100_000, "out": 1000,
@@ -541,7 +551,11 @@ def shadow_setup(env, old_mod, new_mod, composed=False, live=True, base_runs=Non
     base = {"_base": {"prompt": "Triage the inbox.", "enabled_toolsets": ["google"]}}
     if composed:
         fix = Fix("20261018-bbbb0002", "composed_tool", TRIAGE, dict(TOOL) | base, "seq:x")
-        write_shadow_tool(env.root / "tools", fix.payload)
+        write_shadow_tool(env.root / "tools", fix.payload, fix.id)
+        if legacy_tool:
+            spec, _program = _tool_files(fix.payload)
+            (env.root / "tools" / "tuned_triage" / "tool.json").write_text(
+                json.dumps(dict(spec, shadow_only=True)))
     else:
         fix = Fix("20261018-bbbb0001", "job_prompt", TRIAGE,
                   {"prompt": "new prompt", "add_toolsets": []} | base, "seq:x")
@@ -866,7 +880,8 @@ def test_later_unrelated_restart_does_not_fail_waiting_shadow(env):
     sessions = triage_runs(range(2, 30))  # now the live run has happened
     sessions.append({"id": sid(SHADOW_JOB, SHADOW_T), "source": "cron", "started_at": SHADOW_T,
                      "cost": 0.08, "in": 80_000, "out": 800,
-                     "calls": [(GET, {"message_id": "m1"}, "b"), (GET, {"message_id": "m2"}, "b")]})
+                     "calls": [("tuned_triage", {}, TOOL_OK), (GET, {"message_id": "m1"}, "b"),
+                               (GET, {"message_id": "m2"}, "b")]})
     sessions.append({"id": sid(TRIAGE, SHADOW_T + 1200), "source": "cron",
                      "started_at": SHADOW_T + 1200, "cost": 0.10, "in": 100_000, "out": 1000,
                      "calls": [(GET, {"message_id": "m1"}, "b"), (GET, {"message_id": "m2"}, "b")]})
@@ -900,7 +915,8 @@ def test_composed_shadow_restarted_in_its_scheduling_cycle_reaches_trial(env):
     calls = [(GET, {"message_id": "m1"}, "b"), (GET, {"message_id": "m2"}, "b")]
     sessions = triage_runs()
     sessions.append({"id": sid(shadow_id, run_at), "source": "cron", "started_at": run_at,
-                     "cost": 0.08, "in": 80_000, "out": 800, "calls": calls})
+                     "cost": 0.08, "in": 80_000, "out": 800,
+                     "calls": [("tuned_triage", {}, TOOL_OK)] + calls})
     sessions.append({"id": sid(TRIAGE, run_at + 1200), "source": "cron",
                      "started_at": run_at + 1200, "cost": 0.10, "in": 100_000, "out": 1000,
                      "calls": calls})
@@ -950,6 +966,91 @@ def test_shadow_scheduled_when_heartbeat_follows_the_last_restart(env):
     bridge = FakeBridge(jobs=jobs(), oneshot_script=[reply(JOB_PROMPT_REPLY)])
     report = run_cycle(env, bridge, NOW)
     assert len(report.shadowed) == 1 and report.errors == []
+
+
+# --- the shadow's composed-tool calls ---------------------------------------------------
+
+def restarted_before_shadow(env):
+    (env.root / "cycle_state.json").write_text(json.dumps({"restart_times": [SHADOW_T - 3600]}))
+
+
+@pytest.mark.parametrize("legacy_tool", [False, True])
+def test_composed_shadow_that_never_called_its_tool_fails(env, legacy_tool):
+    """Issue 1: the shadow's decisions match the live run's, but it never called the
+    fix's tool, so nothing shows the tool works. It must not go live."""
+    fix = shadow_setup(env, old_mod=[], new_mod=[], composed=True, tool_results=(),
+                       legacy_tool=legacy_tool)
+    restarted_before_shadow(env)
+    bridge = FakeBridge(jobs=jobs())
+    report = run_cycle(env, bridge, NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert rec.state == "shadow_failed" and rec.reason == "shadow never called tuned_triage"
+    assert fix.id in report.rejected
+    assert not (env.root / "tools" / "tuned_triage").exists()
+    assert bridge.jobs[TRIAGE]["prompt"] == "Triage the inbox."
+
+
+def test_composed_shadow_with_a_failed_tool_call_fails(env):
+    fix = shadow_setup(env, old_mod=[], new_mod=[], composed=True,
+                       tool_results=(TOOL_OK, TOOL_ERR, TOOL_OK))
+    restarted_before_shadow(env)
+    bridge = FakeBridge(jobs=jobs())
+    run_cycle(env, bridge, NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert rec.state == "shadow_failed" and rec.reason == "tuned_triage failed 1 of 3 calls"
+    assert bridge.jobs[TRIAGE]["prompt"] == "Triage the inbox."
+
+
+def test_composed_shadow_that_called_its_tool_successfully_goes_live(env):
+    """Control for the two tests above."""
+    fix = shadow_setup(env, old_mod=[], new_mod=[], composed=True,
+                       tool_results=(TOOL_OK, TOOL_OK))
+    restarted_before_shadow(env)
+    run_cycle(env, FakeBridge(jobs=jobs()), NOW)
+    assert Ledger.load(env.root).get(fix.id).state == "trial"
+
+
+OTHER = Fix("20261018-cccc0003", "composed_tool", CAL,
+            dict(TOOL, name="tuned_other", job_prompt="Sync with tuned_other."), "seq:y")
+
+
+@pytest.mark.parametrize("composed", [False, True])
+@pytest.mark.parametrize("other_state, ok", [("shadow_pending", False), ("shadow_failed", False),
+                                             ("trial", True), ("kept", True)])
+def test_shadow_that_used_another_fixs_tool_fails_unless_that_tool_is_live(
+        env, composed, other_state, ok):
+    """Issue 2: the 2026-10-23 briefing shadow called the calendar fix's shadow-only
+    tool 7 times. Decisions resting on a tool that is not live (and not this fix's own)
+    say nothing about this fix. A tool that is live is part of the job either way."""
+    fix = shadow_setup(env, old_mod=[], new_mod=[], composed=composed,
+                       extra_calls=[("tuned_other", {}, TOOL_OK)] * 7)
+    if composed:
+        restarted_before_shadow(env)
+    led = add_record(env, FixRecord(OTHER.id, OTHER.kind, CAL, "seq:y", other_state,
+                                    NOW - DAY, applied_at=NOW - DAY, live_from=NOW - DAY,
+                                    baseline_runs=[]), OTHER)
+    del led
+    bridge = FakeBridge(jobs=jobs())
+    run_cycle(env, bridge, NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    if ok:
+        assert rec.state == "trial", rec.reason
+        return
+    assert rec.state == "shadow_failed"
+    assert rec.reason == "shadow used tuned_other, which is not live and not this fix's tool"
+    assert bridge.jobs[TRIAGE]["prompt"] == "Triage the inbox."
+
+
+def test_shadow_with_a_refused_call_to_another_fixs_tool_is_judged_on_decisions(env):
+    """Under the plugin's refusal the other fix's tool returns an error: the shadow
+    wasted a call, but its decisions do not rest on that tool."""
+    refused = json.dumps({"error": "tuned_other is in another fix's shadow trial and runs "
+                                   "only in that fix's shadow session"})
+    fix = shadow_setup(env, old_mod=[], new_mod=[], extra_calls=[("tuned_other", {}, refused)])
+    add_record(env, FixRecord(OTHER.id, OTHER.kind, CAL, "seq:y", "shadow_pending", NOW - DAY),
+               OTHER)
+    run_cycle(env, FakeBridge(jobs=jobs()), NOW)
+    assert Ledger.load(env.root).get(fix.id).state == "trial"
 
 
 def test_composed_go_live_waits_for_the_plugin(env):

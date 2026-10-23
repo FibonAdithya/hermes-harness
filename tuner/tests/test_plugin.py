@@ -338,7 +338,8 @@ def test_shadow_only_tool_refused_outside_shadow_sessions(home, local_runner):
     ctx = FakeCtx()
     d = add_tool(home, "tuned_t", calls=(SEARCH, LABELS), mutating=True, program=MUTATE)
     spec = json.loads((d / "tool.json").read_text())
-    (d / "tool.json").write_text(json.dumps(dict(spec, shadow_only=True)))
+    # shadow_jobs_by_name: job abc123abc123 is named tuner-shadow-x, i.e. fix "x"
+    (d / "tool.json").write_text(json.dumps(dict(spec, shadow_only=True, shadow_fix="x")))
     local_runner.register(ctx)
     h = ctx.tools["tuned_t"]["handler"]
     out = json.loads(h({"q": "a"}, task_id="t", session_id=LIVE_SID))
@@ -348,6 +349,88 @@ def test_shadow_only_tool_refused_outside_shadow_sessions(home, local_runner):
     out = json.loads(h({"q": "a"}, task_id="t", session_id=SHADOW_SID))
     assert out == {"result": {"dry_run": True}}
     assert [n for n, _, _ in ctx.dispatched] == [SEARCH]
+
+
+OTHER_SHADOW_SID = "cron_def456def456_20261020_054000"
+
+
+def shadow_only_tool(home, ctx, plugin, shadow_fix):
+    d = add_tool(home, "tuned_t", calls=(SEARCH,))
+    spec = json.loads((d / "tool.json").read_text())
+    if shadow_fix is not None:
+        spec["shadow_fix"] = shadow_fix
+    (d / "tool.json").write_text(json.dumps(dict(spec, shadow_only=True)))
+    plugin.register(ctx)
+    return ctx.tools["tuned_t"]["handler"]
+
+
+def two_shadow_jobs(home):
+    """Two shadows are scheduled, for fixes F1 (job abc123abc123) and F2 (job def456def456)."""
+    (home / "tuner" / "shadow_jobs.json").write_text(json.dumps({
+        "abc123abc123": {"fix_id": "F1", "live_job_id": "3bc4e11d29b1", "run_at": time.time()},
+        "def456def456": {"fix_id": "F2", "live_job_id": "cc68e24f21cd", "run_at": time.time()},
+    }))
+    (home / "cron" / "jobs.json").write_text(json.dumps({"jobs": [
+        {"id": "abc123abc123", "name": "tuner-shadow-F1"},
+        {"id": "def456def456", "name": "tuner-shadow-F2"},
+        {"id": "3bc4e11d29b1", "name": "morning-briefing"},
+    ]}))
+
+
+def test_shadow_only_tool_runs_only_in_its_own_fixs_shadow(home, local_runner):
+    """2026-10-23: the morning briefing's shadow called the calendar fix's shadow-only
+    tool 7 times. A shadow-only tool runs only in the shadow of the fix that wrote it."""
+    two_shadow_jobs(home)
+    ctx = FakeCtx()
+    h = shadow_only_tool(home, ctx, local_runner, "F1")
+    assert json.loads(h({"q": "a"}, session_id=SHADOW_SID)) == {"result": 1}
+    out = json.loads(h({"q": "a"}, session_id=OTHER_SHADOW_SID))
+    assert out == {"error": "tuned_t is in another fix's shadow trial and runs only "
+                            "in that fix's shadow session"}
+    out = json.loads(h({"q": "a"}, session_id=LIVE_SID))
+    assert "error" in out and "shadow" in out["error"]
+
+
+def test_shadow_only_tool_owner_found_by_job_name_without_ledger_entry(home, local_runner):
+    """shadow_jobs.json lacks the entry (the plugin recognises the shadow by its job name,
+    tuner-shadow-<fix id>): the owner comes from the name too."""
+    shadow_jobs_by_name(home)  # abc123abc123 is tuner-shadow-x
+    ctx = FakeCtx()
+    h = shadow_only_tool(home, ctx, local_runner, "x")
+    assert json.loads(h({"q": "a"}, session_id=SHADOW_SID)) == {"result": 1}
+
+
+def test_shadow_only_tool_without_an_owner_is_refused_everywhere(home, local_runner):
+    """A tool.json written before it named its fix belongs to no shadow: refused."""
+    two_shadow_jobs(home)
+    ctx = FakeCtx()
+    h = shadow_only_tool(home, ctx, local_runner, None)
+    for session in (SHADOW_SID, OTHER_SHADOW_SID, LIVE_SID):
+        assert "error" in json.loads(h({"q": "a"}, session_id=session))
+    assert ctx.dispatched == []
+
+
+@pytest.mark.parametrize("shadow_fix", [None, "F1"])
+def test_shadow_only_tool_refused_when_the_shadows_fix_is_unknown(home, local_runner,
+                                                                  shadow_fix):
+    """The shadow's ledger entry has no fix_id and no job carries its name: no fix owns
+    this session, so no shadow-only tool runs in it, an owner-less one included."""
+    (home / "tuner" / "shadow_jobs.json").write_text(json.dumps({
+        "abc123abc123": {"live_job_id": "3bc4e11d29b1", "run_at": time.time()}}))
+    ctx = FakeCtx()
+    h = shadow_only_tool(home, ctx, local_runner, shadow_fix)
+    assert "another fix" in json.loads(h({"q": "a"}, session_id=SHADOW_SID))["error"]
+    assert ctx.dispatched == []
+
+
+def test_shadow_fix_must_be_a_string(home):
+    plugin = load_plugin()
+    d = add_tool(home, "tuned_t")
+    spec = json.loads((d / "tool.json").read_text())
+    (d / "tool.json").write_text(json.dumps(dict(spec, shadow_only=True, shadow_fix=7)))
+    ctx = FakeCtx()
+    plugin.register(ctx)
+    assert ctx.tools == {}
 
 
 def test_shadow_only_must_be_a_boolean(home):

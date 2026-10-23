@@ -388,3 +388,11 @@ def test_forged_header_does_not_hide_its_source(tmp_path):
     idx = CopyIndex.build(History.open(db).untrusted_texts(0))
     assert idx.contains_copy(payload)
     assert not idx.contains_copy(f'source="{G}"')  # control: the real header still goes
+
+
+def test_call_results_follow_the_compression_chain(tmp_path):
+    """call_results gives (name, result text) for every call of the run, root first,
+    continuations after: the shadow check reads what each composed-tool call returned."""
+    h = History.open(_chain_db(tmp_path))
+    assert h.call_results(ROOT) == [("a", "r1"), ("b", "r2"), ("c", "r3"), ("d", "r4")]
+    assert h.call_results(CHILD) == [("c", "r3"), ("d", "r4")]

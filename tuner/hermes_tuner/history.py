@@ -178,14 +178,16 @@ class History:
             frontier = nxt
         return chains
 
-    def _chain_calls(self, chains: dict[str, list[str]]) -> dict[str, list]:
-        """Group (ToolCall, args, text) by root id, root session first."""
+    def _chain_calls(self, chains: dict[str, list[str]],
+                     with_text: bool = False) -> dict[str, list]:
+        """Group (ToolCall, args, text) by root id, root session first. text is None
+        unless `with_text`."""
         owner = {sid: root for root, ids in chains.items() for sid in ids}
         order = {sid: n for ids in chains.values() for n, sid in enumerate(ids)}
         per_session: dict[str, list] = {sid: [] for sid in owner}
         ids = list(owner)
         for i in range(0, len(ids), _CHUNK):
-            for sid, call, args, text in self._calls(ids[i:i + _CHUNK]):
+            for sid, call, args, text in self._calls(ids[i:i + _CHUNK], with_text=with_text):
                 per_session[sid].append((call, args, text))
         out: dict[str, list] = {}
         for root, sids in chains.items():
@@ -263,6 +265,12 @@ class History:
         """Calls (name, args) of the run rooted at `session_id`, continuations included."""
         chains = self._chains([{"id": session_id}])
         return [(c.name, a) for c, a, _t in self._chain_calls(chains)[session_id]]
+
+    def call_results(self, session_id: str) -> list[tuple[str, str]]:
+        """(name, result text) of every call of the run rooted at `session_id`,
+        continuations included."""
+        chains = self._chains([{"id": session_id}])
+        return [(c.name, t) for c, _a, t in self._chain_calls(chains, with_text=True)[session_id]]
 
     def chain_ids(self, root_id: str) -> list[str]:
         """Session ids of the run rooted at `root_id`: the root, then its compression

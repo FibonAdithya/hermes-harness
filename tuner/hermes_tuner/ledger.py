@@ -297,28 +297,31 @@ def _write_tool_dir(tools: Path, name: str, spec: dict, program: str) -> None:
         raise
 
 
-def shadow_tool_spec(spec: dict) -> dict:
-    """tool.json as written at shadow scheduling: the plugin refuses the tool outside
-    shadow sessions until go-live rewrites it without the flag (F3)."""
-    return dict(spec, shadow_only=True)
+def shadow_tool_spec(spec: dict, fix_id: str) -> dict:
+    """tool.json as written at shadow scheduling: the plugin runs the tool only in the
+    shadow session of fix `fix_id` until go-live rewrites it without the flags (F3)."""
+    return dict(spec, shadow_only=True, shadow_fix=fix_id)
 
 
-def write_shadow_tool(tools: Path, payload: dict) -> str:
-    """Write a composed_tool payload's tool dir for its shadow run, flagged
+def write_shadow_tool(tools: Path, payload: dict, fix_id: str) -> str:
+    """Write a composed_tool payload's tool dir for fix `fix_id`'s shadow run, flagged
     shadow_only. Returns the tool name. Raises ValueError for a bad payload and
     _Failed if the tool already exists."""
     spec, program = _tool_files(payload)
-    _write_tool_dir(Path(tools), spec["name"], shadow_tool_spec(spec), program)
+    _write_tool_dir(Path(tools), spec["name"], shadow_tool_spec(spec, fix_id), program)
     return spec["name"]
 
 
-def is_shadow_tool(tools: Path, payload: dict) -> bool:
-    """True when `tools` holds exactly this payload's shadow-only tool dir."""
+def is_shadow_tool(tools: Path, payload: dict, fix_id: str) -> bool:
+    """True when `tools` holds exactly this payload's shadow-only tool dir for fix
+    `fix_id`, or the same dir as written before tool.json named its fix (shadow_only
+    alone)."""
     try:
         spec, program = _tool_files(payload)
     except ValueError:
         return False
-    return _tool_matches(Path(tools), {"spec": shadow_tool_spec(spec), "program": program})
+    return any(_tool_matches(Path(tools), {"spec": s, "program": program})
+               for s in (shadow_tool_spec(spec, fix_id), dict(spec, shadow_only=True)))
 
 
 def _tool_matches(tools: Path, after: dict) -> bool:
@@ -433,7 +436,7 @@ def apply(fix: Fix, ledger: Ledger, bridge: Bridge, root: Path, now: float,
                 after["job"] = job_after_for(fix, live)
             _write_json(vdir / "before.json", before)
             _write_json(after_path, after)
-            if is_shadow_tool(tools, p):  # written at shadow scheduling: drop the flag
+            if is_shadow_tool(tools, p, fix.id):  # written at shadow scheduling: drop the flags
                 atomic_write(tools / spec["name"] / "tool.json",
                              json.dumps(spec, indent=2).encode())
             else:

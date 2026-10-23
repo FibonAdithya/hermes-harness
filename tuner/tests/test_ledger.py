@@ -249,7 +249,7 @@ def test_go_live_rewrites_shadow_only_tool_without_the_flag(tmp_path):
     from hermes_tuner.ledger import _tool_files, write_shadow_tool
     root, skills, bridge, ledger = make(tmp_path)
     f = Fix("t1", "composed_tool", JOB, tool_payload(), "k")
-    write_shadow_tool(root / "tools", f.payload)
+    write_shadow_tool(root / "tools", f.payload, f.id)
     d = root / "tools" / "tuned_x"
     assert json.loads((d / "tool.json").read_text())["shadow_only"] is True
     rec = do_apply(f, ledger, bridge, root, skills)
@@ -262,7 +262,7 @@ def test_go_live_rewrites_shadow_only_tool_without_the_flag(tmp_path):
 def test_apply_refuses_a_foreign_tool_dir_of_the_same_name(tmp_path):
     from hermes_tuner.ledger import write_shadow_tool
     root, skills, bridge, ledger = make(tmp_path)
-    write_shadow_tool(root / "tools", tool_payload() | {"program": "print(2)\n"})
+    write_shadow_tool(root / "tools", tool_payload() | {"program": "print(2)\n"}, "t1")
     rec = do_apply(Fix("t1", "composed_tool", JOB, tool_payload(), "k"),
                    ledger, bridge, root, skills)
     assert rec.state == "bridge_error" and "already exists" in rec.reason
@@ -1080,3 +1080,43 @@ def test_composed_rollback_keeps_tool_when_owner_kept_editing_job(tmp_path):
     assert out.state == "owner_changed"
     assert (root / "tools" / "tuned_x" / "tool.json").exists()
     assert "tool dir" in out.reason
+
+
+def test_shadow_tool_records_the_fix_that_owns_it(tmp_path):
+    """The plugin runs a shadow-only tool only in its own fix's shadow session, so the
+    tool dir names that fix."""
+    from hermes_tuner.ledger import is_shadow_tool, write_shadow_tool
+    root, _skills, _bridge, _ledger = make(tmp_path)
+    write_shadow_tool(root / "tools", tool_payload(), "t1")
+    spec = json.loads((root / "tools" / "tuned_x" / "tool.json").read_text())
+    assert spec["shadow_only"] is True and spec["shadow_fix"] == "t1"
+    assert is_shadow_tool(root / "tools", tool_payload(), "t1")
+    assert not is_shadow_tool(root / "tools", tool_payload(), "t2")
+
+
+def test_apply_refuses_another_fixs_shadow_tool_of_the_same_name(tmp_path):
+    from hermes_tuner.ledger import write_shadow_tool
+    root, skills, bridge, ledger = make(tmp_path)
+    write_shadow_tool(root / "tools", tool_payload(), "other-fix")
+    rec = do_apply(Fix("t1", "composed_tool", JOB, tool_payload(), "k"),
+                   ledger, bridge, root, skills)
+    assert rec.state == "bridge_error" and "already exists" in rec.reason
+    assert json.loads((root / "tools" / "tuned_x" / "tool.json").read_text())[
+        "shadow_fix"] == "other-fix"
+
+
+def test_go_live_accepts_a_shadow_tool_written_before_shadow_fix(tmp_path):
+    """Tool dirs written before tool.json named the owning fix (shadow_only only) are
+    still ours: go-live rewrites them without the flag instead of failing."""
+    from hermes_tuner.ledger import _tool_files, is_shadow_tool
+    root, skills, bridge, ledger = make(tmp_path)
+    f = Fix("t1", "composed_tool", JOB, tool_payload(), "k")
+    spec, program = _tool_files(f.payload)
+    d = root / "tools" / "tuned_x"
+    d.mkdir(parents=True)
+    (d / "tool.json").write_text(json.dumps(dict(spec, shadow_only=True)))
+    (d / "program.py").write_text(program)
+    assert is_shadow_tool(root / "tools", f.payload, "t1")
+    rec = do_apply(f, ledger, bridge, root, skills)
+    assert rec.state == "trial"
+    assert json.loads((d / "tool.json").read_text()) == spec
