@@ -35,14 +35,15 @@ def mode(p):
 def test_add_happy_path_call_order(env, capsys):
     root, fake, caddy = env
     assert run_add(env) == 0
-    create = fake.index("hermes", "alice", "profile", "create", "alice", "--no-alias", "--no-skills")
+    create = fake.index("hermes", None, "profile", "create", "alice", "--no-alias", "--no-skills")
     first_write = fake.index("write_file")
     caddy_write = fake.index("write_file", caddy / "alice.caddy", CADDY_FILE_MODE)
     reload_ = fake.index("caddy_reload")
     assert caddy_write < reload_
     install = fake.index("hermes", "alice", "gateway", "install", "--start-now", "--start-on-login")
     assert create < first_write < reload_ < install
-    assert all(c[1] == "alice" for c in fake.calls if c[0] == "hermes")
+    assert all(c[1] == (None if c[2] == "profile" else "alice")
+               for c in fake.calls if c[0] == "hermes")
     out = capsys.readouterr().out
     assert "https://auth.fibonadithya.me/alice/oauth2callback" in out
     assert "/start" in out
@@ -63,7 +64,10 @@ def test_every_hermes_call_sets_home(env):
     (creds / "alice@example.com.json").write_text("{}")
     assert main(["activate", "alice"], system=fake, root=root, now=NOW) == 0
     hermes_calls = [c for c in fake.calls if c[0] == "hermes"]
-    assert hermes_calls and all(c[1] == "alice" for c in hermes_calls)
+    # profile create/delete run as the owner; everything else in the friend's HERMES_HOME
+    assert hermes_calls and all(c[1] == (None if c[2] == "profile" else "alice")
+                                for c in hermes_calls)
+    assert any(c[2] == "gateway" for c in hermes_calls)
 
 
 def test_add_refuses_existing_name_without_side_effects(env):
@@ -139,6 +143,8 @@ def test_add_rolls_back_on_gateway_failure(env):
     reloads = [i for i, c in enumerate(fake.calls) if c == ("caddy_reload",)]
     assert len(reloads) == 2
     assert fake.index("hermes", "alice", "gateway", "uninstall") < reloads[1]
+    # the rollback's profile delete runs as the owner, like the create
+    assert fake.index("hermes", None, "profile", "delete", "-y", "alice") > reloads[1]
 
 
 def test_rollback_continues_when_a_step_fails(env):

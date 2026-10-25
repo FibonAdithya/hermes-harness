@@ -34,7 +34,8 @@ class System:
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"{' '.join(cmd)} timed out after 300s") from None
         if r.returncode != 0:
-            tail = (r.stderr or "")[-500:]
+            # Hermes prints some errors to stdout, so fall back to it when stderr is empty.
+            tail = ((r.stderr or "").strip() or (r.stdout or "").strip())[-500:]
             raise RuntimeError(f"{' '.join(cmd)} failed ({r.returncode}): {tail}")
         return r.stdout
 
