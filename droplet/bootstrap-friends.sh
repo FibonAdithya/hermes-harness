@@ -12,57 +12,13 @@ fi
 
 changes=()
 
-# 1. Caddy from the official apt repo
-if command -v caddy >/dev/null 2>&1; then
-  echo "caddy already installed"
-else
-  apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl
-  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
-    | gpg --batch --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
-    > /etc/apt/sources.list.d/caddy-stable.list
-  apt-get update
-  apt-get install -y caddy
-  changes+=("installed caddy")
+# 1. 2 GB swapfile
+# Recreate a leftover file from an aborted run (inactive and not formatted as swap).
+if [ -e /swapfile ] && ! swapon --show=NAME --noheadings | grep -qx /swapfile \
+   && ! blkid -t TYPE=swap /swapfile >/dev/null 2>&1; then
+  echo "/swapfile exists but is not valid swap; recreating"
+  rm -f /swapfile
 fi
-
-# 2. Per-friend snippet directory, writable by hermes
-install -d -o hermes -g hermes -m 755 /etc/caddy/friends.d
-
-# 3. Caddyfile
-tmp=$(mktemp)
-trap 'rm -f "$tmp"' EXIT
-cat > "$tmp" <<'CADDY'
-auth.fibonadithya.me {
-	import /etc/caddy/friends.d/*.caddy
-	handle {
-		respond 404
-	}
-}
-CADDY
-caddyfile=/etc/caddy/Caddyfile
-if [ -f "$caddyfile" ] && cmp -s "$tmp" "$caddyfile"; then
-  echo "Caddyfile already up to date"
-else
-  # Back up unless it is the apt package's stock Caddyfile.
-  if [ -f "$caddyfile" ] \
-     && ! grep -q 'The Caddyfile is an easy way to configure your Caddy web server' "$caddyfile"; then
-    bak="$caddyfile.bak.$(date +%Y%m%d%H%M%S)"
-    cp -p "$caddyfile" "$bak"
-    echo "backed up existing Caddyfile to $bak"
-    changes+=("backed up Caddyfile to $bak")
-  fi
-  install -m 644 "$tmp" "$caddyfile"
-  changes+=("wrote $caddyfile")
-fi
-caddy validate --config "$caddyfile"
-if systemctl is-active --quiet caddy; then
-  systemctl reload caddy
-else
-  systemctl restart caddy
-fi
-
-# 4. 2 GB swapfile
 if [ -e /swapfile ]; then
   echo "/swapfile already exists"
 else
@@ -80,10 +36,59 @@ if ! grep -qE '^/swapfile[[:space:]]' /etc/fstab; then
   changes+=("added /swapfile to /etc/fstab")
 fi
 
-# 5. Firewall
+# 2. Firewall (ports open before Caddy's first ACME attempt)
 ufw allow 80/tcp
 ufw allow 443/tcp
 changes+=("ufw allow 80/tcp, 443/tcp")
+
+# 3. Caddy from the official apt repo
+if command -v caddy >/dev/null 2>&1; then
+  echo "caddy already installed"
+else
+  apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+    | gpg --batch --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+    > /etc/apt/sources.list.d/caddy-stable.list
+  apt-get update
+  apt-get install -y caddy
+  changes+=("installed caddy")
+fi
+
+# 4. Per-friend snippet directory, writable by hermes
+install -d -o hermes -g hermes -m 755 /etc/caddy/friends.d
+
+# 5. Caddyfile
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+cat > "$tmp" <<'CADDY'
+auth.fibonadithya.me {
+	import /etc/caddy/friends.d/*.caddy
+	handle {
+		respond 404
+	}
+}
+CADDY
+caddyfile=/etc/caddy/Caddyfile
+if [ -f "$caddyfile" ] && cmp -s "$tmp" "$caddyfile"; then
+  echo "Caddyfile already up to date"
+else
+  # Back up any existing Caddyfile that differs from the target.
+  if [ -f "$caddyfile" ]; then
+    bak="$caddyfile.bak.$(date +%Y%m%d%H%M%S)"
+    cp -p "$caddyfile" "$bak"
+    echo "backed up existing Caddyfile to $bak"
+    changes+=("backed up Caddyfile to $bak")
+  fi
+  install -m 644 "$tmp" "$caddyfile"
+  changes+=("wrote $caddyfile")
+fi
+caddy validate --config "$caddyfile"
+if systemctl is-active --quiet caddy; then
+  systemctl reload caddy
+else
+  systemctl restart caddy
+fi
 
 echo
 echo "Summary of changes:"
