@@ -146,7 +146,8 @@ def _apply_actions(system, f: Friend, chat_id: int, actions: list[str],
 
     if "new_month" in actions:
         carried = old_st.stopped_by_cap and "stop_cap" in actions
-        if old_st.stopped_by_cap and not old_st.stopped_by_runaway and not carried:
+        if ((old_st.stopped_by_cap or old_st.notified_cap)
+                and not old_st.stopped_by_runaway and not carried):
             system.systemctl("enable", unit)
             system.systemctl("start", unit)
             system.send(None, chat_id, f"friends: {f.name} new month; gateway re-enabled.")

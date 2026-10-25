@@ -100,7 +100,13 @@ class SpendState:
     def reset_for_month(self, month: str) -> "SpendState":
         """Fresh state for a new month; the runaway hold is kept."""
         return SpendState(month=month, stopped_by_runaway=self.stopped_by_runaway,
-                          notified_runaway=self.notified_runaway)
+                          notified_runaway=self.stopped_by_runaway and self.notified_runaway)
+
+    def clear_runaway(self) -> None:
+        self.stopped_by_runaway = self.notified_runaway = False
+
+    def clear_cap(self) -> None:
+        self.stopped_by_cap = self.notified_cap = False
 
     def start_month(self, month: str) -> None:
         """In-place reset for a new month; the runaway hold is kept."""

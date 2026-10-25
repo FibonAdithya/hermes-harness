@@ -399,3 +399,56 @@ def test_both_stops_one_pair_runaway_message(hermes_root):
                            "The owner has been told."]
     st = state(p)
     assert st["stopped_by_cap"] is True and st["stopped_by_runaway"] is True
+
+
+# ---- fix round 2 ----
+
+def runaway_msgs(fake):
+    return [c for c in sends(fake) if c[1] == "alice" and "paused myself" in c[3]]
+
+
+def test_stale_runaway_notice_not_carried_across_months(hermes_root):
+    p = mk_friend(hermes_root)
+    fake = FakeSystem(hermes_root)
+    prior(p, "2026-09", notified_runaway=True, stopped_by_runaway=False)
+    set_cost(p, 0.5)
+    run(hermes_root, fake, NOW)
+    assert state(p)["notified_runaway"] is False
+    set_cost(p, 2.0)
+    t = NOW + timedelta(hours=1)
+    run(hermes_root, fake, t)  # sample from NOW (0.5) -> 2.0 is a runaway
+    assert len(runaway_msgs(fake)) == 1
+
+
+def test_runaway_after_clear_runaway_notifies(hermes_root):
+    p = mk_friend(hermes_root)
+    fake = FakeSystem(hermes_root)
+    prior(p, MONTH, notified_runaway=True, stopped_by_runaway=True,
+          samples=[[NOW.timestamp() - 3600, 1.0]])
+    st = SpendState.load(p, NOW)
+    st.clear_runaway()  # what resume does
+    st.save(p, fake)
+    set_cost(p, 2.5)
+    run(hermes_root, fake, NOW)
+    assert len(runaway_msgs(fake)) == 1
+
+
+def test_clear_helpers():
+    st = SpendState(MONTH, stopped_by_cap=True, notified_cap=True,
+                    stopped_by_runaway=True, notified_runaway=True)
+    st.clear_runaway()
+    assert (st.stopped_by_runaway, st.notified_runaway, st.stopped_by_cap, st.notified_cap) == \
+        (False, False, True, True)
+    st.clear_cap()
+    assert (st.stopped_by_cap, st.notified_cap) == (False, False)
+
+
+def test_new_month_restarts_half_finished_cap_stop(hermes_root):
+    p = mk_friend(hermes_root)
+    fake = FakeSystem(hermes_root)
+    prior(p, "2026-09", notified_cap=True, stopped_by_cap=False)
+    set_cost(p, 0.5)
+    assert run(hermes_root, fake, NOW) == 0
+    unit = gateway_unit("alice")
+    assert ("systemctl", "enable", unit) in fake.calls
+    assert ("systemctl", "start", unit) in fake.calls
