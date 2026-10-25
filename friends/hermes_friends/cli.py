@@ -92,8 +92,10 @@ def cmd_add(a, system, root: Path, caddy_dir: Path) -> int:
     undo: list = []  # run in reverse on failure
     try:
         undo.append(lambda: pdir.exists() and system.remove_tree(pdir))
-        system.hermes(name, "profile", "create", name, "--no-alias", "--no-skills")
-        undo.append(lambda: system.hermes(name, "profile", "delete", "-y", name))
+        # Profile commands run as the owner: with HERMES_HOME set to the new profile, Hermes
+        # creates <profile>/logs on startup and `profile create` then finds it already exists.
+        system.hermes(None, "profile", "create", name, "--no-alias", "--no-skills")
+        undo.append(lambda: system.hermes(None, "profile", "delete", "-y", name))
         system.chmod(pdir, 0o700)
         _write_profile_files(system, pdir, f, token, owner)
         undo.append(_undo_caddy(system, caddy_file))
@@ -382,7 +384,7 @@ def cmd_remove(a, system, root: Path, caddy_dir: Path) -> int:
     step("removing containers", lambda: system.remove_containers(pdir))
     # the root-run sandbox leaves root-owned files that block the delete
     step(f"reclaim {pdir}", lambda: system.reclaim(pdir))
-    step("profile delete", lambda: system.hermes(name, "profile", "delete", "-y", name))
+    step("profile delete", lambda: system.hermes(None, "profile", "delete", "-y", name))
     if pdir.exists():
         step(f"removing {pdir}", lambda: system.remove_tree(pdir))
     caddy_file = Path(caddy_dir) / f"{name}.caddy"

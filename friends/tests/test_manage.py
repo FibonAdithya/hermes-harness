@@ -201,7 +201,7 @@ def test_remove_revokes_before_delete(hermes_root, tmp_path):
     p, caddy = setup_remove(hermes_root, tmp_path)
     fake = FakeSystem(hermes_root)
     assert run(hermes_root, fake, "remove", "alice", caddy=caddy) == 0
-    assert fake.index("revoke_google_token", "RT-1") < fake.index("hermes", "alice", "profile",
+    assert fake.index("revoke_google_token", "RT-1") < fake.index("hermes", None, "profile",
                                                                  "delete", "-y", "alice")
     assert fake.index("revoke_google_token") < fake.index("systemctl", "stop", UNIT)
 
@@ -214,7 +214,7 @@ def test_remove_order_and_commands(hermes_root, tmp_path):
     i = fake.index
     assert (i("systemctl", "stop", UNIT) < i("systemctl", "disable", UNIT)
             < i("hermes", "alice", "gateway", "uninstall")
-            < i("hermes", "alice", "profile", "delete", "-y", "alice")
+            < i("hermes", None, "profile", "delete", "-y", "alice")
             < i("remove_tree", caddy / "alice.caddy") < i("caddy_reload"))
 
 
@@ -259,7 +259,7 @@ def test_remove_leaves_nothing(hermes_root, tmp_path, capsys):
 def test_remove_profile_delete_failure_falls_back(hermes_root, tmp_path):
     p, caddy = setup_remove(hermes_root, tmp_path)
     fake = FakeSystem(hermes_root)
-    fake.fail_on = [("hermes", "alice", "profile", "delete")]
+    fake.fail_on = [("hermes", None, "profile", "delete")]
     assert run(hermes_root, fake, "remove", "alice", caddy=caddy) == 1
     assert not p.exists()
     assert ("remove_tree", p) in fake.calls
@@ -346,9 +346,9 @@ def test_remove_reclaims_after_uninstall_before_delete(hermes_root, tmp_path):
     assert run(hermes_root, fake, "remove", "alice", caddy=caddy) == 0
     i = fake.index
     assert (i("hermes", "alice", "gateway", "uninstall") < i("systemctl", "reset-failed", UNIT)
-            < i("hermes", "alice", "profile", "delete", "-y", "alice"))
+            < i("hermes", None, "profile", "delete", "-y", "alice"))
     assert (i("hermes", "alice", "gateway", "uninstall") < i("reclaim", p)
-            < i("hermes", "alice", "profile", "delete", "-y", "alice"))
+            < i("hermes", None, "profile", "delete", "-y", "alice"))
 
 
 def test_remove_continues_when_reclaim_or_reset_failed_fail(hermes_root, tmp_path, capsys):

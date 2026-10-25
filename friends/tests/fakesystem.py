@@ -22,8 +22,14 @@ class FakeSystem:
 
     def hermes(self, name, *args):
         self._rec("hermes", name, *args)
-        if name is not None and args[:2] == ("profile", "create"):
-            d = self.root / "profiles" / name
+        if name is not None:
+            # Real Hermes creates HERMES_HOME/logs on startup, before running the subcommand
+            # (MEASURED on the droplet, Hermes v0.19.0).
+            (self.root / "profiles" / name / "logs").mkdir(parents=True, exist_ok=True)
+        if args[:2] == ("profile", "create"):
+            d = self.root / "profiles" / args[2]
+            if d.exists():
+                raise RuntimeError(f"Error: Profile '{args[2]}' already exists at {d}")
             d.mkdir(parents=True)
             os.chmod(d, 0o775)
             (d / ".env").write_text("SEEDED=1\n")
