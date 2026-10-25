@@ -13,5 +13,7 @@ stamp="$HOME/.local/share/harness-deployed.sha"
 git checkout -q master && git reset -q --hard origin/master
 (cd broker && /usr/local/bin/uv sync --no-dev -q)
 systemctl --user restart hermes-approvals
+# After the restart so a broken friends sync never holds back the broker deploy; it still blocks the stamp, so it is retried next tick.
+(cd friends && /usr/local/bin/uv sync --no-dev -q)
 mkdir -p "$(dirname "$stamp")" && printf %s "$want" > "$stamp"
 echo "deployed $(git rev-parse --short HEAD)"
