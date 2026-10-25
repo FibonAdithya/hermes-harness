@@ -48,3 +48,29 @@ def read_owner_env(root: Path) -> OwnerEnv:
     if not cid or not sec:
         raise ValueError("GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET missing in owner .env")
     return OwnerEnv(int(raw), cid, sec)
+
+
+def owner_google_emails(root: Path, home: Path) -> set[str]:
+    """Lowercased Google accounts the owner uses; a friend must never share one.
+
+    Sources: mcp_servers.google.env.USER_GOOGLE_EMAIL in <root>/config.yaml and
+    every <email>.json under <home>/.google_workspace_mcp/credentials/.
+    """
+    import yaml
+
+    out: set[str] = set()
+    cfg = Path(root) / "config.yaml"
+    if cfg.is_file():
+        try:
+            data = yaml.safe_load(cfg.read_text()) or {}
+            email = data["mcp_servers"]["google"]["env"]["USER_GOOGLE_EMAIL"]
+        except (yaml.YAMLError, KeyError, TypeError):
+            email = None
+        if isinstance(email, str) and email.strip():
+            out.add(email.strip().lower())
+    creds = Path(home) / ".google_workspace_mcp" / "credentials"
+    if creds.is_dir():
+        for p in creds.glob("*.json"):
+            if "@" in p.stem and p.name != "oauth_states.json":
+                out.add(p.stem.lower())
+    return out
