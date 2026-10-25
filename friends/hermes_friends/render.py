@@ -77,6 +77,8 @@ def render_env(f: Friend, bot_token: str, owner: OwnerEnv) -> str:
         f"TELEGRAM_BOT_TOKEN={bot_token}\n"
         f"TELEGRAM_ALLOWED_USERS={f.telegram_id}\n"
         "TERMINAL_ENV=docker\n"
+        "TERMINAL_DOCKER_IMAGE=hermes-sandbox:latest\n"
+        "TERMINAL_DOCKER_NETWORK=false\n"
         f"GOOGLE_OAUTH_CLIENT_ID={owner.google_client_id}\n"
         f"GOOGLE_OAUTH_CLIENT_SECRET={owner.google_client_secret}\n"
     )
@@ -93,13 +95,16 @@ def render_soul(f: Friend) -> str:
     return _template("SOUL.md").read_text(encoding="utf-8")
 
 
+def signin_line(f: Friend) -> str:
+    return ("On the user's first message, call start_google_auth for "
+            f"{f.email} and send them the link.")
+
+
 def render_memory(f: Friend) -> str:
     lines = [f"The user's first name is {f.name.capitalize()}.",
              f"Their timezone is {f.tz}."]
     if not f.activated:
-        lines.append(
-            "On the user's first message, call start_google_auth for "
-            f"{f.email} and send them the link.")
+        lines.append(signin_line(f))
     return "\n".join(lines) + "\n"
 
 

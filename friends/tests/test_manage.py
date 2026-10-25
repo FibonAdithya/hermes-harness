@@ -158,8 +158,9 @@ def test_resume_then_runaway_notifies_friend(hermes_root):
           samples=[[NOW.timestamp() - 3600, 0.5]])
     fake = FakeSystem(hermes_root)
     run(hermes_root, fake, "resume", "alice")
+    assert run(hermes_root, fake, "spend-check") == 0  # records the post-resume baseline
     set_cost(p, 2.5)
-    assert run(hermes_root, fake, "spend-check") == 0
+    assert run(hermes_root, fake, "spend-check", now=NOW + timedelta(hours=1)) == 0
     assert any(c[1] == "alice" and "paused myself" in c[3] for c in sends(fake))
 
 

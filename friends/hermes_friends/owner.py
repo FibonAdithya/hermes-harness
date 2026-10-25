@@ -50,6 +50,16 @@ def read_owner_env(root: Path) -> OwnerEnv:
     return OwnerEnv(int(raw), cid, sec)
 
 
+def normalize_email(s: str) -> str:
+    """Canonical form for the owner-account comparison only (Gmail ignores dots and +tags)."""
+    s = s.strip().lower()
+    local, _, domain = s.rpartition("@")
+    if domain in ("gmail.com", "googlemail.com"):
+        local = local.split("+", 1)[0].replace(".", "")
+        domain = "gmail.com"
+    return f"{local}@{domain}"
+
+
 def owner_google_emails(root: Path, home: Path) -> set[str]:
     """Lowercased Google accounts the owner uses; a friend must never share one.
 

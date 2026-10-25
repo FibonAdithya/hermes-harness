@@ -10,6 +10,13 @@ OWNER_ROOT = Path("/home/hermes/.hermes")
 FALLBACK_HERMES = "/home/hermes/.local/bin/hermes"
 
 
+def containers_under(mounts: dict[str, list[str]], profile: Path) -> list[str]:
+    """Container ids with a mount source equal to or under profile."""
+    profile = Path(profile)
+    return [cid for cid, srcs in mounts.items()
+            if any(Path(s).is_relative_to(profile) for s in srcs)]
+
+
 class System:
     def __init__(self, root: Path = OWNER_ROOT):
         self.root = Path(root)
@@ -21,7 +28,11 @@ class System:
         return self.root if name is None else self.root / "profiles" / name
 
     def _run(self, cmd: list[str], env: dict | None = None) -> str:
-        r = subprocess.run(cmd, env=env, check=False, capture_output=True, text=True)
+        try:
+            r = subprocess.run(cmd, env=env, check=False, capture_output=True, text=True,
+                               timeout=300)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"{' '.join(cmd)} timed out after 300s") from None
         if r.returncode != 0:
             tail = (r.stderr or "")[-500:]
             raise RuntimeError(f"{' '.join(cmd)} failed ({r.returncode}): {tail}")
@@ -39,6 +50,19 @@ class System:
         self._run(["docker", "run", "--rm", "--network=none", "--user", "0",
                    "-v", f"{Path(path)}:/p", "hermes-sandbox:latest",
                    "chown", "-R", f"{os.getuid()}:{os.getgid()}", "/p"])
+
+    def remove_containers(self, profile: Path) -> int:
+        """Force-remove every container that mounts something under profile."""
+        ids = self._run(["docker", "ps", "-aq"]).split()
+        mounts = {}
+        for cid in ids:
+            out = self._run(["docker", "inspect", "-f",
+                             '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}', cid])
+            mounts[cid] = [ln for ln in out.splitlines() if ln]
+        doomed = containers_under(mounts, Path(profile))
+        for cid in doomed:
+            self._run(["docker", "rm", "-f", cid])
+        return len(doomed)
 
     def unit_active(self, unit: str) -> bool:
         try:

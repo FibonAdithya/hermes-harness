@@ -127,6 +127,8 @@ def test_env_allowlist():
     lines = env.splitlines()
     assert "TELEGRAM_ALLOWED_USERS=4242" in lines
     assert "TERMINAL_ENV=docker" in lines
+    assert "TERMINAL_DOCKER_IMAGE=hermes-sandbox:latest" in lines
+    assert "TERMINAL_DOCKER_NETWORK=false" in lines
     assert "TELEGRAM_BOT_TOKEN=123:tok" in lines
     assert "GOOGLE_OAUTH_CLIENT_ID=cid-literal" in lines
     assert "GOOGLE_OAUTH_CLIENT_SECRET=SECRET-literal" in lines

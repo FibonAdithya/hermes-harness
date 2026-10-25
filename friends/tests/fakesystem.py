@@ -39,6 +39,10 @@ class FakeSystem:
     def reclaim(self, path):
         self._rec("reclaim", Path(path))
 
+    def remove_containers(self, profile):
+        self._rec("remove_containers", Path(profile))
+        return 0
+
     def unit_active(self, unit):
         return unit in self.active
 

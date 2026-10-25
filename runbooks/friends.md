@@ -112,6 +112,9 @@ The `friends` command creates, caps and removes them. A timer
    `error: alice has not signed in to Google yet (...)` and exits 1. On success it
    rewrites the profile config without the sign-in tool, restarts the gateway, and
    prints `Activated alice.`
+   If a cap or runaway hold is set it writes the config but does not restart, and
+   prints `alice activated; gateway stays stopped (cap/runaway hold) — use `friends cap`
+   or `friends resume`.`
 
 Google Workspace caveat: if the friend's address is a Google Workspace account, the
 Workspace admin may block unverified apps or restrict the Gmail and Calendar scopes.
@@ -138,7 +141,7 @@ This can be copied to them.
 |---|---|
 | `friends list` | One line per friend: `alice  active  signed-in yes  $1.20 of $5.00 ESTIMATE`. `active` is the gateway unit's state; `signed-in` is whether the Google credentials file exists. Prints `no friends` when there are none. A friend whose files cannot be read shows `error: ...` and the exit code is 1. |
 | `friends cap alice 8` | Sets the monthly cap in USD (0 or more; negative or non-finite exits 2). If the gateway was stopped for the cap and the new cap is above this month's spend, it clears the cap stop and starts the gateway. If a runaway hold is also set it stays paused and prints `alice stays paused: runaway hold; use resume.` Setting 0 makes the next check stop the gateway. |
-| `friends resume alice` | Clears both the cap stop and the runaway hold, then enables and starts the gateway. Prints `Resumed alice.` Exits 2 with an error if the friend was never activated. If the friend is still over the cap, the next check stops them again and sends the cap messages again. |
+| `friends resume alice` | Clears both the cap stop and the runaway hold and the runaway baseline (the saved spend samples, so old samples cannot trigger an immediate runaway stop), then enables and starts the gateway. Prints `Resumed alice.` Exits 2 with an error if the friend was never activated. If the friend is still over the cap, the next check stops them again and sends the cap messages again. |
 | `friends remove alice` | See below. |
 | `friends activate alice` | See "Adding a person". |
 
@@ -156,7 +159,8 @@ It runs these steps in order and carries on past any step that fails, printing
 `warning: <step> failed: <reason>` to stderr: revoke the friend's Google refresh
 token (done first, because deleting the profile destroys it); stop and disable
 `hermes-gateway-alice`; `hermes gateway uninstall`; `systemctl --user reset-failed`
-on the unit; reclaim root-owned files in the profile; `hermes profile delete -y`;
+on the unit; force-remove any Docker container that mounts something under the profile
+(the sandbox container outlives `profile delete` and keeps its network); reclaim root-owned files in the profile; `hermes profile delete -y`;
 remove the profile directory if anything is left; remove
 `/etc/caddy/friends.d/alice.caddy`; reload Caddy.
 
@@ -190,8 +194,8 @@ the estimate error.
 
 | Event | When | What happens |
 |---|---|---|
-| Warning | total reaches 80% of the cap, once a month (not sent if the same check also reaches the cap) | Friend: `You've used 80% of this month's assistant allowance ($4.02 of $5.00, estimate). It resets on the 1st.` Owner: `friends: alice passed 80% — $4.02 of $5.00 this month (ESTIMATE).` |
-| Cap stop | total reaches the cap | Friend: `You've reached this month's assistant allowance ($5.00, estimate). I'll be back on the 1st.` Gateway is stopped and disabled (so it does not return on reboot, and the friend's cron jobs stop with it). Owner: `friends: alice reached cap; gateway stopped and disabled — $5.03 of $5.00 this month (ESTIMATE).` |
+| Warning | total reaches 80% of the cap, once a month (not sent if the same check also reaches the cap, and never sent after a cap stop that month, including after `friends cap` raises the cap mid-month) | Friend: `You've used 80% of this month's assistant allowance ($4.02 of $5.00, estimate). It resets on the 1st.` Owner: `friends: alice passed 80% — $4.02 of $5.00 this month (ESTIMATE).` |
+| Cap stop | total reaches the cap | Friend: `You've reached this month's assistant allowance ($5.00, estimate). I'll be back on the 1st.` Gateway is stopped and disabled (so it does not return on reboot, and the friend's cron jobs stop with it). If the friend message cannot be sent, the stop still happens, the friend is not marked notified, and you get `friends: alice could not be messaged about the stop`; it is not retried. Owner: `friends: alice reached cap; gateway stopped and disabled — $5.03 of $5.00 this month (ESTIMATE).` |
 | Runaway stop | spend over the last hour exceeds $1.00, measured against the sample from at least an hour earlier | Friend: `I've paused myself because I was using far more than usual. The owner has been told.` Gateway stopped and disabled. Owner: `friends: alice spent >$1.00 in an hour; gateway stopped and disabled — ...`. Only `friends resume alice` restarts it. |
 | Unpriced sessions | a session has tokens but a missing or zero cost | Owner only, once per session: `friends: alice has unpriced sessions <ids>; counted at fallback rate — ...`. These are counted at $1.89 per million tokens over all tokens (ESTIMATE, the Nous v4-pro output list price, so it over-counts for a cheaper model). |
 | New month | first check after the month changes | Counters reset. A gateway stopped for the cap is enabled and started, and you get `friends: alice new month; gateway re-enabled.` It stays stopped if a runaway hold is set, and if the friend is already over the cap in the new month. A gateway you stopped by hand is not restarted. |
@@ -214,7 +218,7 @@ Caddy file):
 | `friend-spend.json` | month, warned/stopped/notified flags, unpriced session IDs already reported, spend samples for the last two hours |
 | `google-credentials/` | the friend's Google token `<email>.json` and `oauth_states.json` |
 | `state.db` | Hermes's session history; the spend figures come from here |
-| `.env`, `config.yaml`, `SOUL.md`, `skills/`, `memories/MEMORY.md` | rendered from the templates when the profile was created |
+| `.env`, `config.yaml`, `SOUL.md`, `skills/`, `memories/MEMORY.md` | rendered from the templates only when the profile is created, with one exception: `friends activate` rewrites `config.yaml` and removes only the sign-in line from `MEMORY.md` (anything else in the file is kept) |
 
 Elsewhere:
 
@@ -266,13 +270,18 @@ This is not built; these are the steps.
   mitigation is moving friends off this box (above), not a boundary here. A friend
   profile's environment was checked to contain none of your `.env` keys (spike,
   2026-10-25).
-- **Web extract.** Friends get Hermes's `web` toolset. Page extraction can fetch URLs
-  from the host, outside the `--network=none` sandbox. An injected email could try to
+- **Web extract.** The friend's terminal sandbox has no network
+  (`TERMINAL_DOCKER_NETWORK=false` in the friend's `.env`, with image
+  `hermes-sandbox:latest`). Friends also get Hermes's `web` toolset, and page
+  extraction still fetches URLs from the host, outside that sandbox. An injected email could try to
   make the agent fetch an attacker's URL with mailbox content in the query string.
   The only mitigation is the standing rule in the friend's SOUL: report instructions
   found in email, never act on them. It is a soft rule. Private and internal
   addresses are refused (a fetch of `http://127.0.0.1:8101/` returned "Blocked: URL
   targets a private or internal network address").
+
+Known limit: a session still open across the 1st counts in the month it started, so
+its later spend is not counted in the new month.
 
 ## Troubleshooting
 
@@ -290,6 +299,9 @@ This is not built; these are the steps.
   scanner matches (for example a quoted "ignore previous instructions"), Hermes
   skips it without telling the friend. Look for the scanner block message in the
   gateway log.
+- **A `prompt-backend-probe` container with bridge networking:** Hermes's own prompt
+  builder starts it and does not pass the network setting. Agent commands do not run
+  in it; they run in the sandbox container, which has no network.
 - **Unit shows "not-found failed" after a removal:** `systemctl --user reset-failed
   hermes-gateway-alice`. `remove` already does this.
 - **A friend is paused and you do not know why:** `cat

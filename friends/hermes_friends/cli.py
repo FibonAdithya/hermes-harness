@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 from . import render, validate
 from . import spend as spendmod
 from .model import Friend
-from .owner import owner_google_emails, read_owner_env
+from .owner import normalize_email, owner_google_emails, read_owner_env
 from .policy import (CADDY_FILE_MODE, RUNAWAY_USD, WARN_FRACTION, DEFAULT_CADDY_DIR, DEFAULT_CAP_USD, MEM_FLOOR_MB,
                      MEM_PER_FRIEND_MB, PUBLIC_HOST, gateway_unit)
 from .registry import allocate_port, bot_token_in_use, list_friends, profile_dir
@@ -29,14 +29,25 @@ def _err(msg: str) -> None:
     print(f"error: {msg}", file=sys.stderr)
 
 
-def _write_profile_files(system, pdir: Path, f: Friend, token: str | None, owner) -> None:
+def _creds_path(pdir: Path, email: str) -> Path:
+    """Google credentials file of a friend; refuses a path that escapes google-credentials/."""
+    base = (pdir / "google-credentials").resolve()
+    path = pdir / "google-credentials" / f"{email}.json"
+    if not path.resolve().is_relative_to(base):
+        raise ValueError(f"credentials path for {email!r} is outside {base}")
+    return path
+
+
+def _write_profile_files(system, pdir: Path, f: Friend, token: str | None, owner,
+                         memory: bool = True) -> None:
     system.write_file(pdir / "config.yaml", render.render_config(f), 0o600)
     if token is not None:
         system.write_file(pdir / ".env", render.render_env(f, token, owner), 0o600)
         system.write_file(pdir / "SOUL.md", render.render_soul(f), 0o600)
         for rel, data in render.skill_files().items():
             system.write_file(pdir / "skills" / rel, data, 0o600)
-    system.write_file(pdir / "memories" / "MEMORY.md", render.render_memory(f), 0o600)
+    if memory:
+        system.write_file(pdir / "memories" / "MEMORY.md", render.render_memory(f), 0o600)
     system.write_file(pdir / "friend.json", json.dumps(asdict(f), indent=2) + "\n", 0o600)
 
 
@@ -61,7 +72,7 @@ def cmd_add(a, system, root: Path, caddy_dir: Path) -> int:
     except ValueError as e:
         _err(str(e))
         return 2
-    if email.lower() in owner_google_emails(root, root.parent):
+    if normalize_email(email) in {normalize_email(e) for e in owner_google_emails(root, root.parent)}:
         _err("that email is one of the owner's Google accounts; use the friend's own")
         return 1
     pdir = profile_dir(root, name)
@@ -88,6 +99,7 @@ def cmd_add(a, system, root: Path, caddy_dir: Path) -> int:
         undo.append(_undo_caddy(system, caddy_file))
         system.write_file(caddy_file, render.render_caddy(f), CADDY_FILE_MODE)
         system.caddy_reload()
+        undo.append(lambda: system.systemctl("reset-failed", gateway_unit(name)))  # runs after uninstall
         undo.append(lambda: system.hermes(name, "gateway", "uninstall"))
         system.hermes(name, "gateway", "install", "--start-now", "--start-on-login")
     except Exception as e:
@@ -118,15 +130,32 @@ def _friend_dir(root: Path, name: str) -> Path:
     return pdir
 
 
-def cmd_activate(a, system, root: Path) -> int:
+def _activate_memory(system, pdir: Path, f: Friend) -> None:
+    """Drop only the sign-in line from MEMORY.md; keep whatever else the friend's agent added."""
+    path = pdir / "memories" / "MEMORY.md"
+    if not path.is_file():
+        system.write_file(path, render.render_memory(f), 0o600)
+        return
+    line = render.signin_line(f)
+    kept = [ln for ln in path.read_text().splitlines(keepends=True) if ln.rstrip("\r\n") != line]
+    system.write_file(path, "".join(kept), 0o600)
+
+
+def cmd_activate(a, system, root: Path, now: datetime) -> int:
     pdir = _friend_dir(root, a.name)
     f = Friend.load(pdir)
-    creds = pdir / "google-credentials" / f"{f.email}.json"
+    creds = _creds_path(pdir, f.email)
     if not creds.is_file():
         _err(f"{f.name} has not signed in to Google yet ({creds} missing)")
         return 1
     f.activated = True
-    _write_profile_files(system, pdir, f, None, None)
+    _write_profile_files(system, pdir, f, None, None, memory=False)
+    _activate_memory(system, pdir, f)
+    st = spendmod.SpendState.load(pdir, now)
+    if st.stopped_by_cap or st.stopped_by_runaway or st.notified_cap or st.notified_runaway:
+        print(f"{f.name} activated; gateway stays stopped (cap/runaway hold) — "
+              "use `friends cap` or `friends resume`.")
+        return 0
     system.systemctl("restart", gateway_unit(f.name))
     print(f"Activated {f.name}.")
     return 0
@@ -154,6 +183,7 @@ def _apply_actions(system, f: Friend, chat_id: int, actions: list[str],
         st.start_month(spendmod.month_key(now))
         if carried:  # still over the cap: stays stopped, nobody is told again
             st.stopped_by_cap = st.notified_cap = True
+            st.warned = True  # no 80% message for a month that starts over the cap
             actions.remove("stop_cap")
     if "warn" in actions:
         pct = round(WARN_FRACTION * 100)
@@ -165,24 +195,32 @@ def _apply_actions(system, f: Friend, chat_id: int, actions: list[str],
     stops = [x for x in ("stop_cap", "stop_runaway") if x in actions]
     if stops:
         runaway = "stop_runaway" in stops
+        unreachable = False
         if not (st.notified_runaway if runaway else st.notified_cap):
             if runaway:
-                system.send(f.name, f.telegram_id,
-                            "I've paused myself because I was using far more than usual. "
-                            "The owner has been told.")
+                sent = system.send(f.name, f.telegram_id,
+                                   "I've paused myself because I was using far more than usual. "
+                                   "The owner has been told.")
             else:
-                system.send(f.name, f.telegram_id,
-                            f"You've reached this month's assistant allowance (${cap}, "
-                            "estimate). I'll be back on the 1st.")
-            st.notified_runaway = st.notified_runaway or runaway
-            st.notified_cap = st.notified_cap or "stop_cap" in stops
+                sent = system.send(f.name, f.telegram_id,
+                                   f"You've reached this month's assistant allowance (${cap}, "
+                                   "estimate). I'll be back on the 1st.")
+            if sent:
+                st.notified_runaway = st.notified_runaway or runaway
+                st.notified_cap = st.notified_cap or "stop_cap" in stops
+            else:
+                unreachable = True
         system.systemctl("stop", unit)
         system.systemctl("disable", unit)
+        if unreachable:
+            system.send(None, chat_id, f"friends: {f.name} could not be messaged about the stop")
         if "stop_cap" in stops:
             owner("reached cap; gateway stopped and disabled")
         if runaway:
             owner(f"spent >${RUNAWAY_USD:.2f} in an hour; gateway stopped and disabled")
         st.stopped_by_cap = st.stopped_by_cap or "stop_cap" in stops
+        if "stop_cap" in stops:
+            st.warned = True  # no 80% message after the cap message
         st.stopped_by_runaway = st.stopped_by_runaway or runaway
     if "alert_unpriced" in actions:
         new = [i for i in sp.unpriced if i not in st.alerted_unpriced]
@@ -241,7 +279,7 @@ def cmd_list(system, root: Path, now: datetime) -> int:
             f = Friend.load(pdir)
             total = spendmod.month_spend(pdir / "state.db", start).total_usd
             active = "active" if system.unit_active(gateway_unit(f.name)) else "inactive"
-            signed = "yes" if (pdir / "google-credentials" / f"{f.email}.json").is_file() else "no"
+            signed = "yes" if _creds_path(pdir, f.email).is_file() else "no"
             print(f"{f.name}  {active}  signed-in {signed}  "
                   f"${total:.2f} of ${f.cap_usd:.2f} ESTIMATE")
         except Exception as e:
@@ -277,6 +315,8 @@ def cmd_cap(a, system, root: Path, now: datetime) -> int:
     restart = (st.stopped_by_cap or st.notified_cap) and round(a.usd, 6) > round(total, 6)
     if restart:
         st.clear_cap()
+        if not st.stopped_by_runaway:
+            st.samples = []  # old samples would re-trigger a runaway stop at once
         st.save(pdir, system)
         if not st.stopped_by_runaway:
             _start(system, f.name)
@@ -294,6 +334,7 @@ def cmd_resume(a, system, root: Path, now: datetime) -> int:
     st = spendmod.SpendState.load(pdir, now)
     st.clear_runaway()
     st.clear_cap()
+    st.samples = []  # old samples would re-trigger a runaway stop at once
     st.save(pdir, system)
     _start(system, a.name)
     print(f"Resumed {a.name}.")
@@ -322,7 +363,7 @@ def cmd_remove(a, system, root: Path, caddy_dir: Path) -> int:
     credsdir = pdir / "google-credentials"
     creds = None
     try:
-        creds = credsdir / f"{Friend.load(pdir).email}.json"
+        creds = _creds_path(pdir, Friend.load(pdir).email)
     except Exception as e:
         warned = 1
         _warn(f"friend.json unreadable ({' '.join(str(e).split())}); continuing by name")
@@ -337,6 +378,8 @@ def cmd_remove(a, system, root: Path, caddy_dir: Path) -> int:
     step("gateway uninstall", lambda: system.hermes(name, "gateway", "uninstall"))
     # the unit lingers as "not-found failed" after uninstall
     step(f"systemctl reset-failed {unit}", lambda: system.systemctl("reset-failed", unit))
+    # the sandbox container outlives the profile and keeps its network
+    step("removing containers", lambda: system.remove_containers(pdir))
     # the root-run sandbox leaves root-owned files that block the delete
     step(f"reclaim {pdir}", lambda: system.reclaim(pdir))
     step("profile delete", lambda: system.hermes(name, "profile", "delete", "-y", name))
@@ -392,7 +435,7 @@ def main(argv: list[str] | None = None, system: System | None = None,
         if a.cmd == "add":
             return cmd_add(a, system, root, Path(caddy_dir) if caddy_dir else DEFAULT_CADDY_DIR)
         if a.cmd == "activate":
-            return cmd_activate(a, system, root)
+            return cmd_activate(a, system, root, now)
         if a.cmd == "spend-check":
             return cmd_spend_check(system, root, now)
         if a.cmd == "list":

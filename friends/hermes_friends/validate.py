@@ -30,8 +30,9 @@ def validate_tz(s: str) -> str:
 
 
 def validate_email(s: str) -> str:
-    if not re.fullmatch(r"[^@\s]+@[^@\s]+", s):
-        raise ValueError("email must look like name@host with no spaces")
+    if len(s) > 254 or not re.fullmatch(
+            r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", s):
+        raise ValueError("email must look like name@host.tld (letters, digits and ._%+- only)")
     return s
 
 
