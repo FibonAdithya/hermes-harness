@@ -280,7 +280,8 @@ def test_remove_unknown_name_no_calls(hermes_root, tmp_path):
 def test_remove_path_traversal_leaves_victim(hermes_root, tmp_path):
     victim = hermes_root / "profiles" / ".." / ".." / "victim"
     victim.mkdir(parents=True, exist_ok=True)
-    (victim / "friend.json").write_text("{}")
+    Friend(name="victim", telegram_id=1, email="v@example.com", tz="Europe/London", port=8102,
+           cap_usd=1.0, activated=True).save(victim)
     fake = FakeSystem(hermes_root)
     assert run(hermes_root, fake, "remove", "../../victim", caddy=tmp_path) != 0
     assert fake.calls == [] and victim.exists()
@@ -309,3 +310,24 @@ def test_list_shows_estimate_label(hermes_root, capsys):
 def test_list_no_friends(hermes_root, capsys):
     assert run(hermes_root, FakeSystem(hermes_root), "list") == 0
     assert capsys.readouterr().out.strip() == "no friends"
+
+
+def test_remove_reclaims_after_uninstall_before_delete(hermes_root, tmp_path):
+    p, caddy = setup_remove(hermes_root, tmp_path)
+    fake = FakeSystem(hermes_root)
+    assert run(hermes_root, fake, "remove", "alice", caddy=caddy) == 0
+    i = fake.index
+    assert (i("hermes", "alice", "gateway", "uninstall") < i("systemctl", "reset-failed", UNIT)
+            < i("hermes", "alice", "profile", "delete", "-y", "alice"))
+    assert (i("hermes", "alice", "gateway", "uninstall") < i("reclaim", p)
+            < i("hermes", "alice", "profile", "delete", "-y", "alice"))
+
+
+def test_remove_continues_when_reclaim_or_reset_failed_fail(hermes_root, tmp_path, capsys):
+    p, caddy = setup_remove(hermes_root, tmp_path)
+    fake = FakeSystem(hermes_root)
+    fake.fail_on = [("reclaim",), ("systemctl", "reset-failed")]
+    assert run(hermes_root, fake, "remove", "alice", caddy=caddy) == 0
+    assert not p.exists()
+    err = capsys.readouterr().err
+    assert "reclaim" in err and "reset-failed" in err

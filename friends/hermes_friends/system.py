@@ -34,6 +34,12 @@ class System:
     def systemctl(self, *args: str) -> None:
         self._run(["systemctl", "--user", *args])
 
+    def reclaim(self, path: Path) -> None:
+        """Take back ownership of files the root-run Docker sandbox left under path."""
+        self._run(["docker", "run", "--rm", "--network=none", "--user", "0",
+                   "-v", f"{Path(path)}:/p", "hermes-sandbox:latest",
+                   "chown", "-R", f"{os.getuid()}:{os.getgid()}", "/p"])
+
     def unit_active(self, unit: str) -> bool:
         try:
             r = subprocess.run(["systemctl", "--user", "is-active", "--quiet", unit],

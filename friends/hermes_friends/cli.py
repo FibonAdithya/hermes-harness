@@ -309,6 +309,14 @@ def cmd_remove(a, system, root: Path, caddy_dir: Path) -> int:
         except Exception as e:
             _warn(f"systemctl {verb} {unit} failed: {' '.join(str(e).split())}")
     system.hermes(f.name, "gateway", "uninstall")
+    try:  # the unit lingers as "not-found failed" after uninstall
+        system.systemctl("reset-failed", unit)
+    except Exception as e:
+        _warn(f"systemctl reset-failed {unit} failed: {' '.join(str(e).split())}")
+    try:  # the root-run sandbox leaves root-owned files that block the delete
+        system.reclaim(pdir)
+    except Exception as e:
+        _warn(f"reclaim {pdir} failed: {' '.join(str(e).split())}")
     caddy_file = Path(caddy_dir) / f"{f.name}.caddy"
     if caddy_file.exists():
         system.remove_tree(caddy_file)

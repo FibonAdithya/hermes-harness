@@ -36,6 +36,9 @@ class FakeSystem:
     def systemctl(self, *args):
         self._rec("systemctl", *args)
 
+    def reclaim(self, path):
+        self._rec("reclaim", Path(path))
+
     def unit_active(self, unit):
         return unit in self.active
 
