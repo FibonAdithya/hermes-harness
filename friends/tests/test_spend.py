@@ -295,3 +295,107 @@ def test_one_friend_error_does_not_block_others(hermes_root):
     assert any(m.startswith("friends: alice spend-check failed: ") for m in owner_msgs)
     assert ("systemctl", "stop", gateway_unit("bob")) in fake.calls
     assert (b / "friend-spend.json").is_file()
+
+
+# ---- fix round 1 ----
+
+def test_failed_disable_retries_without_repeating_messages(hermes_root):
+    p = mk_friend(hermes_root)
+    fake = FakeSystem(hermes_root)
+    fake.fail_on = [("systemctl", "disable")]
+    set_cost(p, 5.0)
+    unit = gateway_unit("alice")
+    for n in range(3):
+        assert run(hermes_root, fake, NOW + timedelta(minutes=15 * n)) == 1
+        assert (p / "friend-spend.json").is_file()
+    assert len(state(p)["samples"]) == 3
+    assert state(p)["stopped_by_cap"] is False
+    friend_msgs = [c for c in sends(fake) if c[1] == "alice"]
+    assert len(friend_msgs) == 1 and "reached" in friend_msgs[0][3]
+    assert len([c for c in fake.calls if c == ("systemctl", "stop", unit)]) == 3
+    # the failure is reported to the owner each run
+    assert len([c for c in sends(fake) if c[1] is None and "spend-check failed" in c[3]]) == 3
+    fake.fail_on = []
+    assert run(hermes_root, fake, NOW + timedelta(minutes=45)) == 0
+    assert state(p)["stopped_by_cap"] is True
+    assert ("systemctl", "disable", unit) in fake.calls
+    assert len([c for c in sends(fake) if c[1] == "alice"]) == 1
+    assert len([c for c in sends(fake) if c[1] is None and "reached cap" in c[3]]) == 1
+
+
+def test_corrupt_friend_json_does_not_block_others(hermes_root):
+    bad = mk_friend(hermes_root, "alice")
+    (bad / "friend.json").write_text("{not json")
+    b = mk_friend(hermes_root, "bob")
+    set_cost(b, 5.0)
+    fake = FakeSystem(hermes_root)
+    assert run(hermes_root, fake, NOW) == 1
+    owner_msgs = [c[3] for c in sends(fake) if c[1] is None]
+    assert any(m.startswith("friends: alice spend-check failed: ") for m in owner_msgs)
+    assert ("systemctl", "stop", gateway_unit("bob")) in fake.calls
+
+
+def test_new_month_resets_state_in_decide():
+    st = SpendState("2026-09", warned=True)
+    acts = decide(friend(), spend(4.0), st, NOW)
+    assert "new_month" in acts and "warn" in acts
+
+
+def test_cost_zero_with_tokens_is_unpriced(tmp_path):
+    db = tmp_path / "state.db"
+    make_db(db, [("zero", NOW.timestamp(), 1_000_000, 0, 0, 0, 0.0)])
+    ms = month_spend(db, month_start(NOW))
+    assert ms.unpriced == ["zero"] and ms.priced_usd == 0.0
+    assert ms.unpriced_usd == pytest.approx(1.89)
+
+
+def test_warn_dropped_when_cap_reached_same_run():
+    acts = decide(friend(), spend(5.0), SpendState(MONTH), NOW)
+    assert "stop_cap" in acts and "warn" not in acts
+
+
+def test_cap_reached_sends_single_friend_message(hermes_root):
+    p = mk_friend(hermes_root)
+    fake = FakeSystem(hermes_root)
+    set_cost(p, 5.0)
+    run(hermes_root, fake, NOW)
+    friend_msgs = [c[3] for c in sends(fake) if c[1] == "alice"]
+    assert len(friend_msgs) == 1 and friend_msgs[0].startswith("You've reached")
+    assert not any("passed 80%" in c[3] for c in sends(fake))
+
+
+def test_new_month_with_cap_still_hit_stays_stopped(hermes_root):
+    p = mk_friend(hermes_root, cap=0.0)
+    fake = FakeSystem(hermes_root)
+    prior(p, "2026-09", stopped_by_cap=True, notified_cap=True)
+    make_db(p / "state.db", [])
+    assert run(hermes_root, fake, NOW) == 0
+    assert fake.calls and not any(c[0] == "systemctl" for c in fake.calls)
+    assert sends(fake) == []
+    st = state(p)
+    assert st["month"] == MONTH and st["stopped_by_cap"] is True
+
+
+def test_float_thresholds():
+    assert "warn" in decide(friend(cap=3.0), spend(0.8 * 3.0 - 1e-12), SpendState(MONTH), NOW)
+    total = sum(0.05 for _ in range(100))
+    assert total < 5.0  # 4.999999999999998
+    assert "stop_cap" in decide(friend(), spend(total), SpendState(MONTH), NOW)
+    st = SpendState(MONTH, samples=old_sample(1.2))
+    assert "stop_runaway" not in decide(friend(), spend(2.2), st, NOW)  # 2.2 - 1.2 = 1.0000000000000002
+
+
+def test_both_stops_one_pair_runaway_message(hermes_root):
+    p = mk_friend(hermes_root)
+    fake = FakeSystem(hermes_root)
+    prior(p, MONTH, samples=[[NOW.timestamp() - 3600, 1.0]])
+    set_cost(p, 5.0)
+    assert run(hermes_root, fake, NOW) == 0
+    unit = gateway_unit("alice")
+    assert [c for c in fake.calls if c[0] == "systemctl"] == [
+        ("systemctl", "stop", unit), ("systemctl", "disable", unit)]
+    friend_msgs = [c[3] for c in sends(fake) if c[1] == "alice"]
+    assert friend_msgs == ["I've paused myself because I was using far more than usual. "
+                           "The owner has been told."]
+    st = state(p)
+    assert st["stopped_by_cap"] is True and st["stopped_by_runaway"] is True

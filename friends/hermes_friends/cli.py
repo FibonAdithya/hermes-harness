@@ -1,5 +1,6 @@
 """friends command line. All side effects go through the System object."""
 import argparse
+import copy
 import json
 import math
 import sys
@@ -132,25 +133,27 @@ def cmd_activate(a, system, root: Path) -> int:
 
 
 def _apply_actions(system, f: Friend, chat_id: int, actions: list[str],
-                   sp, st, old_st) -> None:
+                   sp, st, old_st, now: datetime) -> None:
+    """Apply actions, setting each state flag as soon as its own effect completes,
+    so a failure part-way is retried next run without repeating finished effects."""
     unit = gateway_unit(f.name)
     total, cap = f"{sp.total_usd:.2f}", f"{f.cap_usd:.2f}"
     tail = f"— ${total} of ${cap} this month (ESTIMATE)."
+    actions = list(actions)
 
     def owner(event: str) -> None:
         system.send(None, chat_id, f"friends: {f.name} {event} {tail}")
 
-    def stop(friend_msg: str, owner_event: str) -> None:
-        system.send(f.name, f.telegram_id, friend_msg)
-        system.systemctl("stop", unit)
-        system.systemctl("disable", unit)
-        owner(owner_event)
-
     if "new_month" in actions:
-        if old_st.stopped_by_cap and not old_st.stopped_by_runaway:
+        carried = old_st.stopped_by_cap and "stop_cap" in actions
+        if old_st.stopped_by_cap and not old_st.stopped_by_runaway and not carried:
             system.systemctl("enable", unit)
             system.systemctl("start", unit)
             system.send(None, chat_id, f"friends: {f.name} new month; gateway re-enabled.")
+        st.start_month(spendmod.month_key(now))
+        if carried:  # still over the cap: stays stopped, nobody is told again
+            st.stopped_by_cap = st.notified_cap = True
+            actions.remove("stop_cap")
     if "warn" in actions:
         pct = round(WARN_FRACTION * 100)
         system.send(f.name, f.telegram_id,
@@ -158,15 +161,28 @@ def _apply_actions(system, f: Friend, chat_id: int, actions: list[str],
                     f"(${total} of ${cap}, estimate). It resets on the 1st.")
         owner(f"passed {pct}%")
         st.warned = True
-    if "stop_cap" in actions:
-        stop(f"You've reached this month's assistant allowance (${cap}, estimate). "
-             "I'll be back on the 1st.", "reached cap; gateway stopped and disabled")
-        st.stopped_by_cap = True
-    if "stop_runaway" in actions:
-        stop("I've paused myself because I was using far more than usual. "
-             "The owner has been told.",
-             f"spent >${RUNAWAY_USD:.2f} in an hour; gateway stopped and disabled")
-        st.stopped_by_runaway = True
+    stops = [x for x in ("stop_cap", "stop_runaway") if x in actions]
+    if stops:
+        runaway = "stop_runaway" in stops
+        if not (st.notified_runaway if runaway else st.notified_cap):
+            if runaway:
+                system.send(f.name, f.telegram_id,
+                            "I've paused myself because I was using far more than usual. "
+                            "The owner has been told.")
+            else:
+                system.send(f.name, f.telegram_id,
+                            f"You've reached this month's assistant allowance (${cap}, "
+                            "estimate). I'll be back on the 1st.")
+            st.notified_runaway = st.notified_runaway or runaway
+            st.notified_cap = st.notified_cap or "stop_cap" in stops
+        system.systemctl("stop", unit)
+        system.systemctl("disable", unit)
+        if "stop_cap" in stops:
+            owner("reached cap; gateway stopped and disabled")
+        if runaway:
+            owner(f"spent >${RUNAWAY_USD:.2f} in an hour; gateway stopped and disabled")
+        st.stopped_by_cap = st.stopped_by_cap or "stop_cap" in stops
+        st.stopped_by_runaway = st.stopped_by_runaway or runaway
     if "alert_unpriced" in actions:
         new = [i for i in sp.unpriced if i not in st.alerted_unpriced]
         owner(f"has unpriced sessions {', '.join(new)}; counted at fallback rate")
@@ -175,25 +191,38 @@ def _apply_actions(system, f: Friend, chat_id: int, actions: list[str],
 
 def cmd_spend_check(system, root: Path, now: datetime) -> int:
     chat_id = read_owner_env(root).chat_id
+    base = root / "profiles"
+    dirs = sorted(d for d in base.iterdir() if (d / "friend.json").is_file()) \
+        if base.is_dir() else []
     failed = 0
-    for f in list_friends(root):
+
+    def report(name: str, e: Exception) -> None:
+        nonlocal failed
+        failed = 1
+        msg = " ".join(str(e).split()) or type(e).__name__
+        _err(f"{name}: {msg}")
+        system.send(None, chat_id, f"friends: {name} spend-check failed: {msg}")
+
+    for pdir in dirs:
+        st = sp = None
         try:
-            pdir = profile_dir(root, f.name)
+            f = Friend.load(pdir)
             sp = spendmod.month_spend(pdir / "state.db", spendmod.month_start(now))
-            old_st = spendmod.SpendState.load(pdir, now)
+            st = spendmod.SpendState.load(pdir, now)
+            old_st = copy.deepcopy(st)
             actions = spendmod.decide(f, sp, old_st, now)
-            st = (old_st.reset_for_month(spendmod.month_key(now))
-                  if "new_month" in actions else old_st)
-            _apply_actions(system, f, chat_id, actions, sp, st, old_st)
-            cutoff = now.timestamp() - spendmod.SAMPLE_KEEP_S
-            st.samples = [s for s in st.samples if s[0] >= cutoff]
-            st.samples.append((now.timestamp(), sp.total_usd))
-            st.save(pdir, system)
+            _apply_actions(system, f, chat_id, actions, sp, st, old_st, now)
         except Exception as e:
-            failed = 1
-            msg = " ".join(str(e).split()) or type(e).__name__
-            _err(f"{f.name}: {msg}")
-            system.send(None, chat_id, f"friends: {f.name} spend-check failed: {msg}")
+            report(pdir.name, e)
+        finally:
+            if st is not None and sp is not None:
+                try:
+                    cutoff = now.timestamp() - spendmod.SAMPLE_KEEP_S
+                    st.samples = [s for s in st.samples if s[0] >= cutoff]
+                    st.samples.append((now.timestamp(), sp.total_usd))
+                    st.save(pdir, system)
+                except Exception as e:
+                    report(pdir.name, e)
     return failed
 
 

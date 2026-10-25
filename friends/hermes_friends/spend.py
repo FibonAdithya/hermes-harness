@@ -68,6 +68,9 @@ class SpendState:
     stopped_by_runaway: bool = False
     alerted_unpriced: list[str] = field(default_factory=list)
     samples: list[tuple[float, float]] = field(default_factory=list)
+    # The friend has been told about a stop; a retry of stop/disable must not tell again.
+    notified_cap: bool = False
+    notified_runaway: bool = False
 
     @classmethod
     def load(cls, profile: Path, now: datetime) -> "SpendState":
@@ -78,21 +81,31 @@ class SpendState:
         return cls(month=d["month"], warned=d["warned"], stopped_by_cap=d["stopped_by_cap"],
                    stopped_by_runaway=d["stopped_by_runaway"],
                    alerted_unpriced=list(d["alerted_unpriced"]),
-                   samples=[(float(t), float(v)) for t, v in d["samples"]])
+                   samples=[(float(t), float(v)) for t, v in d["samples"]],
+                   notified_cap=d.get("notified_cap", False),
+                   notified_runaway=d.get("notified_runaway", False))
 
     def to_json(self) -> str:
         return json.dumps({"month": self.month, "warned": self.warned,
                            "stopped_by_cap": self.stopped_by_cap,
                            "stopped_by_runaway": self.stopped_by_runaway,
                            "alerted_unpriced": self.alerted_unpriced,
-                           "samples": [list(s) for s in self.samples]}, indent=2) + "\n"
+                           "samples": [list(s) for s in self.samples],
+                           "notified_cap": self.notified_cap,
+                           "notified_runaway": self.notified_runaway}, indent=2) + "\n"
 
     def save(self, profile: Path, system) -> None:
         system.write_file(Path(profile) / STATE_FILE, self.to_json(), 0o600)
 
     def reset_for_month(self, month: str) -> "SpendState":
         """Fresh state for a new month; the runaway hold is kept."""
-        return SpendState(month=month, stopped_by_runaway=self.stopped_by_runaway)
+        return SpendState(month=month, stopped_by_runaway=self.stopped_by_runaway,
+                          notified_runaway=self.notified_runaway)
+
+    def start_month(self, month: str) -> None:
+        """In-place reset for a new month; the runaway hold is kept."""
+        fresh = self.reset_for_month(month)
+        self.__dict__.update(fresh.__dict__)
 
 
 def decide(f: Friend, spend: MonthSpend, st: SpendState, now: datetime) -> list[str]:
@@ -100,17 +113,18 @@ def decide(f: Friend, spend: MonthSpend, st: SpendState, now: datetime) -> list[
     if st.month != month_key(now):
         actions.append("new_month")
         st = st.reset_for_month(month_key(now))  # evaluate the rest against the fresh month
-    total = spend.total_usd
-    if total >= WARN_FRACTION * f.cap_usd and not st.warned:
+    total = round(spend.total_usd, 6)
+    stop_cap = total >= round(f.cap_usd, 6) and not st.stopped_by_cap
+    if total >= round(WARN_FRACTION * f.cap_usd, 6) and not st.warned and not stop_cap:
         actions.append("warn")
-    if total >= f.cap_usd and not st.stopped_by_cap:
+    if stop_cap:
         actions.append("stop_cap")
     if not st.stopped_by_runaway:
         cutoff = now.timestamp() - RUNAWAY_WINDOW_S
         old = [s for s in st.samples if s[0] <= cutoff]
         if old:
             base = max(old, key=lambda s: s[0])[1]
-            if total - base > RUNAWAY_USD:
+            if round(total - base, 6) > RUNAWAY_USD:
                 actions.append("stop_runaway")
     if any(i not in st.alerted_unpriced for i in spend.unpriced):
         actions.append("alert_unpriced")
