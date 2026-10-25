@@ -582,3 +582,34 @@ Behaviour:
   environment check against the real test profile's gateway.
 - [ ] **Step 4:** `friends remove test`, then confirm check 11.
 - [ ] **Step 5:** Commit the runbook and results: `docs(friends): runbook and live verification`.
+
+---
+
+## Spike results (2026-10-25, droplet `hermes-vm`, Hermes v0.19.0)
+
+Throwaway profile `spike`, test bot @Jeeves_fibonadi_bot, allowlisted the owner's own Telegram ID.
+All results MEASURED in this session.
+
+| Step | Command / action | Result |
+|---|---|---|
+| 1 | `hermes profile create spike --no-alias --no-skills` | exit 0. Creates `.env` (600), `.no-bundled-skills`, `SOUL.md` (664), `cron home logs memories plans sessions skills skins workspace`. Profile dir mode **775** — `friends add` must chmod 700. |
+| 2 | `HERMES_HOME=$P hermes gateway install --start-now --start-on-login` | Unit `hermes-gateway-spike.service`: `Environment="HERMES_HOME=$P"`, `ExecStart=… -m hermes_cli.main --profile spike gateway run`, `Restart=always`, `WantedBy=default.target`, enabled, active. |
+| 3 | `platform_toolsets.telegram: [web, terminal, file, cronjob, memory, todo, session_search, clarify, skills]`; `HERMES_HOME=$P hermes tools list --platform telegram` | Plain list honoured: those enabled; `browser`, `code_execution`, `image_gen`, `delegation`, `computer_use`, `homeassistant` disabled. (`hermes tools --summary` needs a TTY.) |
+| 4a | Asked the bot to call `start_google_auth` | Auth URL `redirect_uri=https://auth.fibonadithya.me/spike/oauth2callback` (10 scopes). |
+| 4b | `ss -ltnp` while the flow was pending | workspace-mcp listening on `127.0.0.1:8101` and `[::1]:8101`; nothing before the flow started. |
+| 4c | — | No extra variable needed; `GOOGLE_OAUTH_REDIRECT_URI` alone suffices. Owner's server entry uses `command: uvx`. |
+| 4 (finding) | Asked the bot to list its tools | `tools.include` does not cover Hermes' MCP utility tools: `mcp__google__{list_resources,read_resource,list_prompts,get_prompt}` were registered. Switches: `mcp_servers.<n>.tools.resources/prompts` (default true, `tools/mcp_tool.py:5560`). Friend config sets both false (Ruling 3). Live re-check pending (Task 8 check 5). |
+| 5 | Same open session, one more message | `api_call_count` 5→6, `estimated_cost_usd` 0.00249286→0.00308926 (`cost_status=estimated`). Cost accrues while a session is open. |
+| 6 | `HERMES_HOME=$P hermes send -t telegram:<id> -q "<text>"` | exit 0 and delivered (owner confirmed) both with the gateway running and stopped. Non-interactive forms: `hermes profile delete -y <name>`, `HERMES_HOME=$P hermes gateway uninstall`. |
+| 7 | Asked the bot to `web_extract` `http://127.0.0.1:8101/` | `"Blocked: URL targets a private or internal network address"`, refused before any request. Whether public fetches are local or Nous-side is still unknown; spec §1 accepted risk stands. |
+| 7a | Env var **names** of the spike gateway and every descendant vs the owner's `.env` keys | None of the owner's 19 keys present. MCP children receive the Google client vars and no `TELEGRAM_BOT_TOKEN`. |
+| 8 | stop, disable, `gateway uninstall`, `profile delete -y spike` | Uninstall exit 0, but the unit lingers as "not-found failed" until `systemctl --user reset-failed`. **`profile delete` failed: Permission denied** on root-owned `sandboxes/docker/prompt-backend-probe/home/.hermes{,/skills}` (the sandbox runs as root). `docker run --rm --network=none --user 0 -v $P:/p hermes-sandbox:latest chown -R $(id -u):$(id -g) /p` then `profile delete -y` → exit 0. `remove` does both (Ruling 9). |
+| — | Owner credential mtimes before/after | `<owner>.json` changed 06:00:52→08:00:39 GMT, matching the owner's own triage cron (`cron_3bc4e11d29b1_20261025_080033`) refreshing its token; owner `oauth_states.json` unchanged; the spike's OAuth state was written to `spike/google-credentials/oauth_states.json`. |
+
+Also confirmed: profile commands resolve `~/.hermes/profiles` correctly with `HERMES_HOME` set to the
+friend's profile; the approvals bot token lives in `~/.hermes/broker/broker.json`; 0 of 38 owner
+sessions since 2026-10-18 had tokens with a NULL/0 cost.
+
+Owner inputs for Task 8: test Google account `adithya@tig.foundation` (Google Workspace — an admin
+policy may block the unverified app; unknown until sign-in). The owner's own Gmail is refused by
+`friends add` (Ruling 4).
