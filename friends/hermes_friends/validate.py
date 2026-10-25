@@ -1,7 +1,7 @@
 import re
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-_NAME = re.compile(r"[a-z][a-z0-9]{0,30}")
+_NAME = re.compile(r"[a-z0-9]{1,32}")
 _TOKEN = re.compile(r"\d{6,}:[A-Za-z0-9_-]{30,}")
 
 
@@ -9,7 +9,7 @@ def validate_name(s: str) -> str:
     if s == "default":
         raise ValueError("name 'default' is reserved")
     if not _NAME.fullmatch(s):
-        raise ValueError("name must be lowercase letters and digits, starting with a letter")
+        raise ValueError("name must be 1-32 lowercase letters and digits")
     return s
 
 
@@ -20,12 +20,12 @@ def validate_telegram_id(s: str) -> int:
 
 
 def validate_tz(s: str) -> str:
+    if not s:
+        raise ValueError("timezone is empty")
     try:
         ZoneInfo(s)
     except (ZoneInfoNotFoundError, ValueError, OSError):
         raise ValueError(f"unknown timezone: {s!r}") from None
-    if not s:
-        raise ValueError("timezone is empty")
     return s
 
 

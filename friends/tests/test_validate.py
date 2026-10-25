@@ -9,7 +9,9 @@ from hermes_friends.validate import (
 def test_name_rules():
     assert validate_name("alice") == "alice"
     assert validate_name("bob2") == "bob2"
-    for bad in ["", "Alice", "al-ice", "default", "../x"]:
+    assert validate_name("2fast") == "2fast"
+    assert validate_name("a" * 32) == "a" * 32
+    for bad in ["a" * 33, "", "Alice", "al-ice", "default", "../x"]:
         with pytest.raises(ValueError):
             validate_name(bad)
 

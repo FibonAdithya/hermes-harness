@@ -61,3 +61,20 @@ def test_friend_roundtrip_and_mode(tmp_path):
     assert Friend.load(tmp_path) == f
     assert stat.S_IMODE((tmp_path / "friend.json").stat().st_mode) == 0o600
     assert json.loads((tmp_path / "friend.json").read_text())["name"] == "amy"
+
+
+def test_bot_token_in_use_parses_export_and_comment(hermes_root):
+    tok = "555555:" + "E" * 35
+    (hermes_root / ".env").write_text(f"export TELEGRAM_BOT_TOKEN={tok}\n")
+    assert bot_token_in_use(hermes_root, tok)
+    tok2 = "666666:" + "C" * 35
+    (hermes_root / ".env").write_text(f"TELEGRAM_BOT_TOKEN={tok2} # main bot\n")
+    assert bot_token_in_use(hermes_root, tok2)
+
+
+def test_save_tightens_existing_mode(tmp_path):
+    p = tmp_path / "friend.json"
+    p.write_text("{}")
+    p.chmod(0o644)
+    mk("amy", 8101).save(tmp_path)
+    assert stat.S_IMODE(p.stat().st_mode) == 0o600
