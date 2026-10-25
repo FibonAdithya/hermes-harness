@@ -1,3 +1,4 @@
+import json
 import dataclasses
 
 import pytest
@@ -5,7 +6,7 @@ import yaml
 
 from hermes_friends import render
 from hermes_friends.model import Friend
-from hermes_friends.owner import OwnerEnv
+from hermes_friends.owner import OwnerEnv, read_env
 from hermes_friends.render import (
     GOOGLE_TOOLS, SIGNIN_TOOLS, TELEGRAM_TOOLSETS, render_caddy, render_config,
     render_env, render_memory, render_soul, skill_files,
@@ -128,10 +129,23 @@ def test_env_allowlist():
     assert "TELEGRAM_ALLOWED_USERS=4242" in lines
     assert "TERMINAL_ENV=docker" in lines
     assert "TERMINAL_DOCKER_IMAGE=hermes-sandbox:latest" in lines
-    assert "TERMINAL_DOCKER_NETWORK=false" in lines
     assert "TELEGRAM_BOT_TOKEN=123:tok" in lines
     assert "GOOGLE_OAUTH_CLIENT_ID=cid-literal" in lines
     assert "GOOGLE_OAUTH_CLIENT_SECRET=SECRET-literal" in lines
+
+
+def test_env_cuts_network_for_every_container(tmp_path):
+    # Hermes's prompt probe container ignores TERMINAL_DOCKER_NETWORK and came up on the
+    # bridge network (MEASURED on the droplet, Hermes v0.19.0). Both it and the terminal
+    # sandbox read TERMINAL_DOCKER_EXTRA_ARGS, so the network is cut there instead.
+    env = render_env(mk(), "123:tok", OWNER)
+    path = tmp_path / ".env"
+    path.write_text(env)
+    parsed = read_env(path)
+    assert json.loads(parsed["TERMINAL_DOCKER_EXTRA_ARGS"]) == ["--network=none"]
+    # With both set, Hermes passes --network=none twice and docker refuses to start
+    # ("network \"none\" is specified multiple times", MEASURED).
+    assert "TERMINAL_DOCKER_NETWORK" not in parsed
 
 
 @pytest.mark.parametrize("bad", [0, -5])

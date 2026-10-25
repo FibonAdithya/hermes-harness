@@ -78,7 +78,10 @@ def render_env(f: Friend, bot_token: str, owner: OwnerEnv) -> str:
         f"TELEGRAM_ALLOWED_USERS={f.telegram_id}\n"
         "TERMINAL_ENV=docker\n"
         "TERMINAL_DOCKER_IMAGE=hermes-sandbox:latest\n"
-        "TERMINAL_DOCKER_NETWORK=false\n"
+        # Not TERMINAL_DOCKER_NETWORK=false: Hermes's prompt probe container ignores it and
+        # runs on the bridge network. Both containers read the extra args; setting both
+        # makes docker refuse "--network=none" given twice.
+        'TERMINAL_DOCKER_EXTRA_ARGS=["--network=none"]\n'
         f"GOOGLE_OAUTH_CLIENT_ID={owner.google_client_id}\n"
         f"GOOGLE_OAUTH_CLIENT_SECRET={owner.google_client_secret}\n"
     )
