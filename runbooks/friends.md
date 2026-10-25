@@ -113,8 +113,7 @@ The `friends` command creates, caps and removes them. A timer
    rewrites the profile config without the sign-in tool, restarts the gateway, and
    prints `Activated alice.`
    If a cap or runaway hold is set it writes the config but does not restart, and
-   prints `alice activated; gateway stays stopped (cap/runaway hold) — use `friends cap`
-   or `friends resume`.`
+   prints ``alice activated; gateway stays stopped (cap/runaway hold) — use `friends cap` or `friends resume`.``
 
 Google Workspace caveat: if the friend's address is a Google Workspace account, the
 Workspace admin may block unverified apps or restrict the Gmail and Calendar scopes.

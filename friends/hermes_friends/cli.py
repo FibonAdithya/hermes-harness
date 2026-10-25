@@ -149,9 +149,9 @@ def cmd_activate(a, system, root: Path, now: datetime) -> int:
         _err(f"{f.name} has not signed in to Google yet ({creds} missing)")
         return 1
     f.activated = True
+    st = spendmod.SpendState.load(pdir, now)  # before any write: a corrupt file changes nothing
     _write_profile_files(system, pdir, f, None, None, memory=False)
     _activate_memory(system, pdir, f)
-    st = spendmod.SpendState.load(pdir, now)
     if st.stopped_by_cap or st.stopped_by_runaway or st.notified_cap or st.notified_runaway:
         print(f"{f.name} activated; gateway stays stopped (cap/runaway hold) — "
               "use `friends cap` or `friends resume`.")

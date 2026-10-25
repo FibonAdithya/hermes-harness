@@ -305,3 +305,48 @@ def test_remove_continues_when_container_removal_fails(hermes_root, tmp_path, ca
     assert run(hermes_root, fake, "remove", "alice", caddy=caddy) == 1
     assert not p.exists()
     assert "containers" in capsys.readouterr().err
+
+
+# ---- re-review fixes ----
+
+def test_inspect_template_has_no_raw_newline_or_backslash(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run(self, cmd, env=None):
+        calls.append(cmd)
+        return "c1\n" if cmd[:3] == ["docker", "ps", "-aq"] else ""
+
+    monkeypatch.setattr(System, "_run", fake_run)
+    System(tmp_path).remove_containers(tmp_path / "p")
+    fmt = [c for c in calls if c[:2] == ["docker", "inspect"]][0][3]
+    assert "\n" not in fmt and "\\" not in fmt and fmt == "{{range .Mounts}}{{println .Source}}{{end}}"
+
+
+def test_remove_containers_skips_failed_inspect(monkeypatch, tmp_path):
+    prof = tmp_path / "profiles" / "alice"
+    calls = []
+
+    def fake_run(self, cmd, env=None):
+        calls.append(cmd)
+        if cmd[:3] == ["docker", "ps", "-aq"]:
+            return "gone\nc2\n"
+        if cmd[:2] == ["docker", "inspect"]:
+            if cmd[-1] == "gone":
+                raise RuntimeError("no such object")
+            return f"{prof}/ws\n"
+        return ""
+
+    monkeypatch.setattr(System, "_run", fake_run)
+    assert System(tmp_path).remove_containers(prof) == 1
+    assert ["docker", "rm", "-f", "c2"] in calls
+
+
+def test_activate_corrupt_spend_state_changes_nothing(hermes_root, tmp_path):
+    fake, p = setup(hermes_root, tmp_path)
+    creds(p)
+    (p / "friend-spend.json").write_text("{not json")
+    before = {f: (p / f).read_text() for f in ("config.yaml", "friend.json", "memories/MEMORY.md")}
+    fake.calls.clear()
+    assert main(["activate", "alice"], system=fake, root=hermes_root, now=NOW) == 1
+    assert fake.calls == []
+    assert before == {f: (p / f).read_text() for f in before}

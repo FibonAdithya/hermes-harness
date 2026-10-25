@@ -56,8 +56,11 @@ class System:
         ids = self._run(["docker", "ps", "-aq"]).split()
         mounts = {}
         for cid in ids:
-            out = self._run(["docker", "inspect", "-f",
-                             '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}', cid])
+            try:
+                out = self._run(["docker", "inspect", "-f",
+                                 "{{range .Mounts}}{{println .Source}}{{end}}", cid])
+            except RuntimeError:
+                continue  # removed between ps and inspect
             mounts[cid] = [ln for ln in out.splitlines() if ln]
         doomed = containers_under(mounts, Path(profile))
         for cid in doomed:
