@@ -9,9 +9,10 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from . import render, validate
+from . import spend as spendmod
 from .model import Friend
 from .owner import owner_google_emails, read_owner_env
-from .policy import (CADDY_FILE_MODE, DEFAULT_CADDY_DIR, DEFAULT_CAP_USD, MEM_FLOOR_MB,
+from .policy import (CADDY_FILE_MODE, RUNAWAY_USD, WARN_FRACTION, DEFAULT_CADDY_DIR, DEFAULT_CAP_USD, MEM_FLOOR_MB,
                      MEM_PER_FRIEND_MB, PUBLIC_HOST, gateway_unit)
 from .registry import allocate_port, bot_token_in_use, list_friends, profile_dir
 from .system import OWNER_ROOT, System
@@ -130,6 +131,72 @@ def cmd_activate(a, system, root: Path) -> int:
     return 0
 
 
+def _apply_actions(system, f: Friend, chat_id: int, actions: list[str],
+                   sp, st, old_st) -> None:
+    unit = gateway_unit(f.name)
+    total, cap = f"{sp.total_usd:.2f}", f"{f.cap_usd:.2f}"
+    tail = f"— ${total} of ${cap} this month (ESTIMATE)."
+
+    def owner(event: str) -> None:
+        system.send(None, chat_id, f"friends: {f.name} {event} {tail}")
+
+    def stop(friend_msg: str, owner_event: str) -> None:
+        system.send(f.name, f.telegram_id, friend_msg)
+        system.systemctl("stop", unit)
+        system.systemctl("disable", unit)
+        owner(owner_event)
+
+    if "new_month" in actions:
+        if old_st.stopped_by_cap and not old_st.stopped_by_runaway:
+            system.systemctl("enable", unit)
+            system.systemctl("start", unit)
+            system.send(None, chat_id, f"friends: {f.name} new month; gateway re-enabled.")
+    if "warn" in actions:
+        pct = round(WARN_FRACTION * 100)
+        system.send(f.name, f.telegram_id,
+                    f"You've used {pct}% of this month's assistant allowance "
+                    f"(${total} of ${cap}, estimate). It resets on the 1st.")
+        owner(f"passed {pct}%")
+        st.warned = True
+    if "stop_cap" in actions:
+        stop(f"You've reached this month's assistant allowance (${cap}, estimate). "
+             "I'll be back on the 1st.", "reached cap; gateway stopped and disabled")
+        st.stopped_by_cap = True
+    if "stop_runaway" in actions:
+        stop("I've paused myself because I was using far more than usual. "
+             "The owner has been told.",
+             f"spent >${RUNAWAY_USD:.2f} in an hour; gateway stopped and disabled")
+        st.stopped_by_runaway = True
+    if "alert_unpriced" in actions:
+        new = [i for i in sp.unpriced if i not in st.alerted_unpriced]
+        owner(f"has unpriced sessions {', '.join(new)}; counted at fallback rate")
+        st.alerted_unpriced = st.alerted_unpriced + new
+
+
+def cmd_spend_check(system, root: Path, now: datetime) -> int:
+    chat_id = read_owner_env(root).chat_id
+    failed = 0
+    for f in list_friends(root):
+        try:
+            pdir = profile_dir(root, f.name)
+            sp = spendmod.month_spend(pdir / "state.db", spendmod.month_start(now))
+            old_st = spendmod.SpendState.load(pdir, now)
+            actions = spendmod.decide(f, sp, old_st, now)
+            st = (old_st.reset_for_month(spendmod.month_key(now))
+                  if "new_month" in actions else old_st)
+            _apply_actions(system, f, chat_id, actions, sp, st, old_st)
+            cutoff = now.timestamp() - spendmod.SAMPLE_KEEP_S
+            st.samples = [s for s in st.samples if s[0] >= cutoff]
+            st.samples.append((now.timestamp(), sp.total_usd))
+            st.save(pdir, system)
+        except Exception as e:
+            failed = 1
+            msg = " ".join(str(e).split()) or type(e).__name__
+            _err(f"{f.name}: {msg}")
+            system.send(None, chat_id, f"friends: {f.name} spend-check failed: {msg}")
+    return failed
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="friends")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -142,6 +209,7 @@ def _parser() -> argparse.ArgumentParser:
     add.add_argument("--cap", type=float, default=DEFAULT_CAP_USD)
     act = sub.add_parser("activate")
     act.add_argument("name")
+    sub.add_parser("spend-check")
     return p
 
 
@@ -160,6 +228,8 @@ def main(argv: list[str] | None = None, system: System | None = None,
             return cmd_add(a, system, root, Path(caddy_dir) if caddy_dir else DEFAULT_CADDY_DIR)
         if a.cmd == "activate":
             return cmd_activate(a, system, root)
+        if a.cmd == "spend-check":
+            return cmd_spend_check(system, root, now)
     except Refused as e:
         _err(str(e))
         return e.code
