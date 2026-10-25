@@ -270,8 +270,9 @@ This is not built; these are the steps.
   profile's environment was checked to contain none of your `.env` keys (spike,
   2026-10-25).
 - **Web extract.** The friend's terminal sandbox has no network
-  (`TERMINAL_DOCKER_NETWORK=false` in the friend's `.env`, with image
-  `hermes-sandbox:latest`). Friends also get Hermes's `web` toolset, and page
+  (`TERMINAL_DOCKER_EXTRA_ARGS=["--network=none"]` in the friend's `.env`, with image
+  `hermes-sandbox:latest`). Not `TERMINAL_DOCKER_NETWORK=false`: Hermes's prompt-probe
+  container ignores that setting and came up on the bridge network. Friends also get Hermes's `web` toolset, and page
   extraction still fetches URLs from the host, outside that sandbox. An injected email could try to
   make the agent fetch an attacker's URL with mailbox content in the query string.
   The only mitigation is the standing rule in the friend's SOUL: report instructions
