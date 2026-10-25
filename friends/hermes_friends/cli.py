@@ -228,18 +228,26 @@ def cmd_spend_check(system, root: Path, now: datetime) -> int:
 
 
 def cmd_list(system, root: Path, now: datetime) -> int:
-    friends = list_friends(root)
-    if not friends:
+    base = Path(root) / "profiles"
+    dirs = sorted(d for d in base.iterdir() if (d / "friend.json").is_file()) \
+        if base.is_dir() else []
+    if not dirs:
         print("no friends")
         return 0
     start = spendmod.month_start(now)
-    for f in friends:
-        pdir = profile_dir(root, f.name)
-        total = spendmod.month_spend(pdir / "state.db", start).total_usd
-        active = "active" if system.unit_active(gateway_unit(f.name)) else "inactive"
-        signed = "yes" if (pdir / "google-credentials" / f"{f.email}.json").is_file() else "no"
-        print(f"{f.name}  {active}  signed-in {signed}  ${total:.2f} of ${f.cap_usd:.2f} ESTIMATE")
-    return 0
+    failed = 0
+    for pdir in dirs:
+        try:
+            f = Friend.load(pdir)
+            total = spendmod.month_spend(pdir / "state.db", start).total_usd
+            active = "active" if system.unit_active(gateway_unit(f.name)) else "inactive"
+            signed = "yes" if (pdir / "google-credentials" / f"{f.email}.json").is_file() else "no"
+            print(f"{f.name}  {active}  signed-in {signed}  "
+                  f"${total:.2f} of ${f.cap_usd:.2f} ESTIMATE")
+        except Exception as e:
+            failed = 1
+            print(f"{pdir.name}  error: {' '.join(str(e).split()) or type(e).__name__}")
+    return failed
 
 
 def _save_friend(system, pdir: Path, f: Friend) -> None:
@@ -280,6 +288,9 @@ def cmd_cap(a, system, root: Path, now: datetime) -> int:
 
 def cmd_resume(a, system, root: Path, now: datetime) -> int:
     pdir = _friend_dir(root, a.name)
+    if not Friend.load(pdir).activated:
+        _err(f"{a.name} has not been activated yet; run `activate` after Google sign-in")
+        return 2
     st = spendmod.SpendState.load(pdir, now)
     st.clear_runaway()
     st.clear_cap()
@@ -294,41 +305,52 @@ def _warn(msg: str) -> None:
 
 
 def cmd_remove(a, system, root: Path, caddy_dir: Path) -> int:
+    """Deleting the friend's data is never blocked: every step after validation warns and continues."""
     pdir = _friend_dir(root, a.name)
-    f = Friend.load(pdir)
-    unit = gateway_unit(f.name)
-    creds = pdir / "google-credentials" / f"{f.email}.json"
-    if creds.is_file():  # revoke first: the profile delete destroys the token
+    name = a.name
+    warned = 0
+
+    def step(what: str, fn) -> None:
+        nonlocal warned
         try:
-            system.revoke_google_token(json.loads(creds.read_text())["refresh_token"])
+            fn()
         except Exception as e:
-            _warn(f"Google token revoke failed: {' '.join(str(e).split()) or type(e).__name__}")
-    for verb in ("stop", "disable"):
-        try:
-            system.systemctl(verb, unit)
-        except Exception as e:
-            _warn(f"systemctl {verb} {unit} failed: {' '.join(str(e).split())}")
-    system.hermes(f.name, "gateway", "uninstall")
-    try:  # the unit lingers as "not-found failed" after uninstall
-        system.systemctl("reset-failed", unit)
-    except Exception as e:
-        _warn(f"systemctl reset-failed {unit} failed: {' '.join(str(e).split())}")
-    try:  # the root-run sandbox leaves root-owned files that block the delete
-        system.reclaim(pdir)
-    except Exception as e:
-        _warn(f"reclaim {pdir} failed: {' '.join(str(e).split())}")
-    caddy_file = Path(caddy_dir) / f"{f.name}.caddy"
-    if caddy_file.exists():
-        system.remove_tree(caddy_file)
-    system.caddy_reload()
+            warned = 1
+            _warn(f"{what} failed: {' '.join(str(e).split()) or type(e).__name__}")
+
+    unit = gateway_unit(name)
+    credsdir = pdir / "google-credentials"
+    creds = None
     try:
-        system.hermes(f.name, "profile", "delete", "-y", f.name)
+        creds = credsdir / f"{Friend.load(pdir).email}.json"
     except Exception as e:
-        _warn(f"profile delete failed: {' '.join(str(e).split())}; removing the directory")
+        warned = 1
+        _warn(f"friend.json unreadable ({' '.join(str(e).split())}); continuing by name")
+        found = [c for c in credsdir.glob("*.json") if c.name != "oauth_states.json"] \
+            if credsdir.is_dir() else []
+        creds = found[0] if len(found) == 1 else None
+    if creds is not None and creds.is_file():  # revoke first: the delete destroys the token
+        step("Google token revoke",
+             lambda: system.revoke_google_token(json.loads(creds.read_text())["refresh_token"]))
+    for verb in ("stop", "disable"):
+        step(f"systemctl {verb} {unit}", lambda v=verb: system.systemctl(v, unit))
+    step("gateway uninstall", lambda: system.hermes(name, "gateway", "uninstall"))
+    # the unit lingers as "not-found failed" after uninstall
+    step(f"systemctl reset-failed {unit}", lambda: system.systemctl("reset-failed", unit))
+    # the root-run sandbox leaves root-owned files that block the delete
+    step(f"reclaim {pdir}", lambda: system.reclaim(pdir))
+    step("profile delete", lambda: system.hermes(name, "profile", "delete", "-y", name))
     if pdir.exists():
-        system.remove_tree(pdir)
-    print(f"Removed {f.name}.")
+        step(f"removing {pdir}", lambda: system.remove_tree(pdir))
+    caddy_file = Path(caddy_dir) / f"{name}.caddy"
+    if caddy_file.exists():
+        step("removing the Caddy file", lambda: system.remove_tree(caddy_file))
+    step("caddy reload", system.caddy_reload)
+    print(f"Removed {name}." if not pdir.exists() else f"{name}: profile still present.")
     print("delete the bot in BotFather (@BotFather → /deletebot)")
+    if warned or pdir.exists():
+        print("remove finished with warnings; check the lines above")
+        return 1
     return 0
 
 

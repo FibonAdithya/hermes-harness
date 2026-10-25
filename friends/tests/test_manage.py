@@ -118,10 +118,16 @@ def test_cap_raise_then_cap_stop_notifies_friend_again(hermes_root):
 
 
 def test_cap_unknown_friend_no_calls(hermes_root):
+    victim = hermes_root / "profiles" / ".." / ".." / "victim"
+    victim.mkdir(parents=True, exist_ok=True)
+    Friend(name="victim", telegram_id=1, email="v@example.com", tz="Europe/London", port=8102,
+           cap_usd=1.0, activated=True).save(victim)
     fake = FakeSystem(hermes_root)
+    assert run(hermes_root, fake, "cap", "../../victim", "7") != 0
     assert run(hermes_root, fake, "cap", "../x", "1") != 0
     assert run(hermes_root, fake, "cap", "nobody", "1") != 0
     assert fake.calls == []
+    assert Friend.load(victim).cap_usd == 1.0
 
 
 # ---- resume ----
@@ -207,15 +213,15 @@ def test_remove_order_and_commands(hermes_root, tmp_path):
     i = fake.index
     assert (i("systemctl", "stop", UNIT) < i("systemctl", "disable", UNIT)
             < i("hermes", "alice", "gateway", "uninstall")
-            < i("remove_tree", caddy / "alice.caddy") < i("caddy_reload")
-            < i("hermes", "alice", "profile", "delete", "-y", "alice"))
+            < i("hermes", "alice", "profile", "delete", "-y", "alice")
+            < i("remove_tree", caddy / "alice.caddy") < i("caddy_reload"))
 
 
 def test_remove_continues_when_revoke_fails(hermes_root, tmp_path, capsys):
     p, caddy = setup_remove(hermes_root, tmp_path)
     fake = FakeSystem(hermes_root)
     fake.fail_on = [("revoke_google_token",)]
-    assert run(hermes_root, fake, "remove", "alice", caddy=caddy) == 0
+    assert run(hermes_root, fake, "remove", "alice", caddy=caddy) == 1
     assert not p.exists()
     cap = capsys.readouterr()
     assert "revoke" in (cap.out + cap.err).lower() and "injected failure" in (cap.out + cap.err)
@@ -233,7 +239,7 @@ def test_remove_tolerates_stop_disable_failure(hermes_root, tmp_path):
     p, caddy = setup_remove(hermes_root, tmp_path)
     fake = FakeSystem(hermes_root)
     fake.fail_on = [("systemctl", "stop"), ("systemctl", "disable")]
-    assert run(hermes_root, fake, "remove", "alice", caddy=caddy) == 0
+    assert run(hermes_root, fake, "remove", "alice", caddy=caddy) == 1
     assert ("hermes", "alice", "gateway", "uninstall") in fake.calls
     assert not p.exists()
 
@@ -253,7 +259,7 @@ def test_remove_profile_delete_failure_falls_back(hermes_root, tmp_path):
     p, caddy = setup_remove(hermes_root, tmp_path)
     fake = FakeSystem(hermes_root)
     fake.fail_on = [("hermes", "alice", "profile", "delete")]
-    assert run(hermes_root, fake, "remove", "alice", caddy=caddy) == 0
+    assert run(hermes_root, fake, "remove", "alice", caddy=caddy) == 1
     assert not p.exists()
     assert ("remove_tree", p) in fake.calls
 
@@ -307,6 +313,27 @@ def test_list_shows_estimate_label(hermes_root, capsys):
                                 "ESTIMATE"]
 
 
+def test_list_signed_in_needs_the_friends_own_creds_file(hermes_root, capsys):
+    b = mk(hermes_root, "bob")
+    (b / "google-credentials").mkdir()
+    (b / "google-credentials" / "other@example.com.json").write_text("{}")
+    assert run(hermes_root, FakeSystem(hermes_root), "list") == 0
+    assert "signed-in no" in capsys.readouterr().out
+
+
+def test_list_one_bad_friend_does_not_drop_the_rest(hermes_root, capsys):
+    mk(hermes_root, "alice")
+    bad = mk(hermes_root, "bad")
+    (bad / "friend.json").write_text("{not json")
+    mk(hermes_root, "carol")
+    assert run(hermes_root, FakeSystem(hermes_root), "list") == 1
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 3
+    assert lines[0].startswith("alice  ") and lines[0].endswith("ESTIMATE")
+    assert lines[1].startswith("bad  error: ")
+    assert lines[2].startswith("carol  ") and lines[2].endswith("ESTIMATE")
+
+
 def test_list_no_friends(hermes_root, capsys):
     assert run(hermes_root, FakeSystem(hermes_root), "list") == 0
     assert capsys.readouterr().out.strip() == "no friends"
@@ -327,7 +354,56 @@ def test_remove_continues_when_reclaim_or_reset_failed_fail(hermes_root, tmp_pat
     p, caddy = setup_remove(hermes_root, tmp_path)
     fake = FakeSystem(hermes_root)
     fake.fail_on = [("reclaim",), ("systemctl", "reset-failed")]
-    assert run(hermes_root, fake, "remove", "alice", caddy=caddy) == 0
+    assert run(hermes_root, fake, "remove", "alice", caddy=caddy) == 1
     assert not p.exists()
     err = capsys.readouterr().err
     assert "reclaim" in err and "reset-failed" in err
+
+
+def test_remove_caddy_reload_failure_still_deletes(hermes_root, tmp_path, capsys):
+    p, caddy = setup_remove(hermes_root, tmp_path)
+    fake = FakeSystem(hermes_root)
+    fake.fail_on = [("caddy_reload",)]
+    assert run(hermes_root, fake, "remove", "alice", caddy=caddy) == 1
+    assert not p.exists() and not (caddy / "alice.caddy").exists()
+    cap = capsys.readouterr()
+    assert "caddy" in cap.err.lower()
+    assert "remove finished with warnings; check the lines above" in cap.out
+
+
+def test_remove_rerun_without_caddy_file_and_failing_uninstall(hermes_root, tmp_path):
+    p, caddy = setup_remove(hermes_root, tmp_path)
+    (caddy / "alice.caddy").unlink()
+    fake = FakeSystem(hermes_root)
+    fake.fail_on = [("hermes", "alice", "gateway", "uninstall")]
+    assert run(hermes_root, fake, "remove", "alice", caddy=caddy) == 1
+    assert not p.exists()
+
+
+def test_remove_clean_run_has_no_warning_line(hermes_root, tmp_path, capsys):
+    p, caddy = setup_remove(hermes_root, tmp_path)
+    assert run(hermes_root, FakeSystem(hermes_root), "remove", "alice", caddy=caddy) == 0
+    assert "warnings" not in capsys.readouterr().out
+
+
+def test_remove_corrupt_friend_json_still_deletes(hermes_root, tmp_path):
+    p, caddy = setup_remove(hermes_root, tmp_path)
+    (p / "friend.json").write_text("{not json")
+    (p / "google-credentials" / "oauth_states.json").write_text("{}")
+    fake = FakeSystem(hermes_root)
+    assert run(hermes_root, fake, "remove", "alice", caddy=caddy) == 1
+    assert not p.exists() and not (caddy / "alice.caddy").exists()
+    assert ("revoke_google_token", "RT-1") in fake.calls  # the single non-state creds file
+
+
+def test_resume_refuses_unactivated_friend(hermes_root, capsys):
+    p = mk(hermes_root)
+    f = Friend.load(p)
+    f.activated = False
+    f.save(p)
+    prior(p, MONTH, stopped_by_cap=True)
+    fake = FakeSystem(hermes_root)
+    assert run(hermes_root, fake, "resume", "alice") == 2
+    assert fake.calls == []
+    assert state(p)["stopped_by_cap"] is True
+    assert capsys.readouterr().err.count("\n") == 1
