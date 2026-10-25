@@ -1,0 +1,41 @@
+import re
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+_NAME = re.compile(r"[a-z][a-z0-9]{0,30}")
+_TOKEN = re.compile(r"\d{6,}:[A-Za-z0-9_-]{30,}")
+
+
+def validate_name(s: str) -> str:
+    if s == "default":
+        raise ValueError("name 'default' is reserved")
+    if not _NAME.fullmatch(s):
+        raise ValueError("name must be lowercase letters and digits, starting with a letter")
+    return s
+
+
+def validate_telegram_id(s: str) -> int:
+    if not re.fullmatch(r"[0-9]+", s) or int(s) <= 0:
+        raise ValueError("telegram id must be a positive integer")
+    return int(s)
+
+
+def validate_tz(s: str) -> str:
+    try:
+        ZoneInfo(s)
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        raise ValueError(f"unknown timezone: {s!r}") from None
+    if not s:
+        raise ValueError("timezone is empty")
+    return s
+
+
+def validate_email(s: str) -> str:
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+", s):
+        raise ValueError("email must look like name@host with no spaces")
+    return s
+
+
+def validate_bot_token(s: str) -> str:
+    if not _TOKEN.fullmatch(s):
+        raise ValueError("bot token must look like 123456:ABC... from BotFather")
+    return s
