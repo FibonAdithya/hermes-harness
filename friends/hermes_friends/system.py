@@ -34,6 +34,14 @@ class System:
     def systemctl(self, *args: str) -> None:
         self._run(["systemctl", "--user", *args])
 
+    def unit_active(self, unit: str) -> bool:
+        try:
+            r = subprocess.run(["systemctl", "--user", "is-active", "--quiet", unit],
+                               check=False, capture_output=True, timeout=30)
+            return r.returncode == 0
+        except Exception:
+            return False
+
     def mem_available_mb(self) -> int:
         for line in Path("/proc/meminfo").read_text().splitlines():
             if line.startswith("MemAvailable:"):

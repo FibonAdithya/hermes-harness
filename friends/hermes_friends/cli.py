@@ -145,7 +145,7 @@ def _apply_actions(system, f: Friend, chat_id: int, actions: list[str],
         system.send(None, chat_id, f"friends: {f.name} {event} {tail}")
 
     if "new_month" in actions:
-        carried = old_st.stopped_by_cap and "stop_cap" in actions
+        carried = (old_st.stopped_by_cap or old_st.notified_cap) and "stop_cap" in actions
         if ((old_st.stopped_by_cap or old_st.notified_cap)
                 and not old_st.stopped_by_runaway and not carried):
             system.systemctl("enable", unit)
@@ -227,6 +227,103 @@ def cmd_spend_check(system, root: Path, now: datetime) -> int:
     return failed
 
 
+def cmd_list(system, root: Path, now: datetime) -> int:
+    friends = list_friends(root)
+    if not friends:
+        print("no friends")
+        return 0
+    start = spendmod.month_start(now)
+    for f in friends:
+        pdir = profile_dir(root, f.name)
+        total = spendmod.month_spend(pdir / "state.db", start).total_usd
+        active = "active" if system.unit_active(gateway_unit(f.name)) else "inactive"
+        signed = "yes" if (pdir / "google-credentials" / f"{f.email}.json").is_file() else "no"
+        print(f"{f.name}  {active}  signed-in {signed}  ${total:.2f} of ${f.cap_usd:.2f} ESTIMATE")
+    return 0
+
+
+def _save_friend(system, pdir: Path, f: Friend) -> None:
+    system.write_file(pdir / "friend.json", json.dumps(asdict(f), indent=2) + "\n", 0o600)
+
+
+def _start(system, name: str) -> None:
+    unit = gateway_unit(name)
+    system.systemctl("enable", unit)
+    system.systemctl("start", unit)
+
+
+def cmd_cap(a, system, root: Path, now: datetime) -> int:
+    pdir = _friend_dir(root, a.name)
+    if not math.isfinite(a.usd) or a.usd < 0:
+        _err("cap must be a finite number, 0 or more")
+        return 2
+    f = Friend.load(pdir)
+    f.cap_usd = a.usd
+    _save_friend(system, pdir, f)
+    st = spendmod.SpendState.load(pdir, now)
+    if st.month != spendmod.month_key(now):
+        # Stale state: the next spend-check starts the new month and decides the restart.
+        print(f"{f.name} cap set to ${a.usd:.2f}.")
+        return 0
+    total = spendmod.month_spend(pdir / "state.db", spendmod.month_start(now)).total_usd
+    restart = (st.stopped_by_cap or st.notified_cap) and round(a.usd, 6) > round(total, 6)
+    if restart:
+        st.clear_cap()
+        st.save(pdir, system)
+        if not st.stopped_by_runaway:
+            _start(system, f.name)
+        else:
+            print(f"{f.name} stays paused: runaway hold; use `resume`.")
+    print(f"{f.name} cap set to ${a.usd:.2f}.")
+    return 0
+
+
+def cmd_resume(a, system, root: Path, now: datetime) -> int:
+    pdir = _friend_dir(root, a.name)
+    st = spendmod.SpendState.load(pdir, now)
+    st.clear_runaway()
+    st.clear_cap()
+    st.save(pdir, system)
+    _start(system, a.name)
+    print(f"Resumed {a.name}.")
+    return 0
+
+
+def _warn(msg: str) -> None:
+    print(f"warning: {msg}", file=sys.stderr)
+
+
+def cmd_remove(a, system, root: Path, caddy_dir: Path) -> int:
+    pdir = _friend_dir(root, a.name)
+    f = Friend.load(pdir)
+    unit = gateway_unit(f.name)
+    creds = pdir / "google-credentials" / f"{f.email}.json"
+    if creds.is_file():  # revoke first: the profile delete destroys the token
+        try:
+            system.revoke_google_token(json.loads(creds.read_text())["refresh_token"])
+        except Exception as e:
+            _warn(f"Google token revoke failed: {' '.join(str(e).split()) or type(e).__name__}")
+    for verb in ("stop", "disable"):
+        try:
+            system.systemctl(verb, unit)
+        except Exception as e:
+            _warn(f"systemctl {verb} {unit} failed: {' '.join(str(e).split())}")
+    system.hermes(f.name, "gateway", "uninstall")
+    caddy_file = Path(caddy_dir) / f"{f.name}.caddy"
+    if caddy_file.exists():
+        system.remove_tree(caddy_file)
+    system.caddy_reload()
+    try:
+        system.hermes(f.name, "profile", "delete", "-y", f.name)
+    except Exception as e:
+        _warn(f"profile delete failed: {' '.join(str(e).split())}; removing the directory")
+    if pdir.exists():
+        system.remove_tree(pdir)
+    print(f"Removed {f.name}.")
+    print("delete the bot in BotFather (@BotFather → /deletebot)")
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="friends")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -240,6 +337,14 @@ def _parser() -> argparse.ArgumentParser:
     act = sub.add_parser("activate")
     act.add_argument("name")
     sub.add_parser("spend-check")
+    sub.add_parser("list")
+    cap = sub.add_parser("cap")
+    cap.add_argument("name")
+    cap.add_argument("usd", type=float)
+    res = sub.add_parser("resume")
+    res.add_argument("name")
+    rem = sub.add_parser("remove")
+    rem.add_argument("name")
     return p
 
 
@@ -260,6 +365,14 @@ def main(argv: list[str] | None = None, system: System | None = None,
             return cmd_activate(a, system, root)
         if a.cmd == "spend-check":
             return cmd_spend_check(system, root, now)
+        if a.cmd == "list":
+            return cmd_list(system, root, now)
+        if a.cmd == "cap":
+            return cmd_cap(a, system, root, now)
+        if a.cmd == "resume":
+            return cmd_resume(a, system, root, now)
+        if a.cmd == "remove":
+            return cmd_remove(a, system, root, Path(caddy_dir) if caddy_dir else DEFAULT_CADDY_DIR)
     except Refused as e:
         _err(str(e))
         return e.code

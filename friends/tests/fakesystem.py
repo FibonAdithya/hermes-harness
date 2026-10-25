@@ -12,6 +12,7 @@ class FakeSystem:
         self.mem_mb = 4096
         self.fail_on: list[tuple] = []  # call-tuple prefixes that raise
         self.send_ok = True
+        self.active: set[str] = set()  # units reported active; not a recorded call
 
     def _rec(self, *call):
         self.calls.append(call)
@@ -34,6 +35,9 @@ class FakeSystem:
 
     def systemctl(self, *args):
         self._rec("systemctl", *args)
+
+    def unit_active(self, unit):
+        return unit in self.active
 
     def mem_available_mb(self):
         return self.mem_mb
