@@ -1,6 +1,7 @@
 """friends command line. All side effects go through the System object."""
 import argparse
 import json
+import math
 import sys
 from dataclasses import asdict
 from datetime import datetime
@@ -17,7 +18,9 @@ from .system import OWNER_ROOT, System
 
 
 class Refused(Exception):
-    pass
+    def __init__(self, msg: str, code: int = 1):
+        super().__init__(msg)
+        self.code = code
 
 
 def _err(msg: str) -> None:
@@ -49,9 +52,9 @@ def cmd_add(a, system, root: Path, caddy_dir: Path) -> int:
         tid = validate.validate_telegram_id(a.telegram_id)
         token = validate.validate_bot_token(a.bot_token)
         tz = validate.validate_tz(a.tz)
-        email = validate.validate_email(a.email)
-        if a.cap <= 0:
-            raise ValueError("cap must be positive")
+        email = validate.validate_email(a.email).lower()
+        if not math.isfinite(a.cap) or a.cap <= 0:
+            raise ValueError("cap must be a positive finite number")
         owner = read_owner_env(root)
     except ValueError as e:
         _err(str(e))
@@ -75,13 +78,13 @@ def cmd_add(a, system, root: Path, caddy_dir: Path) -> int:
     caddy_file = Path(caddy_dir) / f"{name}.caddy"
     undo: list = []  # run in reverse on failure
     try:
-        system.hermes(name, "profile", "create", name, "--no-alias", "--no-skills")
         undo.append(lambda: pdir.exists() and system.remove_tree(pdir))
+        system.hermes(name, "profile", "create", name, "--no-alias", "--no-skills")
         undo.append(lambda: system.hermes(name, "profile", "delete", "-y", name))
         system.chmod(pdir, 0o700)
         _write_profile_files(system, pdir, f, token, owner)
-        system.write_file(caddy_file, render.render_caddy(f), CADDY_FILE_MODE)
         undo.append(_undo_caddy(system, caddy_file))
+        system.write_file(caddy_file, render.render_caddy(f), CADDY_FILE_MODE)
         system.caddy_reload()
         undo.append(lambda: system.hermes(name, "gateway", "uninstall"))
         system.hermes(name, "gateway", "install", "--start-now", "--start-on-login")
@@ -101,11 +104,20 @@ def cmd_add(a, system, root: Path, caddy_dir: Path) -> int:
     return 0
 
 
-def cmd_activate(a, system, root: Path) -> int:
-    pdir = profile_dir(root, a.name)
+def _friend_dir(root: Path, name: str) -> Path:
+    """Validated profile dir of an existing friend; raises Refused otherwise."""
+    try:
+        validate.validate_name(name)
+    except ValueError as e:
+        raise Refused(str(e), 2) from None
+    pdir = profile_dir(root, name)
     if not (pdir / "friend.json").is_file():
-        _err(f"no such friend: {a.name}")
-        return 1
+        raise Refused(f"no such friend: {name}", 1)
+    return pdir
+
+
+def cmd_activate(a, system, root: Path) -> int:
+    pdir = _friend_dir(root, a.name)
     f = Friend.load(pdir)
     creds = pdir / "google-credentials" / f"{f.email}.json"
     if not creds.is_file():
@@ -143,8 +155,15 @@ def main(argv: list[str] | None = None, system: System | None = None,
     except SystemExit as e:
         return int(e.code) if isinstance(e.code, int) else 2
     system = system or System(root)
-    if a.cmd == "add":
-        return cmd_add(a, system, root, Path(caddy_dir) if caddy_dir else DEFAULT_CADDY_DIR)
-    if a.cmd == "activate":
-        return cmd_activate(a, system, root)
+    try:
+        if a.cmd == "add":
+            return cmd_add(a, system, root, Path(caddy_dir) if caddy_dir else DEFAULT_CADDY_DIR)
+        if a.cmd == "activate":
+            return cmd_activate(a, system, root)
+    except Refused as e:
+        _err(str(e))
+        return e.code
+    except Exception as e:
+        _err(" ".join(str(e).split()) or type(e).__name__)
+        return 1
     return 2

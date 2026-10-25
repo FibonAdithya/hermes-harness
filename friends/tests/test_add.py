@@ -37,7 +37,9 @@ def test_add_happy_path_call_order(env, capsys):
     assert run_add(env) == 0
     create = fake.index("hermes", "alice", "profile", "create", "alice", "--no-alias", "--no-skills")
     first_write = fake.index("write_file")
+    caddy_write = fake.index("write_file", caddy / "alice.caddy", CADDY_FILE_MODE)
     reload_ = fake.index("caddy_reload")
+    assert caddy_write < reload_
     install = fake.index("hermes", "alice", "gateway", "install", "--start-now", "--start-on-login")
     assert create < first_write < reload_ < install
     assert all(c[1] == "alice" for c in fake.calls if c[0] == "hermes")
@@ -182,3 +184,47 @@ def test_second_friend_gets_distinct_port(env):
 def test_no_unlabelled_dollar_in_output(env, capsys):
     run_add(env)
     assert "$" not in capsys.readouterr().out
+
+
+def test_add_lowercases_email(env):
+    root, _, _ = env
+    assert run_add(env, email="Alice@Example.com") == 0
+    assert json.loads((root / "profiles" / "alice" / "friend.json").read_text())["email"] \
+        == "alice@example.com"
+
+
+@pytest.mark.parametrize("cap", ["nan", "inf", "-inf", "0"])
+def test_add_rejects_bad_cap(env, cap):
+    _, fake, _ = env
+    assert run_add(env, extra=("--cap", cap)) != 0
+    assert fake.calls == []
+
+
+def test_add_cleans_partial_dir_when_create_fails(env):
+    root, fake, _ = env
+    orig = fake.hermes
+
+    def partial(name, *args):
+        if args[:2] == ("profile", "create"):
+            (root / "profiles" / name).mkdir()
+            raise RuntimeError("boom")
+        return orig(name, *args)
+
+    fake.hermes = partial
+    assert run_add(env) != 0
+    assert not (root / "profiles" / "alice").exists()
+
+
+def test_caddy_write_failure_still_cleans_up(env):
+    root, fake, caddy = env
+    caddy.mkdir()
+    orig = fake.write_file
+
+    def w(path, data, mode):
+        orig(path, data, mode)
+        if str(path).endswith(".caddy"):
+            raise RuntimeError("disk")
+
+    fake.write_file = w
+    assert run_add(env) != 0
+    assert not (caddy / "alice.caddy").exists()

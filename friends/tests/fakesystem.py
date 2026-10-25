@@ -68,6 +68,7 @@ class FakeSystem:
 
     # helpers for assertions
     def index(self, *prefix):
+        prefix = tuple(prefix)
         for i, c in enumerate(self.calls):
             if c[: len(prefix)] == prefix:
                 return i

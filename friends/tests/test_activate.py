@@ -48,3 +48,36 @@ def test_activate_switches_tools(hermes_root, tmp_path):
     assert "start_google_auth" not in (p / "memories" / "MEMORY.md").read_text()
     assert ("systemctl", "restart", gateway_unit("alice")) in fake.calls
     assert oct(p.joinpath("config.yaml").stat().st_mode & 0o777) == oct(0o600)
+
+
+def test_activate_rejects_path_traversal(hermes_root):
+    fake = FakeSystem(hermes_root)
+    (hermes_root / "x").mkdir()
+    (hermes_root / "x" / "friend.json").write_text(json.dumps(dict(
+        name="x", telegram_id=1, email="x@e.com", tz="UTC", port=8101, cap_usd=5.0, activated=False)))
+    (hermes_root / "x" / "google-credentials").mkdir()
+    (hermes_root / "x" / "google-credentials" / "x@e.com.json").write_text("{}")
+    assert main(["activate", "../x"], system=fake, root=hermes_root, now=NOW) != 0
+    assert fake.calls == []
+
+
+def test_activate_failure_is_one_error_line(hermes_root, tmp_path, capsys):
+    fake, p = setup(hermes_root, tmp_path)
+    (p / "google-credentials").mkdir()
+    (p / "google-credentials" / "alice@example.com.json").write_text("{}")
+    fake.fail_on.append(("systemctl", "restart"))
+    capsys.readouterr()
+    assert main(["activate", "alice"], system=fake, root=hermes_root, now=NOW) == 1
+    err = capsys.readouterr().err
+    assert err.count("error:") == 1 and "Traceback" not in err and len(err.strip().splitlines()) == 1
+
+
+def test_mixed_case_email_activates(hermes_root, tmp_path):
+    fake = FakeSystem(hermes_root)
+    argv = ["add", "alice", "--telegram-id", "4242", "--bot-token", TOKEN,
+            "--tz", "Europe/London", "--email", "Alice@Example.com"]
+    assert main(argv, system=fake, root=hermes_root, caddy_dir=tmp_path / "caddy", now=NOW) == 0
+    p = hermes_root / "profiles" / "alice"
+    (p / "google-credentials").mkdir()
+    (p / "google-credentials" / "alice@example.com.json").write_text("{}")
+    assert main(["activate", "alice"], system=fake, root=hermes_root, now=NOW) == 0
