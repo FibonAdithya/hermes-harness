@@ -1,5 +1,6 @@
 """Command line entry point. Each subcommand registers itself in `_COMMANDS`."""
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -66,7 +67,52 @@ def _add_worklist(sub) -> None:
     p.set_defaults(func=_cmd_worklist, needs_config=False)
 
 
-_COMMANDS = [_add_mcp, _add_export_public, _add_worklist]
+def _cmd_session_end(args, cfg) -> int:
+    from . import extract
+
+    try:
+        text = sys.stdin.read()
+    except Exception:
+        text = ""
+    extract.session_end(text, os.environ, cfg)
+    return 0  # the hook must never fail a session exit
+
+
+def _add_session_end(sub) -> None:
+    p = sub.add_parser("session-end", help="SessionEnd hook: condense, queue and spawn the extractor")
+    p.set_defaults(func=_cmd_session_end)
+
+
+def _cmd_drain(args, cfg) -> int:
+    from . import extract
+
+    for session, ok in extract.drain(cfg, limit=args.limit):
+        print(f"{session}: {'ok' if ok else 'failed'}")
+    return 0
+
+
+def _add_drain(sub) -> None:
+    p = sub.add_parser("drain", help="run the extractor over queued sessions, newest first")
+    p.add_argument("--limit", type=int, default=4)
+    p.set_defaults(func=_cmd_drain)
+
+
+def _cmd_extract_dir(args, cfg) -> int:
+    from . import extract
+
+    ok = extract.extract_dir(cfg, Path(args.projects).expanduser(), args.session)
+    print("extracted" if ok else "not extracted")
+    return 0 if ok else 1
+
+
+def _add_extract_dir(sub) -> None:
+    p = sub.add_parser("extract-dir", help="extract notes from the newest transcript under a projects dir")
+    p.add_argument("--projects", required=True)
+    p.add_argument("--session", required=True)
+    p.set_defaults(func=_cmd_extract_dir)
+
+
+_COMMANDS = [_add_mcp, _add_export_public, _add_worklist, _add_session_end, _add_drain, _add_extract_dir]
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -1,0 +1,16 @@
+{"type": "user", "message": {"role": "user", "content": "How do I configure the widget service?"}}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "SECRET-THOUGHT"}, {"type": "text", "text": "Check the config file first."}, {"type": "tool_use", "name": "Bash", "input": {"command": "cat widget.toml\nsecond line"}}]}}
+{"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "TOOL-OUTPUT-ONE"}]}}
+{"type": "user", "message": {"role": "user", "content": "<command-name>/clear</command-name>"}}
+{"type": "user", "message": {"role": "user", "content": "Meta caveat text"}, "isMeta": true}
+{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "It uses port 9000, please note that."}]}}
+this line is not json
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Noted, port 9000."}]}}
+{"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t2", "content": "TOOL-OUTPUT-TWO"}, {"type": "text", "text": "ignored mixed"}]}}
+{"type": "user", "message": {"role": "user", "content": "Why did the deploy fail last time?"}}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "Read", "input": {"file_path": "/x/y.log"}}]}}
+{"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t3", "content": "TOOL-OUTPUT-THREE"}]}}
+{"type": "system", "content": "system noise"}
+{"type": "user", "message": {"role": "user", "content": "Then fix it and record the cause."}}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Fixed: the port was wrong."}]}}
+{"type": "user", "message": {"role": "user", "content": "Thanks, that is all."}}

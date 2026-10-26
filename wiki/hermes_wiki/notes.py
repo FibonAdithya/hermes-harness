@@ -1,9 +1,11 @@
 """Build, validate and publish inbox notes."""
 import base64
+import os
 import re
 import secrets
 import subprocess
 from datetime import date
+from pathlib import Path
 
 from .config import WikiConfig
 from .frontmatter import dump
@@ -29,7 +31,13 @@ def note_path(source: str, kind: str, created: date, rand: str) -> str:
     return f"inbox/{source}/{created:%Y-%m-%d}-{kind}-{rand}.md"
 
 
-def publish(repo: str, path: str, content: str, run=subprocess.run, gh: str = "gh") -> None:
+def publish(repo: str, path: str, content: str, run=subprocess.run, gh: str = "gh",
+            dry_dir: Path | None = None) -> None:
+    if dry_dir is not None and os.environ.get("HERMES_WIKI_DRY_PUBLISH") == "1":
+        target = Path(dry_dir) / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return
     encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
     argv = [
         gh, "api", "-X", "PUT", f"repos/{repo}/contents/{path}",
@@ -93,7 +101,7 @@ def add_note(
     path = note_path(cfg.source, kind, created, rand)
     content = dump(meta, body)
     if publisher is publish:
-        publisher(cfg.repo, path, content, gh=cfg.gh)
+        publisher(cfg.repo, path, content, gh=cfg.gh, dry_dir=cfg.state_dir / "dry")
     else:
         publisher(cfg.repo, path, content)
     return path
