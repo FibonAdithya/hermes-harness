@@ -9,7 +9,7 @@ from pathlib import Path
 
 from . import notes
 from .config import WikiConfig
-from .schema import NOTE_WORD_CAP
+from .schema import NOTE_CHAR_CAP, NOTE_WORD_CAP
 
 IMPORT_SOURCE = "import-claude-memory"
 _KINDS = {"user": "person", "feedback": "decision", "project": "status", "reference": "fact"}
@@ -46,6 +46,24 @@ def _truncate(text: str, cap: int) -> str:
     if len(words) <= cap:
         return text
     return text[: words[cap - 2].end()] + " [truncated]"  # the marker is one word inside the cap
+
+
+_MARK = " [truncated]"
+
+
+def _truncate_chars(text: str, cap: int) -> str:
+    """Cut text to at most cap characters, marker included, at the last whitespace that fits.
+
+    When that whitespace would drop more than half the room (one very long token, such as a
+    path or URL), the cut goes inside the token instead.
+    """
+    if len(text) <= cap:
+        return text
+    room = cap - len(_MARK)
+    head = text[: room + 1]  # a whitespace character right at the limit is a valid cut point
+    cut = max((m.start() for m in re.finditer(r"\s", head)), default=-1)
+    kept = text[:cut].rstrip() if cut > room // 2 else ""
+    return (kept or text[:room]) + _MARK
 
 
 def validate_only(cfg: WikiConfig, **kw) -> str:
@@ -98,6 +116,7 @@ def import_claude_memory(projects: Path, cfg: WikiConfig, add=notes.add_note,
                 text = raw.decode("utf-8")
                 body = _truncate(f"Imported from Claude Code project {pdir.name}.\n\n" + _split(text)[1].strip(),
                                  NOTE_WORD_CAP)
+                body = _truncate_chars(body, NOTE_CHAR_CAP)
                 kw = dict(kind=memory_kind(text), body=body, tags=[], repos=[], verified="claim",
                           session=f"import:{pdir.name}"[:80])
                 if today is not None:

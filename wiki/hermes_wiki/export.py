@@ -5,13 +5,13 @@ import shutil
 from pathlib import Path
 
 from .pages import iter_pages, links, resolve
-from .schema import is_private
+from .schema import is_private, load_tags
 
 _LINK = re.compile(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]")
 _HEAD_FILE = ".source-head"
 # Written next to the head: bump it whenever the privacy filter changes, so an export made by
 # the old filter is rebuilt even when the wiki's HEAD has not moved.
-FILTER_VERSION = "filter-v2"
+FILTER_VERSION = "filter-v3"
 
 
 def _strip_links(text: str, visible) -> str:
@@ -56,7 +56,10 @@ def export_public(src: Path, dest: Path, head: str, now: float, keep_seconds: in
         pass
 
     pages = iter_pages(src)
-    exported = [p for p in pages if not p.infra and not is_private(p.meta)]
+    # Tags must come from TAGS.md. A missing or empty TAGS.md gives an empty set, so every page
+    # with a non-empty tag list stays private (fail closed).
+    allowed = load_tags(src)
+    exported = [p for p in pages if not p.infra and not is_private(p.meta, allowed_tags=allowed)]
     visible_pages = exported + [p for p in pages if p.infra]
 
     def visible(target: str) -> bool:

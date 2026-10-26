@@ -260,3 +260,49 @@ def test_emitted_meta_lists_and_errors_are_capped(tmp_path):
     n = next(n for n in worklist.build(root, TODAY)["notes"] if n["path"].endswith("7a7b7c7d.md"))
     assert n["meta"]["tags"] == [f"t{i}" for i in range(20)] + ["[truncated: 100 items]"]
     assert len(n["invalid"]) == 21 and n["invalid"][-1].startswith("[truncated: ")
+
+
+def _lint_pages(tmp_path, pages):
+    root = make(tmp_path)
+    for name, text in pages.items():
+        (root / f"{name}.md").write_text(text)
+    with open(root / "index.md", "a") as f:
+        f.write("".join(f"- [[{n}]]\n" for n in pages))
+    return [(x["page"], x["problem"]) for x in worklist.build(root, TODAY)["lint"]]
+
+
+def test_lint_flags_missing_and_unknown_keys(tmp_path):
+    long_key = "k" * 60
+    problems = _lint_pages(tmp_path, {
+        "notype": "---\ntags: [ops]\n---\nx\n",
+        "notags": "---\ntype: topic\n---\nx\n",
+        "labels": "---\ntype: topic\ntags: [ops]\nlabels: [health]\n---\nx\n",
+        "longkey": f"---\ntype: topic\ntags: [ops]\n{long_key}: 1\n---\nx\n",
+        "fine": "---\ntype: topic\ntags: [ops]\nrepos: [a]\nupdated: 2026-10-01\nreview_by: 2027-01-01\n---\nx\n",
+    })
+    assert ("notype", "missing type") in problems
+    assert ("notags", "missing tags") in problems
+    assert ("labels", "unknown key: labels") in problems
+    assert ("longkey", "unknown key: " + "k" * 40) in problems
+    assert not [p for p in problems if p[0] == "fine"]
+
+
+def test_lint_flags_malformed_and_unknown_type(tmp_path):
+    problems = _lint_pages(tmp_path, {
+        "people": "---\ntype: people\ntags: [ops]\n---\nx\n",
+        "twowords": "---\ntype: how to\ntags: [ops]\n---\nx\n",
+        "caps": "---\ntype: Decision\ntags: [ops]\n---\nx\n",
+        "kelvin": "---\ntype: Kelvin\ntags: [ops]\n---\nx\n",
+        "longtype": "---\ntype: " + "z" * 60 + "\ntags: [ops]\n---\nx\n",
+    })
+    assert ("people", "unknown type: people") in problems
+    assert ("twowords", "malformed type") in problems
+    assert ("caps", "malformed type") in problems
+    assert ("kelvin", "malformed type") in problems
+    assert ("longtype", "unknown type: " + "z" * 40) in problems
+
+
+def test_lint_key_rules_skip_infra_and_unfrontmattered_pages(tmp_path):
+    problems = run(tmp_path)["lint"]
+    assert not [x for x in problems if x["problem"].startswith(("missing type", "missing tags", "unknown"))
+                and x["page"] in {"index", "TAGS", "CONVENTIONS", "delta", "nofm"}]

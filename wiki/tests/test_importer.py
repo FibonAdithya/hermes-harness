@@ -219,3 +219,56 @@ def test_install_hook_cli(tmp_path):
     s = tmp_path / "settings.json"
     assert cli.main(["install-hook", "--settings", str(s), "--command", "x session-end", "--config", str(conf)]) == 0
     assert "x session-end" in s.read_text()
+
+
+_PREFIX = "Imported from Claude Code project d.\n\n"
+
+
+def _import_bodies(tmp_path, cfg, text):
+    """Import one memory file through the real validation (publisher stubbed); return (body, result)."""
+    from hermes_wiki.notes import add_note
+    projects = tmp_path / "projects"
+    _mem(projects, "d", "a.md", f"---\ntype: user\n---\n{text}\n")
+    seen = []
+
+    def add(c, **kw):
+        seen.append(kw["body"])
+        return add_note(c, publisher=lambda *a, **k: None, **kw)
+
+    out = importer.import_claude_memory(projects, cfg, add=add, today=TODAY)
+    return seen[0], out[0][1]
+
+
+def test_import_body_at_char_cap_is_whole(tmp_path, cfg):
+    word = "x" * 49
+    n_words = (4000 - len(_PREFIX)) // 50
+    rest = 4000 - len(_PREFIX) - n_words * 50
+    text = " ".join([word] * n_words) + " " + "y" * rest
+    assert len(_PREFIX + text) == 4000
+    body, result = _import_bodies(tmp_path, cfg, text)
+    assert body == _PREFIX + text
+    assert result.startswith("inbox/import-claude-memory/")
+
+
+def test_import_body_over_char_cap_is_cut_at_a_word(tmp_path, cfg):
+    word = "x" * 49
+    n_words = (4000 - len(_PREFIX)) // 50
+    rest = 4000 - len(_PREFIX) - n_words * 50
+    text = " ".join([word] * n_words) + " " + "y" * (rest + 1)  # one character over the cap
+    assert len(_PREFIX + text) == 4001
+    body, result = _import_bodies(tmp_path, cfg, text)
+    assert len(body) <= 4000
+    assert body.endswith(" [truncated]")
+    kept = body[: -len(" [truncated]")]
+    assert (_PREFIX + text).startswith(kept)
+    assert kept.split()[-1] == word  # cut between words, not inside the last one
+    assert result.startswith("inbox/import-claude-memory/")
+
+
+def test_import_single_long_token_is_cut_and_imported(tmp_path, cfg):
+    text = "see /" + "seg/" * 1500
+    body, result = _import_bodies(tmp_path, cfg, text)
+    # Cut inside the token, keeping the full room, rather than dropping the token at its start.
+    assert len(body) == 4000 and body.endswith(" [truncated]")
+    assert (_PREFIX + text).startswith(body[: -len(" [truncated]")])
+    assert result.startswith("inbox/import-claude-memory/")

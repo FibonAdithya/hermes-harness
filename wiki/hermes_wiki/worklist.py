@@ -110,6 +110,26 @@ def _malformed_tags(page) -> bool:
     return not _CANON_TAGS.fullmatch(value)
 
 
+_KEY_MAX = 40
+_PLAIN = re.compile(r"[a-z0-9-]+")
+
+
+def _key_problems(meta: dict) -> list[str]:
+    """Frontmatter problems that make schema.is_private hide a page, so the curator repairs them."""
+    out = []
+    for key in ("type", "tags"):
+        if key not in meta:
+            out.append(f"missing {key}")
+    out.extend(f"unknown key: {k[:_KEY_MAX]}" for k in meta if k not in schema.PAGE_KEYS)
+    if "type" in meta:
+        typ = meta["type"]
+        if not isinstance(typ, str) or not typ.isascii() or not _PLAIN.fullmatch(typ):
+            out.append("malformed type")
+        elif typ not in schema.PAGE_TYPES:
+            out.append(f"unknown type: {typ[:_KEY_MAX]}")
+    return out
+
+
 def _lint(all_pages, tags: set[str]) -> list[dict]:
     out = []
     by_name = {p.name: p for p in all_pages}
@@ -123,6 +143,8 @@ def _lint(all_pages, tags: set[str]) -> list[dict]:
             else:
                 indexed.add(hit.name)
     for p in all_pages:
+        if p.meta is not None and not p.infra:
+            out.extend({"page": p.name, "problem": prob} for prob in _key_problems(p.meta))
         if p.meta is not None and "tags" in p.meta:
             if _malformed_tags(p):
                 out.append({"page": p.name, "problem": "malformed tags"})

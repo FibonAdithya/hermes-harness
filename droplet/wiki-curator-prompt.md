@@ -39,6 +39,7 @@ Never record secrets: no passwords, API keys, tokens, card numbers or one-time c
 
 - Keep each page's markdown structure: headings, lists, tables and `[[links]]` stay as they are unless you are deliberately changing them.
 - Write frontmatter in exactly the format `CONVENTIONS.md` shows: a `---` line, one `key: value` per line, lists as `key: [a, b]`, quote a value that contains `:` or `#`, then a closing `---` line. No other YAML forms.
+- Pages need exactly the keys `type` and `tags`, plus optionally `repos`, `updated` and `review_by`; a page missing a key or using any other key is hidden from the coding box until repaired.
 - `type` is one of `person`, `project`, `org`, `commitment`, `topic`, `how-to`, `decision`, `log`. Every tag must be listed in `TAGS.md`. Set `updated` to today's date (YYYY-MM-DD; `date +%F` prints it) on every page you change.
 - `index.md`, `CONVENTIONS.md` and `TAGS.md` are infrastructure: they get no frontmatter and no size limit.
 - Never file a note into `index.md`, `CONVENTIONS.md` or `TAGS.md`. Change `TAGS.md` only through `tag_proposals`, `index.md` only to keep its entries correct, and `CONVENTIONS.md` never.

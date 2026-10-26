@@ -23,7 +23,7 @@ def test_is_private():
     assert schema.is_private({"type": "person"}) is True
     assert schema.is_private({"type": "topic", "tags": ["investing"]}) is True
     assert schema.is_private({"type": "topic", "tags": ["hermes"]}) is False
-    assert schema.is_private({"type": "topic"}) is False
+    assert schema.is_private({"type": "topic"}) is True  # wave 2: missing tags key fails closed
 
 
 def test_validate_note_accepts_a_good_note():
@@ -210,3 +210,100 @@ def test_meta_list_item_cap_boundary():
     assert schema.validate_note(good(suggest_tags=["a" * 500]), BODY, {"hermes"}) == []
     errors = schema.validate_note(good(suggest_tags=["a" * 501]), BODY, {"hermes"})
     assert errors and all(e.startswith("suggest_tags:") for e in errors)
+
+
+# Wave 2: fail closed on missing keys, unknown keys, unknown types, non-ASCII, and tags not in TAGS.md.
+# The reviewer MEASURED every one of these as public and exported at e6f749f.
+WRONG_KEY_FRONTMATTER = {
+    "tag-singular": "type: topic\ntag: finance\n",
+    "tag-singular-list": "type: topic\ntag: [finance]\n",
+    "labels": "type: topic\nlabels: [health]\n",
+    "categories": "type: topic\ncategories: [finance]\n",
+    "keywords": "type: topic\nkeywords: [people]\n",
+    "kind-person": "kind: person\ntags: [hermes]\n",
+    "page-type-person": "page_type: person\n",
+    "private-true": "type: topic\nprivate: true\n",
+    "extra-key-with-tags": "type: topic\ntags: [hermes]\nlabels: [health]\n",
+}
+# Different words for private things; private once tags must come from TAGS.md or type from PAGE_TYPES.
+DIFFERENT_WORD_FRONTMATTER = {
+    "tag-finances": "type: topic\ntags: [finances]\n",
+    "tag-money": "type: topic\ntags: [money]\n",
+    "tag-medical": "type: topic\ntags: [medical]\n",
+    "tag-person": "type: topic\ntags: [person]\n",
+    "type-people": "type: people\ntags: [hermes]\n",
+}
+WAVE2_TAGS = {"hermes", "cost", "ops", "people"}  # what a real TAGS.md holds; no synonyms of private tags
+
+
+@pytest.mark.parametrize("name", sorted(WRONG_KEY_FRONTMATTER))
+def test_wrong_key_spellings_are_private(name):
+    meta, _ = frontmatter.parse(f"---\n{WRONG_KEY_FRONTMATTER[name]}---\nbody\n")
+    assert meta is not None
+    assert schema.is_private(meta) is True
+    assert schema.is_private(meta, allowed_tags=WAVE2_TAGS) is True
+
+
+@pytest.mark.parametrize("name", sorted(DIFFERENT_WORD_FRONTMATTER))
+def test_different_word_spellings_are_private_with_tags_md(name):
+    meta, _ = frontmatter.parse(f"---\n{DIFFERENT_WORD_FRONTMATTER[name]}---\nbody\n")
+    assert schema.is_private(meta, allowed_tags=WAVE2_TAGS) is True
+
+
+@pytest.mark.parametrize("meta", [{"type": "topic"}, {"tags": ["hermes"]}, {}])
+def test_missing_type_or_tags_is_private(meta):  # rule 1b
+    assert schema.is_private(meta) is True
+
+
+@pytest.mark.parametrize("key", ["tag", "labels", "private", "kind", "updated_by"])
+def test_unknown_key_is_private(key):  # rule 1c
+    assert schema.is_private({"type": "topic", "tags": ["hermes"], key: "x"}) is True
+
+
+def test_every_page_key_is_allowed():
+    meta = {"type": "topic", "tags": ["hermes"], "repos": ["a"], "updated": "2026-10-01",
+            "review_by": "2027-01-01"}
+    assert set(meta) == schema.PAGE_KEYS
+    assert schema.is_private(meta) is False
+
+
+@pytest.mark.parametrize("typ", ["people", "how to", "", "topics", "note"])
+def test_type_outside_page_types_is_private(typ):  # rule 1d
+    assert schema.is_private({"type": typ, "tags": ["hermes"]}) is True
+
+
+@pytest.mark.parametrize("typ", sorted(schema.PAGE_TYPES - schema.PRIVATE_TYPES) + ["Decision", " topic "])
+def test_page_types_are_public(typ):
+    assert schema.is_private({"type": typ, "tags": ["hermes"]}) is False
+
+
+@pytest.mark.parametrize("meta", [
+    {"type": "topic", "tags": ["Kelvin"]},  # KELVIN SIGN lowercases to ASCII k
+    {"type": "topic", "tags": "hermes, Kelvin"},
+    {"type": "Kelvin", "tags": ["hermes"]},
+    {"type": "topic", "tags": ["fіnance"]},  # Cyrillic i
+])
+def test_non_ascii_tag_or_type_is_private(meta):  # rule 1e
+    assert schema.is_private(meta) is True
+
+
+def test_kelvin_sign_lowercases_to_ascii():
+    # Why 1e checks isascii() before lowercasing: this value would otherwise pass the [a-z0-9-]+ check.
+    assert "Kelvin".lower() == "kelvin"
+
+
+def test_tag_outside_allowed_tags_is_private():  # rule 1f
+    meta = {"type": "topic", "tags": ["hermes", "money"]}
+    assert schema.is_private(meta) is False
+    assert schema.is_private(meta, allowed_tags={"hermes", "money"}) is False
+    assert schema.is_private(meta, allowed_tags={"hermes"}) is True
+    assert schema.is_private({"type": "topic", "tags": "Hermes"}, allowed_tags={"hermes"}) is False
+
+
+def test_empty_allowed_tags_makes_tagged_pages_private():
+    assert schema.is_private({"type": "topic", "tags": ["hermes"]}, allowed_tags=set()) is True
+
+
+def test_empty_tag_list_with_valid_type_stays_public():
+    assert schema.is_private({"type": "topic", "tags": []}) is False
+    assert schema.is_private({"type": "topic", "tags": []}, allowed_tags=set()) is False

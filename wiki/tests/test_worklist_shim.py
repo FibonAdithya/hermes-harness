@@ -311,3 +311,9 @@ def test_curator_prompt_search_skips_inbox_and_names_malformed_tags():
     text = " ".join(PROMPT.read_text(encoding="utf-8").split())
     assert "rg -il '<key words>' ~/hermes-wiki --glob '!inbox/**'" in text
     assert "`malformed tags`" in text
+
+
+def test_curator_prompt_states_page_keys_rule():
+    text = " ".join(PROMPT.read_text(encoding="utf-8").split())
+    assert ("Pages need exactly the keys `type` and `tags`, plus optionally `repos`, `updated` and `review_by`; "
+            "a page missing a key or using any other key is hidden from the coding box until repaired.") in text

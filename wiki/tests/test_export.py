@@ -211,3 +211,60 @@ def test_symlinked_pages_not_listed_or_exported(tmp_path):
     assert not [f for f in files if f.startswith("link")]
     text = "".join((dest / f).read_text() for f in files)
     assert "link-secret" not in text
+
+
+from test_schema import DIFFERENT_WORD_FRONTMATTER, WRONG_KEY_FRONTMATTER  # noqa: E402
+
+
+def test_wrong_key_and_different_word_pages_not_exported(tmp_path):
+    cases = {**WRONG_KEY_FRONTMATTER, **DIFFERENT_WORD_FRONTMATTER}
+    extra = {f"leak-{n}": f"---\n{fm}---\nsecret-{n} body\n" for n, fm in cases.items()}
+    extra["ok"] = "---\ntype: topic\ntags: [hermes, cost]\n---\nok page\n"
+    extra["ok-untagged"] = "---\ntype: topic\ntags: []\n---\nok untagged\n"
+    src = _src(tmp_path, extra_pages=extra)
+    dest = tmp_path / "pub"
+    export_public(src, dest, "h1", 1000)
+    files = _files(dest.resolve())
+    assert {"ok.md", "ok-untagged.md"} <= files
+    assert not [f for f in files if f.startswith("leak-")]
+    text = "".join((dest / f).read_text() for f in files)
+    assert "secret-" not in text and "[[leak-" not in text
+
+
+def test_tag_missing_from_tags_md_not_exported(tmp_path):
+    src = _src(tmp_path, extra_pages={"stray": "---\ntype: topic\ntags: [hermes, newtag]\n---\nstray\n"})
+    dest = tmp_path / "pub"
+    export_public(src, dest, "h1", 1000)
+    files = _files(dest.resolve())
+    assert "stray.md" not in files and "alpha.md" in files
+
+
+@pytest.mark.parametrize("tags_md", [None, "", "# Tags\n\nno tag lines here\n"])
+def test_missing_or_empty_tags_md_fails_closed(tmp_path, tags_md):
+    src = _src(tmp_path, extra_pages={"untagged": "---\ntype: topic\ntags: []\n---\nuntagged\n"})
+    if tags_md is None:
+        (src / "TAGS.md").unlink()
+    else:
+        (src / "TAGS.md").write_text(tags_md)
+    dest = tmp_path / "pub"
+    assert export_public(src, dest, "h1", 1000) == 1
+    files = _files(dest.resolve())
+    assert "untagged.md" in files
+    assert not {"alpha.md", "beta.md", "nights/2026-09-25.md"} & files
+
+
+def test_filter_version_is_v3():
+    from hermes_wiki import export as export_mod
+    assert export_mod.FILTER_VERSION == "filter-v3"
+
+
+def test_v2_export_is_rebuilt_by_v3(tmp_path):
+    # A v2 export of the same head may hold pages the v3 filter hides; it must not be kept.
+    src = _src(tmp_path, extra_pages={"labelled": "---\ntype: topic\nlabels: [health]\n---\nsecret\n"})
+    old = tmp_path / ".dest.500"
+    old.mkdir()
+    (old / ".source-head").write_text("a filter-v2\n")
+    (old / "labelled.md").write_text("v2 output\n")
+    os.symlink(old.name, tmp_path / "dest")
+    assert export_public(src, tmp_path / "dest", "a", 1000) == 3
+    assert not (tmp_path / "dest" / "labelled.md").exists()

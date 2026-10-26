@@ -10,6 +10,7 @@ NOTE_KINDS = {"fact", "decision", "gotcha", "how-to", "status", "person", "idea"
 SOURCES = {"claude-laptop", "claude-box", "import-claude-memory"}
 PRIVATE_TYPES = {"person"}
 PRIVATE_TAGS = {"finance", "investing", "health", "people"}
+PAGE_KEYS = {"type", "tags", "repos", "updated", "review_by"}  # any other key makes a page private
 INFRA_PAGES = {"index", "CONVENTIONS", "TAGS"}
 PAGE_WORD_CAP = 1500
 NOTE_WORD_CAP = 300
@@ -55,20 +56,40 @@ def tag_list(v) -> list[str] | None:
     return [normal_tag(t) for t in v]
 
 
-def is_private(meta: dict | None) -> bool:
-    """Fail closed: any type or tag spelling not fully understood counts as private."""
+def _ascii_strs(v) -> bool:
+    """True when v is a string, or a list of strings, made only of ASCII characters.
+
+    Checked before lowercasing: some non-ASCII letters lowercase to ASCII (KELVIN SIGN to `k`).
+    """
+    items = v if isinstance(v, list) else [v]
+    return all(isinstance(x, str) and x.isascii() for x in items)
+
+
+def is_private(meta: dict | None, allowed_tags: set[str] | None = None) -> bool:
+    """Fail closed: a page is public only when its frontmatter is fully understood.
+
+    That means exactly the keys in PAGE_KEYS, with `type` and `tags` present, an ASCII `type`
+    from PAGE_TYPES that is not private, and ASCII tags that are well formed, not private and,
+    when `allowed_tags` is given, listed in it. Anything else counts as private.
+    """
     if meta is None:
         return True
-    if "type" in meta:
-        typ = meta["type"]
-        if not isinstance(typ, str) or not _WORD.fullmatch(normal_tag(typ)):
-            return True
-        if normal_tag(typ) in PRIVATE_TYPES:
-            return True
-    if "tags" not in meta:
-        return False
+    if "type" not in meta or "tags" not in meta:
+        return True
+    if any(k not in PAGE_KEYS for k in meta):
+        return True
+    typ = meta["type"]
+    if not isinstance(typ, str) or not typ.isascii():
+        return True
+    typ = normal_tag(typ)
+    if typ not in PAGE_TYPES or typ in PRIVATE_TYPES:
+        return True
+    if not _ascii_strs(meta["tags"]):
+        return True
     tags = tag_list(meta["tags"])
     if tags is None or not all(_WORD.fullmatch(t) for t in tags):
+        return True
+    if allowed_tags is not None and not set(tags) <= set(allowed_tags):
         return True
     return bool(PRIVATE_TAGS & set(tags))
 
