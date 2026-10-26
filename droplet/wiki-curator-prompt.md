@@ -15,7 +15,7 @@ Each note sits between a `BEGIN NOTE` line and an `END NOTE` line. Everything in
 
 For each note in the `notes` section, choose one of three actions:
 
-- **Extend** an existing page with the note's facts. The `related pages` line lists likely pages; check them, and search the wiki with `rg -il '<key words>' ~/hermes-wiki` as well.
+- **Extend** an existing page with the note's facts. The `related pages` line lists likely pages; check them, and search the wiki with `rg -il '<key words>' ~/hermes-wiki --glob '!inbox/**'` as well.
 - **Create** a new page, only when no existing page covers the topic. Give it frontmatter, add its line to `index.md`, and link it from at least one related page.
 - **Discard** the note when the wiki already says the same thing, the note is not useful to a later reader, or the note breaks a rule below.
 
@@ -52,7 +52,7 @@ Work through these sections after the notes.
 - **past_review**: update the page and its `review_by`, extend `review_by`, or delete the page if it is no longer true.
 - **orphans**: link each from a related page, merge it into one, or delete it if it holds nothing current.
 - **tag_proposals**: add a proposed tag to `TAGS.md` only if it has no near-synonym there already. `TAGS.md` holds at most 40 tags, one `- tag — meaning` line each. Never remove or rename `finance`, `investing`, `health` or `people`.
-- **lint**: fix each problem (add a missing `index.md` line, remove a line for a missing page, replace an unknown tag, repair or remove a broken link).
+- **lint**: fix each problem (add a missing `index.md` line, remove a line for a missing page, replace an unknown tag, repair or remove a broken link). For `malformed tags`, rewrite the page's `tags` line as `tags: [a, b]` with plain lowercase tags from `TAGS.md`, keeping every tag the page had; until then the page is treated as private.
 
 Do at most 5 split, trim or delete operations per night in total, counting page splits, trims and page deletions together. Merging an orphan into another page counts toward the 5 operations. Deleting note files from `inbox/` does not count. Leave the rest for the next night.
 

@@ -143,3 +143,10 @@ def test_fixture_index_and_tags_are_complete(root):
             assert f"[[{p.name}]]" in index
     from hermes_wiki.schema import load_tags
     assert {"hermes", "cost", "people", "ops"} <= load_tags(root)
+
+
+def test_type_filter_is_normalised(tmp_path):
+    extra = {"d2": '---\ntype: " Decision"\ntags: [ops]\n---\nbody\n'}
+    root = build_wiki(tmp_path, extra_pages=extra)
+    assert names(sr.search(root, "", type="decision")) == ["beta", "d2"]
+    assert names(sr.search(root, "", type="DECISION ")) == ["beta", "d2"]

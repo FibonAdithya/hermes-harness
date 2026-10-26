@@ -2,7 +2,7 @@
 from pathlib import Path
 
 from .pages import Page, iter_pages, links, resolve, valid_name
-from .schema import is_private
+from .schema import is_private, normal_tag
 
 
 class PageNotFound(Exception):
@@ -30,7 +30,8 @@ def _passes(page: Page, tags, type, repos, updated_after) -> bool:
         return False
     if tags and not set(tags) <= set(_as_list(meta.get("tags"))):
         return False
-    if type and meta.get("type") != type:
+    typ = meta.get("type")
+    if type and not (isinstance(typ, str) and normal_tag(typ) == normal_tag(type)):
         return False
     if repos and not set(repos) & set(_as_list(meta.get("repos"))):
         return False

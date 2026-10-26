@@ -22,6 +22,16 @@ def _strip_links(text: str, visible) -> str:
     return _LINK.sub(repl, text)
 
 
+def _index_line_public(line: str, visible) -> bool:
+    """Fail closed: keep blank lines, headings, and lines whose links all point at exported pages."""
+    if not line.strip():
+        return True
+    targets = links(line)
+    if not all(visible(t) for t in targets):
+        return False
+    return bool(targets) or line.lstrip().startswith("#")
+
+
 def _unique_dir(parent: Path, base: str) -> Path:
     path = parent / base
     n = 0
@@ -67,10 +77,8 @@ def export_public(src: Path, dest: Path, head: str, now: float, keep_seconds: in
                 shutil.copyfile(src / f"{name}.md", new / f"{name}.md")
         index = src / "index.md"
         if index.is_file():
-            kept = [
-                line for line in index.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
-                if all(visible(t) for t in links(line))
-            ]
+            kept = [line for line in index.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+                    if _index_line_public(line, visible)]
             (new / "index.md").write_text("".join(kept), encoding="utf-8")
         (new / _HEAD_FILE).write_text(f"{head} {FILTER_VERSION}\n", encoding="utf-8")
 

@@ -305,3 +305,9 @@ def test_flagged_quarantine_reason_is_replaced(shim, tmp_path, capsys):
     out = capsys.readouterr().out
     assert f"quarantined: {FLAGGED} (reason withheld)" in out
     assert "fine" in out and "notes withheld" not in out
+
+
+def test_curator_prompt_search_skips_inbox_and_names_malformed_tags():
+    text = " ".join(PROMPT.read_text(encoding="utf-8").split())
+    assert "rg -il '<key words>' ~/hermes-wiki --glob '!inbox/**'" in text
+    assert "`malformed tags`" in text

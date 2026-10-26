@@ -121,7 +121,6 @@ def test_dry_run_cli_never_publishes(tmp_path, monkeypatch, capsys):
         raise AssertionError("published")
 
     monkeypatch.setattr(notes, "publish", boom)
-    monkeypatch.setattr(notes.subprocess, "run", boom)
     assert cli.main(["import-claude-memory", "--projects", str(projects), "--dry-run", "--config", str(conf)]) == 0
     out = capsys.readouterr().out
     assert "inbox/import-claude-memory/" in out

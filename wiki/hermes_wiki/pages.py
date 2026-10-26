@@ -30,10 +30,13 @@ def valid_name(name: str) -> bool:
 
 def iter_pages(root: Path) -> list[Page]:
     root = Path(root)
+    real_root = root.resolve()
     out = []
     for path in root.rglob("*.md"):
         rel = path.relative_to(root)
         if rel.parts[0] in _SKIP_TOP or path.is_symlink() or not path.is_file():
+            continue
+        if real_root not in path.resolve().parents:  # reached through a directory symlink
             continue
         try:
             text = path.read_text(encoding="utf-8", errors="replace")

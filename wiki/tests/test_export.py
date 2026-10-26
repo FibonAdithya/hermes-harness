@@ -179,3 +179,35 @@ def test_export_made_before_filter_version_is_rebuilt(tmp_path):
     os.symlink(old.name, tmp_path / "dest")
     assert export_public(src, tmp_path / "dest", "a", 1000) == 3
     assert not (tmp_path / "dest" / "leak.md").exists()
+
+
+def test_index_keeps_only_blank_heading_and_fully_visible_link_lines(tmp_path):
+    src = _src(tmp_path, index_lines=["", "## Money", "Salary review is with gamma in March.",
+                                      "  indented prose, no links", "- [[alpha]] and [[beta]]"])
+    dest = tmp_path / "pub"
+    export_public(src, dest, "h1", 1000)
+    lines = (dest / "index.md").read_text().splitlines()
+    assert "## Money" in lines and "" in lines and "- [[alpha]] and [[beta]]" in lines
+    assert "# Index" in lines
+    assert not [ln for ln in lines if "Salary" in ln or "prose" in ln]
+    assert all(ln == "" or ln.startswith("#") or "[[" in ln for ln in lines)
+
+
+def test_symlinked_pages_not_listed_or_exported(tmp_path):
+    from hermes_wiki.pages import iter_pages
+    src = _src(tmp_path)
+    outside = tmp_path / "outside"
+    (outside / "sub").mkdir(parents=True)
+    (outside / "secret.md").write_text("---\ntype: topic\ntags: [hermes]\n---\nfile-link-secret\n")
+    (outside / "sub" / "deep.md").write_text("---\ntype: topic\ntags: [hermes]\n---\ndir-link-secret\n")
+    (src / "linked.md").symlink_to(outside / "secret.md")
+    (src / "linkdir").symlink_to(outside / "sub", target_is_directory=True)
+    names = {p.name for p in iter_pages(src)}
+    assert "alpha" in names
+    assert not [n for n in names if n.startswith("link")]
+    dest = tmp_path / "pub"
+    export_public(src, dest, "h1", 1000)
+    files = _files(dest.resolve())
+    assert not [f for f in files if f.startswith("link")]
+    text = "".join((dest / f).read_text() for f in files)
+    assert "link-secret" not in text

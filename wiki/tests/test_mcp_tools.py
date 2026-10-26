@@ -86,14 +86,28 @@ def test_maybe_pull_respects_interval(tmp_path):
     assert stamp.stat().st_mtime == 1000.0
 
 
-def test_maybe_pull_failure_warns_and_keeps_stamp(tmp_path):
-    stamp = tmp_path / "stamp"
-    run = lambda argv, **kw: SimpleNamespace(returncode=1, stderr="diverged", stdout="")
-    msg = freshness.maybe_pull(tmp_path, stamp, now=1000.0, run=run)
+def test_maybe_pull_failure_warns_and_throttles_retries(tmp_path):
+    stamp = tmp_path / "state" / "stamp"
+    calls = []
+
+    def failing(argv, **kw):
+        calls.append(argv)
+        return SimpleNamespace(returncode=1, stderr="diverged", stdout="")
+
+    msg = freshness.maybe_pull(tmp_path, stamp, now=1000.0, run=failing)
     assert msg.startswith("wiki copy may be stale") and "diverged" in msg
-    assert not stamp.exists()
+    assert stamp.stat().st_mtime == 1000.0
+    # Within the interval: no new pull, and the last warning is still returned.
+    assert freshness.maybe_pull(tmp_path, stamp, now=1299.0, run=failing) == msg
+    assert len(calls) == 1
+    assert freshness.maybe_pull(tmp_path, stamp, now=1300.0, run=failing) == msg
+    assert len(calls) == 2
 
     def timeout(argv, **kw):
         raise subprocess.TimeoutExpired(argv, 20)
 
-    assert freshness.maybe_pull(tmp_path, stamp, now=1000.0, run=timeout).startswith("wiki copy may be stale")
+    assert freshness.maybe_pull(tmp_path, stamp, now=2000.0, run=timeout).startswith("wiki copy may be stale")
+    assert stamp.stat().st_mtime == 2000.0
+    ok = lambda argv, **kw: SimpleNamespace(returncode=0, stderr="", stdout="")  # noqa: E731
+    assert freshness.maybe_pull(tmp_path, stamp, now=3000.0, run=ok) is None
+    assert freshness.maybe_pull(tmp_path, stamp, now=3001.0, run=failing) is None  # success clears the warning
