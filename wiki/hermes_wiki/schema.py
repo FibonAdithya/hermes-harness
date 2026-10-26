@@ -43,7 +43,7 @@ def is_private(meta: dict | None) -> bool:
     typ = meta.get("type")
     if typ is not None and not isinstance(typ, str):
         return True
-    if typ in PRIVATE_TYPES:
+    if isinstance(typ, str) and typ.strip().lower() in PRIVATE_TYPES:
         return True
     tags = meta.get("tags")
     if tags is None:
@@ -52,7 +52,7 @@ def is_private(meta: dict | None) -> bool:
         tags = [tags]
     if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
         return True
-    return bool(PRIVATE_TAGS & set(tags))
+    return bool(PRIVATE_TAGS & {t.strip().lower() for t in tags})
 
 
 def _date_ok(v) -> bool:

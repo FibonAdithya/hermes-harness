@@ -126,3 +126,18 @@ def test_is_private_string_tag_public():
 )
 def test_trailing_newline_rejected(over):
     assert schema.validate_note(good(**over), BODY, {"hermes"})
+
+
+@pytest.mark.parametrize(
+    "meta",
+    [
+        {"type": "topic", "tags": ["Finance"]},
+        {"type": "topic", "tags": [" finance"]},
+        {"type": "topic", "tags": ["HEALTH "]},
+        {"type": "Person"},
+        {"type": " person "},
+        {"type": "topic", "tags": "Investing"},
+    ],
+)
+def test_is_private_ignores_case_and_space(meta):
+    assert schema.is_private(meta) is True
