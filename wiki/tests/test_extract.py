@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ from hermes_wiki import extract as ex
 from hermes_wiki import notes as nt
 from wikifixture import build_wiki
 
+NOW = time.time() - 3600
 FIXTURE = Path(__file__).parent / "fixtures" / "transcript.jsonl"
 
 
@@ -23,14 +25,6 @@ def cfg(tmp_path):
                          bin="/x/hermes-wiki", path=tmp_path / "config.json")
 
 
-@pytest.fixture
-def homedir():
-    """A scratch directory outside /tmp (cwd values under /tmp are skipped as `tmp` first)."""
-    d = Path(tempfile.mkdtemp(dir=Path.home(), prefix=".wiki-test-"))
-    yield d
-    shutil.rmtree(d, ignore_errors=True)
-
-
 @pytest.mark.parametrize("env,cwd,n,want", [
     ({"WIKI_NOTE_CHILD": "1"}, "/home/u/p", 9, "child"),
     ({}, "/tmp/x", 9, "tmp"),
@@ -39,31 +33,31 @@ def homedir():
     ({}, "/home/u/p", 3, "short"),
     ({}, "/home/u/p", 4, None),
 ])
-def test_skip_reasons(homedir, env, cwd, n, want):
+def test_skip_reasons(tmp_path, monkeypatch, env, cwd, n, want):
     if cwd == "SUB":
-        repo = homedir / "repo"
+        repo = tmp_path / "repo"
         (repo / ".git").mkdir(parents=True)
         (repo / ".no-wiki-notes").write_text("")
         (repo / "a" / "b").mkdir(parents=True)
         cwd = str(repo / "a" / "b")
+        monkeypatch.setattr(ex, "_is_tmp", lambda c: False)  # tmp_path lives under /tmp
     hook = {"cwd": cwd, "transcript_path": str(FIXTURE)}
-    assert ex.skip_reason(hook, env, n) == want
+    assert ex.skip_reason(hook, {**env, "HOME": str(tmp_path)}, n) == want
 
 
-def test_skip_optout_stops_at_git_root(homedir):
-    (homedir / ".no-wiki-notes").write_text("")
-    repo = homedir / "repo"
+def test_optout_stops_at_git_root(tmp_path):
+    (tmp_path / ".no-wiki-notes").write_text("")
+    repo = tmp_path / "repo"
     (repo / ".git").mkdir(parents=True)
-    assert ex.skip_reason({"cwd": str(repo), "transcript_path": str(FIXTURE)}, {"HOME": "/nonexistent"}, 9) is None
+    assert ex._opted_out(str(repo), "/nonexistent") is False
 
 
-def test_skip_optout_stops_at_home(homedir):
-    (homedir / ".no-wiki-notes").write_text("")
-    sub = homedir / "home" / "proj"
+def test_optout_stops_at_home(tmp_path):
+    (tmp_path / ".no-wiki-notes").write_text("")
+    sub = tmp_path / "home" / "proj"
     sub.mkdir(parents=True)
-    # HOME is the child directory, so the opt-out file in homedir (above HOME) is not seen
-    env = {"HOME": str(homedir / "home")}
-    assert ex.skip_reason({"cwd": str(sub), "transcript_path": str(FIXTURE)}, env, 9) is None
+    assert ex._opted_out(str(sub), str(tmp_path / "home")) is False
+    assert ex._opted_out(str(sub), "/nonexistent") is True
 
 
 def test_skip_no_transcript():
@@ -139,7 +133,7 @@ class FakeRun:
 
 
 def test_drain_newest_first_and_limit(cfg):
-    files = [_pending(cfg, f"s{i}", 1000 + i) for i in range(6)]
+    files = [_pending(cfg, f"s{i}", NOW + i) for i in range(6)]
     run = FakeRun(0)
     res = ex.drain(cfg, limit=4, run=run)
     assert res == [("s5", True), ("s4", True), ("s3", True), ("s2", True)]
@@ -152,7 +146,7 @@ def test_drain_newest_first_and_limit(cfg):
 
 
 def test_drain_passes_session_to_mcp_config(cfg):
-    _pending(cfg, "abc", 1000)
+    _pending(cfg, "abc", NOW)
     seen = {}
 
     def run(argv, **kw):
@@ -164,13 +158,13 @@ def test_drain_passes_session_to_mcp_config(cfg):
 
 
 def test_drain_keeps_pending_on_failure(cfg):
-    p = _pending(cfg, "s0", 1000)
+    p = _pending(cfg, "s0", NOW)
     assert ex.drain(cfg, run=FakeRun(1)) == [("s0", False)]
     assert p.exists()
 
 
 def test_drain_keeps_pending_on_timeout(cfg):
-    p = _pending(cfg, "s0", 1000)
+    p = _pending(cfg, "s0", NOW)
 
     def run(argv, **kw):
         raise subprocess.TimeoutExpired(argv, 900)
@@ -180,7 +174,7 @@ def test_drain_keeps_pending_on_timeout(cfg):
 
 
 def test_drain_lock_held_returns_empty(cfg):
-    _pending(cfg, "s0", 1000)
+    _pending(cfg, "s0", NOW)
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     fd = os.open(cfg.state_dir / "drain.lock", os.O_CREAT | os.O_RDWR)
     fcntl.flock(fd, fcntl.LOCK_EX)
@@ -192,21 +186,31 @@ def test_drain_lock_held_returns_empty(cfg):
         os.close(fd)
 
 
-def test_extract_dir_uses_newest_and_drains_only_it(cfg, tmp_path):
+def test_extract_dir_uses_newest_and_drains_with_limit4(cfg, tmp_path):
     proj = tmp_path / "projects" / "p"
-    proj.mkdir(parents=True)
-    old, new = proj / "old.jsonl", proj / "new.jsonl"
-    shutil.copy(FIXTURE, old)
-    shutil.copy(FIXTURE, new)
+    (proj / "subagents").mkdir(parents=True)
+    old, new, sub = proj / "old.jsonl", proj / "new.jsonl", proj / "subagents" / "agent-1.jsonl"
+    for f in (old, new, sub):
+        shutil.copy(FIXTURE, f)
+    sub.write_text("SUBAGENT-TRANSCRIPT\n")
     os.utime(old, (1000, 1000))
     os.utime(new, (2000, 2000))
-    _pending(cfg, "other", 3000)
+    os.utime(sub, (3000, 3000))
+    _pending(cfg, "other", NOW)
     run = FakeRun(0)
     assert ex.extract_dir(cfg, tmp_path / "projects", "task-7", run=run) is True
-    assert len(run.calls) == 1
-    assert "OWNER: Thanks, that is all." in run.calls[0][1]["input"]
-    assert (cfg.state_dir / "pending" / "other.txt").exists()
-    assert not (cfg.state_dir / "pending" / "task-7.txt").exists()
+    assert len(run.calls) == 2  # the new file and the older pending retry
+    inputs = [kw["input"] for _, kw in run.calls]
+    assert any("OWNER: Thanks, that is all." in i for i in inputs)
+    assert not any("SUBAGENT-TRANSCRIPT" in i for i in inputs)
+
+
+def test_extract_dir_failure_keeps_pending_for_retry(cfg, tmp_path):
+    proj = tmp_path / "projects" / "p"
+    proj.mkdir(parents=True)
+    shutil.copy(FIXTURE, proj / "a.jsonl")
+    assert ex.extract_dir(cfg, tmp_path / "projects", "task-7", run=FakeRun(1)) is False
+    assert (cfg.state_dir / "pending" / "task-7.txt").exists()
 
 
 def test_extract_dir_no_transcript(cfg, tmp_path):
@@ -237,3 +241,79 @@ def test_publish_without_dry_env_calls_gh(tmp_path, monkeypatch):
     nt.publish("o/r", "inbox/a.md", "x", run=lambda *a, **k: calls.append(a) or subprocess.CompletedProcess(a, 0, "", ""),
                dry_dir=tmp_path / "dry")
     assert len(calls) == 1 and not (tmp_path / "dry").exists()
+
+
+def test_drain_input_has_prompt_and_session_dir(cfg):
+    _pending(cfg, "s0", NOW)
+    run = FakeRun(0)
+    ex.drain(cfg, run=run)
+    inp = run.calls[0][1]["input"]
+    assert inp.startswith(ex.load_prompt())
+    assert "Session directory: /c\n\nOWNER: hi" in inp
+    assert run.calls[0][1]["encoding"] == "utf-8"
+
+
+def test_drain_runs_in_state_dir(cfg):
+    _pending(cfg, "s0", NOW)
+    run = FakeRun(0)
+    ex.drain(cfg, run=run)
+    assert run.calls[0][1]["cwd"] == cfg.state_dir
+
+
+def test_drain_child_env_strips_claude_vars(cfg, monkeypatch):
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "cli")
+    monkeypatch.setenv("CLAUDE_OTHER", "keep")
+    _pending(cfg, "s0", NOW)
+    run = FakeRun(0)
+    ex.drain(cfg, run=run)
+    env = run.calls[0][1]["env"]
+    assert "CLAUDECODE" not in env and "CLAUDE_CODE_ENTRYPOINT" not in env
+    assert env["CLAUDE_OTHER"] == "keep" and env["WIKI_NOTE_CHILD"] == "1"
+
+
+def test_drain_logs_returncode_and_stderr(cfg):
+    _pending(cfg, "s0", NOW)
+
+    def run(argv, **kw):
+        return subprocess.CompletedProcess(argv, 3, "o" * 5000, "boom-error")
+
+    ex.drain(cfg, run=run)
+    log = (cfg.state_dir / "log" / "drain.log").read_text()
+    assert "s0" in log and "rc=3" in log and "boom-error" in log
+    assert "o" * 2000 in log and "o" * 2001 not in log
+
+
+def test_drain_deletes_stale_pending_without_running(cfg):
+    stale = _pending(cfg, "old", time.time() - 8 * 86400)
+    fresh = _pending(cfg, "new", NOW)
+    run = FakeRun(0)
+    res = ex.drain(cfg, run=run)
+    assert not stale.exists() and not fresh.exists()
+    assert len(run.calls) == 1 and res == [("new", True)]
+    assert "old" in (cfg.state_dir / "log" / "drain.log").read_text()
+
+
+def test_drain_not_stale_at_six_days(cfg):
+    p = _pending(cfg, "six", time.time() - 6 * 86400)
+    ex.drain(cfg, run=FakeRun(1))
+    assert p.exists()
+
+
+def test_drain_continues_after_unexpected_error(cfg):
+    bad = _pending(cfg, "bad", NOW + 10)  # newest, runs first
+    bad.write_bytes(b"\xff\xfe not utf8\n")
+    os.utime(bad, (NOW + 10, NOW + 10))
+    _pending(cfg, "good", NOW)
+    run = FakeRun(0)
+    res = ex.drain(cfg, run=run)
+    assert res == [("bad", False), ("good", True)]
+    assert len(run.calls) == 1
+    assert "bad" in (cfg.state_dir / "log" / "hook-errors.log").read_text()
+
+
+def test_spawn_detached_uses_state_dir_cwd(cfg, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(ex.subprocess, "Popen", lambda argv, **kw: seen.update(kw))
+    ex._spawn_detached(["x"], cfg, "s1")
+    assert seen["cwd"] == cfg.state_dir

@@ -21,6 +21,10 @@ def load_prompt() -> str:
     return resources.files("hermes_wiki").joinpath("prompts", "extract.md").read_text(encoding="utf-8")
 
 
+def _is_tmp(cwd: str) -> bool:
+    return cwd.startswith("/tmp/") or "pytest-of-" in cwd
+
+
 def _opted_out(cwd: str, home: str) -> bool:
     d = Path(cwd)
     while True:
@@ -35,7 +39,7 @@ def skip_reason(hook: dict, env: Mapping[str, str], owner_msgs: int) -> str | No
     cwd = hook.get("cwd") or ""
     if env.get("WIKI_NOTE_CHILD") == "1":
         return "child"
-    if cwd.startswith("/tmp/") or "pytest-of-" in cwd:
+    if _is_tmp(cwd):
         return "tmp"
     if cwd and _opted_out(cwd, env.get("HOME") or str(Path.home())):
         return "opted-out"
@@ -80,8 +84,9 @@ def _spawn_detached(argv: list[str], cfg: WikiConfig | None = None, session: str
     state = cfg.state_dir if cfg else Path(tempfile.gettempdir())
     d = state / "log"
     d.mkdir(parents=True, exist_ok=True)
+    state.mkdir(parents=True, exist_ok=True)
     with open(d / f"drain-{session}.log", "ab") as log:
-        subprocess.Popen(argv, start_new_session=True, stdin=subprocess.DEVNULL,
+        subprocess.Popen(argv, cwd=state, start_new_session=True, stdin=subprocess.DEVNULL,
                          stdout=log, stderr=subprocess.STDOUT)
 
 
@@ -120,12 +125,35 @@ def session_end(stdin_text: str, env: Mapping, cfg: WikiConfig, spawn=None) -> s
         return "error"
 
 
+_STALE_SECONDS = 7 * 86400
+_LOG_TAIL = 2000
+
+
+def _drain_log(cfg: WikiConfig, text: str) -> None:
+    try:
+        d = cfg.state_dir / "log"
+        d.mkdir(parents=True, exist_ok=True)
+        with open(d / "drain.log", "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {text}\n")
+    except Exception:
+        pass
+
+
+def _child_env() -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE" and not k.startswith("CLAUDE_CODE_")}
+    env["WIKI_NOTE_CHILD"] = "1"
+    return env
+
+
 def _run_one(cfg: WikiConfig, pending: Path, run) -> tuple[str, bool]:
     head, _, body = pending.read_text(encoding="utf-8").partition("\n")
+    cwd = ""
     try:
-        session = str(json.loads(head)["session"])
-    except (ValueError, KeyError, TypeError):
+        meta = json.loads(head)
+        session, cwd = str(meta["session"]), str(meta.get("cwd") or "")
+    except (ValueError, KeyError, TypeError, AttributeError):
         session = pending.stem
+    cfg.state_dir.mkdir(parents=True, exist_ok=True)
     tmpdir = cfg.state_dir / "tmp"
     tmpdir.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(suffix=".json", prefix="mcp-", dir=tmpdir)
@@ -136,13 +164,16 @@ def _run_one(cfg: WikiConfig, pending: Path, run) -> tuple[str, bool]:
         try:
             proc = run(
                 claude_argv(conf, cfg.model, cfg.claude),
-                input=load_prompt() + "\n\n" + body,
-                env={**os.environ, "WIKI_NOTE_CHILD": "1"},
+                input=load_prompt() + "\n\n" + f"Session directory: {cwd}\n\n" + body,
+                env=_child_env(), cwd=cfg.state_dir, encoding="utf-8",
                 capture_output=True, text=True, timeout=900,
             )
             ok = proc.returncode == 0
+            _drain_log(cfg, f"session={session} rc={proc.returncode} "
+                            f"stdout={(proc.stdout or '')[-_LOG_TAIL:]!r} stderr={(proc.stderr or '')[-_LOG_TAIL:]!r}")
         except (subprocess.TimeoutExpired, OSError) as e:
             _log_error(cfg, f"drain {session}: {type(e).__name__}: {e}")
+            _drain_log(cfg, f"session={session} rc=none error={type(e).__name__}")
             ok = False
     finally:
         conf.unlink(missing_ok=True)
@@ -158,12 +189,29 @@ def _locked_drain(cfg: WikiConfig, pick, run) -> list[tuple[str, bool]]:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return []
-        return [_run_one(cfg, p, run) for p in pick()]
+        results = []
+        for p in pick():
+            try:
+                results.append(_run_one(cfg, p, run))
+            except Exception as e:
+                _log_error(cfg, f"drain {p.name}: {type(e).__name__}: {e}")
+                results.append((p.stem, False))
+        return results
 
 
 def drain(cfg: WikiConfig, limit: int = 4, run=subprocess.run) -> list[tuple[str, bool]]:
     def pick() -> list[Path]:
-        files = list((cfg.state_dir / "pending").glob("*.txt"))
+        now = time.time()
+        files = []
+        for p in (cfg.state_dir / "pending").glob("*.txt"):
+            try:
+                if now - p.stat().st_mtime > _STALE_SECONDS:
+                    p.unlink()
+                    _drain_log(cfg, f"session={p.stem} deleted stale pending file (older than 7 days)")
+                else:
+                    files.append(p)
+            except OSError:
+                continue
         files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         return files[:limit]
 
@@ -173,10 +221,9 @@ def drain(cfg: WikiConfig, limit: int = 4, run=subprocess.run) -> list[tuple[str
 def extract_dir(cfg: WikiConfig, projects: Path, session: str, run=subprocess.run) -> bool:
     if not _SESSION_OK.fullmatch(session):
         return False
-    files = [p for p in Path(projects).rglob("*.jsonl") if p.is_file()]
+    files = [p for p in Path(projects).glob("*/*.jsonl") if p.is_file()]
     if not files:
         return False
     newest = max(files, key=lambda p: p.stat().st_mtime)
-    pending = _write_pending(cfg, session, "", transcript.condense(newest))
-    res = _locked_drain(cfg, lambda: [pending], run)
-    return bool(res) and res[0][1]
+    _write_pending(cfg, session, "", transcript.condense(newest))
+    return (session, True) in drain(cfg, limit=4, run=run)

@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 
 _NOT_OWNER_PREFIXES = ("<command-", "<local-command", "<system-reminder", "<task-notification")
+_INTERRUPT = "[Request interrupted by user"
+_SUMMARY_CAP = 2000
 _OMITTED = "[earlier turns omitted]\n"
 
 
@@ -28,12 +30,17 @@ def _blocks(content) -> list[dict]:
 
 def _owner_text(obj: dict) -> str | None:
     """The owner's text for a user line, or None when the line is not owner text."""
-    if obj.get("type") != "user" or obj.get("isMeta"):
+    if obj.get("type") != "user" or obj.get("isMeta") or obj.get("isCompactSummary"):
         return None
+    text = _user_text(obj)
+    if text is None or text.lstrip().startswith(_NOT_OWNER_PREFIXES + (_INTERRUPT,)):
+        return None
+    return text
+
+
+def _user_text(obj: dict) -> str | None:
     content = _content(obj)
     if isinstance(content, str):
-        if content.lstrip().startswith(_NOT_OWNER_PREFIXES):
-            return None
         return content
     blocks = _blocks(content)
     if any(b.get("type") == "tool_result" for b in blocks):
@@ -49,6 +56,11 @@ def owner_messages(path: Path) -> int:
 def condense(path: Path, cap: int = 60000) -> str:
     parts: list[str] = []
     for obj in _events(path):
+        if obj.get("type") == "user" and obj.get("isCompactSummary"):
+            summary = _user_text(obj)
+            if summary:
+                parts.append(f"SUMMARY: {summary[:_SUMMARY_CAP]}")
+            continue
         owner = _owner_text(obj)
         if owner is not None:
             parts.append(f"OWNER: {owner}")

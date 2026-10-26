@@ -40,3 +40,23 @@ def test_condense_survives_bad_lines_and_caps(tmp_path):
 
 def test_condense_under_cap_has_no_marker():
     assert MARK not in tr.condense(FIXTURE)
+
+
+def _write(p, objs):
+    p.write_text("\n".join(json.dumps(o) for o in objs) + "\n", encoding="utf-8")
+
+
+def test_compact_summary_and_interrupt_not_owner(tmp_path):
+    p = tmp_path / "t.jsonl"
+    _write(p, [
+        {"type": "user", "isCompactSummary": True, "message": {"content": "S" * 5000}},
+        {"type": "user", "message": {"content": "[Request interrupted by user for tool use]"}},
+        {"type": "user", "message": {"content": [{"type": "text", "text": "[Request interrupted by user]"}]}},
+        {"type": "user", "message": {"content": "real owner words"}},
+    ])
+    assert tr.owner_messages(p) == 1
+    out = tr.condense(p)
+    assert "OWNER: real owner words" in out
+    assert "OWNER: SSS" not in out
+    assert "SUMMARY: " + "S" * 2000 in out and "S" * 2001 not in out
+    assert "Request interrupted" not in out
