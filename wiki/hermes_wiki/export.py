@@ -71,6 +71,12 @@ def export_public(src: Path, dest: Path, head: str, now: float, keep_seconds: in
             (new / "index.md").write_text("".join(kept), encoding="utf-8")
         (new / _HEAD_FILE).write_text(head + "\n", encoding="utf-8")
 
+        if dest.is_symlink():
+            # Retention counts from retirement, not creation: a container may have just mounted it.
+            try:
+                os.utime(dest.resolve(), (now, now))
+            except OSError:
+                pass
         tmp_link = parent / f".{dest.name}.swap"
         if tmp_link.is_symlink():
             tmp_link.unlink()

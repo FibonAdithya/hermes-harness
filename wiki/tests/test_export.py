@@ -118,3 +118,23 @@ def test_cli_export_public(tmp_path, monkeypatch):
     assert rc == 0
     assert (dest / "alpha.md").exists()
     assert (dest / ".source-head").read_text().strip() != ""
+
+
+def test_retention_counts_from_retirement(tmp_path):
+    src = _src(tmp_path)
+    dest = tmp_path / "dest"
+    export_public(src, dest, "h1", 1000)
+    os.utime(tmp_path / ".dest.1000", (1000, 1000))
+    export_public(src, dest, "h2", 1000 + 200000)
+    assert (tmp_path / ".dest.1000").exists()
+    export_public(src, dest, "h3", 1000 + 200000 + 86401)
+    assert not (tmp_path / ".dest.1000").exists()
+    assert (tmp_path / ".dest.201000").exists()
+
+
+def test_cli_export_public_git_failure(tmp_path, capsys):
+    src = _src(tmp_path)
+    rc = cli.main(["export-public", "--src", str(src), "--dest", str(tmp_path / "d")])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "hermes-wiki" in err and "Traceback" not in err

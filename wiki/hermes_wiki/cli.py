@@ -25,8 +25,13 @@ def _cmd_export_public(args, cfg) -> int:
     from . import export
 
     src = Path(args.src).expanduser()
-    head = subprocess.run(["git", "-C", str(src), "rev-parse", "HEAD"], capture_output=True,
-                          text=True, check=True).stdout.strip()
+    try:
+        head = subprocess.run(["git", "-C", str(src), "rev-parse", "HEAD"], capture_output=True,
+                              text=True, check=True).stdout.strip()
+    except (subprocess.CalledProcessError, OSError) as e:
+        detail = (getattr(e, "stderr", "") or str(e)).strip().splitlines()
+        print(f"hermes-wiki: cannot read HEAD of {src}: {detail[0] if detail else e}", file=sys.stderr)
+        return 2
     n = export.export_public(src, Path(args.dest).expanduser(), head, time.time())
     print("unchanged" if n < 0 else f"exported {n} pages")
     return 0
