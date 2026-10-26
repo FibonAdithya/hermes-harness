@@ -99,3 +99,30 @@ def test_load_tags(tmp_path):
     (tmp_path / "TAGS.md").write_text("- hermes — the assistant\n- cost — money\nprose line\n")
     assert schema.load_tags(tmp_path) == {"hermes", "cost"}
     assert schema.load_tags(tmp_path / "missing") == set()
+
+
+@pytest.mark.parametrize(
+    "meta",
+    [
+        {"type": "topic", "tags": "finance"},
+        {"type": ["person"]},
+        {"type": 5},
+        {"type": "topic", "tags": 5},
+        {"type": "topic", "tags": {"a": "b"}},
+        {"type": "topic", "tags": [["health"]]},
+    ],
+)
+def test_is_private_fails_closed_on_malformed_meta(meta):
+    assert schema.is_private(meta) is True
+
+
+def test_is_private_string_tag_public():
+    assert schema.is_private({"type": "topic", "tags": "hermes"}) is False
+
+
+@pytest.mark.parametrize(
+    "over",
+    [{"repos": ["x\n"]}, {"suggest_tags": ["tag\n"]}, {"created": "2026-10-26\n"}, {"review_by": "2026-10-26\n"}],
+)
+def test_trailing_newline_rejected(over):
+    assert schema.validate_note(good(**over), BODY, {"hermes"})
