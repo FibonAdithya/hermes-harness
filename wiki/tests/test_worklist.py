@@ -198,3 +198,12 @@ def test_lint_problem_target_collapsed_and_cut(tmp_path):
         f.write("- [[evil]]\n")
     probs = [x["problem"] for x in worklist.build(root, TODAY)["lint"] if x["page"] == "evil"]
     assert len(probs) == 1 and "\n" not in probs[0] and len(probs[0]) < 120
+
+
+def test_infra_pages_example_links_not_linted(tmp_path):
+    # CONVENTIONS.md shows `[[page-name]]` as an example; the curator must not be told to "repair" it.
+    root = make(tmp_path)
+    (root / "CONVENTIONS.md").write_text("Cross-link with `[[page-name]]`; every entry uses a [[wikilink]].\n")
+    problems = [(x["page"], x["problem"]) for x in worklist.build(root, TODAY)["lint"]]
+    assert not [p for p in problems if p[0] == "CONVENTIONS"]
+    assert any(p == "beta" and "nonexistent" in t for p, t in problems)

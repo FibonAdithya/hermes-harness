@@ -163,8 +163,29 @@ def _add_import_memory(sub) -> None:
     p.set_defaults(func=_cmd_import_memory)
 
 
+def _cmd_seed(args, cfg) -> int:
+    from . import seed
+
+    try:
+        actions = seed.seed(args.repo, force=args.force, gh=args.gh)
+    except (OSError, seed.SeedError) as e:
+        print(f"hermes-wiki: seed failed: {e}", file=sys.stderr)
+        return 2
+    for a in actions:
+        print(a)
+    return 0
+
+
+def _add_seed(sub) -> None:
+    p = sub.add_parser("seed", help="one-time: create TAGS.md and replace CONVENTIONS.md in the wiki repo")
+    p.add_argument("--force", action="store_true", help="replace CONVENTIONS.md even if it changed since planning")
+    p.add_argument("--repo", default="FibonAdithya/hermes-wiki")
+    p.add_argument("--gh", default="gh", help="gh binary")
+    p.set_defaults(func=_cmd_seed, needs_config=False)
+
+
 _COMMANDS = [_add_mcp, _add_export_public, _add_worklist, _add_session_end, _add_drain, _add_extract_dir,
-             _add_install_hook, _add_import_memory]
+             _add_install_hook, _add_import_memory, _add_seed]
 
 
 def build_parser() -> argparse.ArgumentParser:

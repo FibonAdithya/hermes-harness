@@ -84,7 +84,7 @@ def _lint(all_pages, tags: set[str]) -> list[dict]:
             for t in _list(p.meta.get("tags")):
                 if t not in tags:
                     out.append({"page": p.name, "problem": f"unknown tag: {t}"})
-        if p.name != "index":
+        if not p.infra:  # index lines are checked above; CONVENTIONS/TAGS hold example links
             for target in pagelib.links(p.body):
                 if pagelib.resolve(target, all_pages) is None:
                     out.append({"page": p.name, "problem": f"broken link: [[{_short(target)}]]"})
