@@ -25,12 +25,40 @@ def _is_tmp(cwd: str) -> bool:
     return cwd.startswith("/tmp/") or "pytest-of-" in cwd
 
 
+def _main_checkout(git_file: Path) -> Path | None:
+    """For a worktree's `.git` file (`gitdir: <main>/.git/worktrees/<name>`), return <main>."""
+    try:
+        text = git_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.startswith("gitdir:"):
+            gitdir = Path(line[len("gitdir:"):].strip())
+            if not gitdir.is_absolute():
+                gitdir = git_file.parent / gitdir
+            gitdir = Path(os.path.normpath(gitdir))
+            for d in (gitdir, *gitdir.parents):
+                if d.name == ".git":
+                    return d.parent
+            return None
+    return None
+
+
 def _opted_out(cwd: str, home: str) -> bool:
+    """Walk up from cwd; stop only at a `.git` directory, $HOME or /.
+
+    A `.git` file marks a git worktree: its main checkout's opt-out applies too.
+    """
     d = Path(cwd)
     while True:
         if (d / ".no-wiki-notes").exists():
             return True
-        if (d / ".git").exists() or str(d) == home or d == d.parent:
+        git = d / ".git"
+        if git.is_file():
+            main = _main_checkout(git)
+            if main is not None and (main / ".no-wiki-notes").exists():
+                return True
+        if git.is_dir() or str(d) == home or d == d.parent:
             return False
         d = d.parent
 

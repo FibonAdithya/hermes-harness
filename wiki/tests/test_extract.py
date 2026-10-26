@@ -317,3 +317,51 @@ def test_spawn_detached_uses_state_dir_cwd(cfg, monkeypatch):
     monkeypatch.setattr(ex.subprocess, "Popen", lambda argv, **kw: seen.update(kw))
     ex._spawn_detached(["x"], cfg, "s1")
     assert seen["cwd"] == cfg.state_dir
+
+
+def _git(*args):
+    subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "user.name=t", "-c", "user.email=t@t",
+                    *args], check=True, capture_output=True)
+
+
+def _main_with_worktree(tmp_path):
+    main, wt = tmp_path / "main", tmp_path / "elsewhere" / "wt"
+    main.mkdir()
+    _git("init", "-q", str(main))
+    _git("-C", str(main), "commit", "-q", "--allow-empty", "--no-verify", "-m", "c")
+    _git("-C", str(main), "worktree", "add", "-q", "-b", "wt", str(wt))
+    assert (wt / ".git").is_file()
+    (wt / "sub").mkdir()
+    return main, wt
+
+
+def test_optout_in_main_checkout_covers_its_worktree(tmp_path):
+    main, wt = _main_with_worktree(tmp_path)
+    home = str(tmp_path)
+    assert ex._opted_out(str(wt / "sub"), home) is False
+    (main / ".no-wiki-notes").write_text("")
+    assert ex._opted_out(str(wt / "sub"), home) is True
+    assert ex._opted_out(str(wt), home) is True
+
+
+def test_optout_relative_gitdir(tmp_path):
+    main = tmp_path / "main"
+    (main / ".git" / "worktrees" / "wt").mkdir(parents=True)
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    (wt / ".git").write_text("gitdir: ../main/.git/worktrees/wt\n")
+    assert ex._opted_out(str(wt), str(tmp_path)) is False
+    (main / ".no-wiki-notes").write_text("")
+    assert ex._opted_out(str(wt), str(tmp_path)) is True
+
+
+def test_optout_git_file_walk_continues_to_parent(tmp_path):
+    # A .git file is not a repository root: the walk goes on up to a .git directory or $HOME.
+    (tmp_path / "outer" / ".no-wiki-notes").parent.mkdir()
+    (tmp_path / "outer" / ".no-wiki-notes").write_text("")
+    wt = tmp_path / "outer" / "wt"
+    wt.mkdir()
+    (wt / ".git").write_text("gitdir: /nonexistent/.git/worktrees/wt\n")
+    assert ex._opted_out(str(wt), str(tmp_path)) is True
+    (wt / ".git").write_text("garbage\n")
+    assert ex._opted_out(str(wt), str(tmp_path)) is True
