@@ -178,3 +178,41 @@ def test_write_task_prompt_refuses_non_list(tmp_path):
         with pytest.raises(ValueError, match="context_pages must be a list of page names"):
             boxlib.write_task_prompt(tmp_path / "work", "do X", bad, ex)
     assert not (tmp_path / "work" / "prompt.txt").exists()
+
+
+PAGE_WITH_CODE = "# Title\n\nFirst para.\n\n```sh\n  indented  command   --flag\nsecond line\n```\n\n- item\n"
+
+
+def test_build_context_keeps_page_text_byte_identical(tmp_path):
+    ex = _export(tmp_path, {"code": PAGE_WITH_CODE, "plain": "no newline"})
+    text, inc, _ = boxlib.build_context(ex, ["code", "plain"])
+    assert inc == ["code", "plain"]
+    assert f"\n### code\n{PAGE_WITH_CODE}" in text
+    assert text.endswith("\n### plain\nno newline\n")
+
+
+def test_build_context_truncation_keeps_newlines(tmp_path):
+    page = "".join(f"line{i} a b\n" for i in range(100))  # 300 words
+    ex = _export(tmp_path, {"p": page})
+    text, _, _ = boxlib.build_context(ex, ["p"], cap_words=10)
+    body = text.split("### p\n", 1)[1]
+    assert body == "line0 a b\nline1 a b\nline2 a b\nline3 [truncated]\n"
+
+
+def test_write_task_prompt_is_utf8(tmp_path, monkeypatch):
+    # The box's locale may not be UTF-8; prompt.txt must not depend on it.
+    seen = []
+    real = Path.write_text
+
+    def spy(self, data, encoding=None, errors=None, newline=None):
+        seen.append((self.name, encoding))
+        return real(self, data, encoding=encoding, errors=errors, newline=newline)
+
+    monkeypatch.setattr(Path, "write_text", spy)
+    ex = tmp_path / "export"
+    ex.mkdir()
+    (ex / "u.md").write_bytes("caf\u00e9 \u2014 \u65e5\u672c".encode("utf-8"))
+    boxlib.write_task_prompt(tmp_path / "work", "do \u00e9", ["u"], ex)
+    assert seen == [("prompt.txt", "utf-8")]
+    t = (tmp_path / "work" / "prompt.txt").read_bytes().decode("utf-8")
+    assert t.startswith("do \u00e9") and "caf\u00e9 \u2014 \u65e5\u672c" in t
