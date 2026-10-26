@@ -30,17 +30,18 @@ BASE_TAGS = {
 }
 
 
-def build_wiki(root, extra_pages=None, index_lines=None, extra_tags=None, inbox=None) -> Path:
+def build_wiki(root, extra_pages=None, index_lines=None, extra_tags=None, inbox=None, unindexed=None) -> Path:
     """Write the base wiki under root and return it.
 
     extra_pages: {name: full text} added (or overriding) pages, also listed in index.md.
     index_lines: extra raw lines appended to index.md (e.g. a link to a missing page).
     extra_tags: {tag: meaning} added to TAGS.md.
+    unindexed: {name: full text} pages written but left out of index.md.
     inbox: {relative path under inbox/: text} extra inbox files.
     """
     root = Path(root)
     pages = {**BASE_PAGES, **(extra_pages or {})}
-    for name, text in pages.items():
+    for name, text in {**pages, **(unindexed or {})}.items():
         path = root / f"{name}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")

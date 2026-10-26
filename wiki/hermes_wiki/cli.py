@@ -44,7 +44,29 @@ def _add_export_public(sub) -> None:
     p.set_defaults(func=_cmd_export_public, needs_config=False)
 
 
-_COMMANDS = [_add_mcp, _add_export_public]
+def _cmd_worklist(args, cfg) -> int:
+    import json
+    from datetime import date
+
+    from . import worklist
+
+    try:
+        today = date.fromisoformat(args.today) if args.today else date.today()
+    except ValueError:
+        print(f"hermes-wiki: --today must be YYYY-MM-DD, got {args.today!r}", file=sys.stderr)
+        return 2
+    print(json.dumps(worklist.build(Path(args.root), today), indent=2, ensure_ascii=False))
+    return 0
+
+
+def _add_worklist(sub) -> None:
+    p = sub.add_parser("worklist", help="print the curator worklist for a wiki checkout as JSON")
+    p.add_argument("--root", required=True)
+    p.add_argument("--today", help="YYYY-MM-DD (default: today)")
+    p.set_defaults(func=_cmd_worklist, needs_config=False)
+
+
+_COMMANDS = [_add_mcp, _add_export_public, _add_worklist]
 
 
 def build_parser() -> argparse.ArgumentParser:
