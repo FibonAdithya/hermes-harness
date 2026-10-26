@@ -28,6 +28,7 @@ def cfg(tmp_path):
 @pytest.mark.parametrize("env,cwd,n,want", [
     ({"WIKI_NOTE_CHILD": "1"}, "/home/u/p", 9, "child"),
     ({}, "/tmp/x", 9, "tmp"),
+    ({}, "/tmp", 9, "tmp"),
     ({}, "/var/pytest-of-u/pytest-0/t", 9, "tmp"),
     ({}, "SUB", 9, "opted-out"),
     ({}, "/home/u/p", 3, "short"),
@@ -365,3 +366,41 @@ def test_optout_git_file_walk_continues_to_parent(tmp_path):
     assert ex._opted_out(str(wt), str(tmp_path)) is True
     (wt / ".git").write_text("garbage\n")
     assert ex._opted_out(str(wt), str(tmp_path)) is True
+
+
+def test_drain_keeps_pending_rewritten_during_run(cfg):
+    # The same session ended again (e.g. after --resume) while its extractor ran:
+    # the newer pending file must survive for the next drain.
+    p = _pending(cfg, "s0", NOW, text="OWNER: first end")
+
+    def run(argv, **kw):
+        ex._write_pending(cfg, "s0", "/c", "OWNER: second end")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    assert ex.drain(cfg, run=run) == [("s0", True)]
+    assert p.exists()
+    assert "second end" in p.read_text()
+
+
+def test_spawn_detached_child_has_own_session_and_no_stdin(cfg):
+    # A real child: it must outlive the hook, so it needs its own session and must not hold
+    # the hook's stdin. It reports both into its log.
+    import sys
+    code = ("import os; print('sid', os.getsid(0) == os.getpid()); "
+            "print('stdin', os.readlink('/proc/self/fd/0'))")
+    r, w = os.pipe()
+    saved = os.dup(0)
+    os.dup2(r, 0)  # the hook's stdin is a pipe from Claude Code; the child must not inherit it
+    try:
+        ex._spawn_detached([sys.executable, "-c", code], cfg, "s1")
+    finally:
+        os.dup2(saved, 0)
+        for fd in (saved, r, w):
+            os.close(fd)
+    log = cfg.state_dir / "log" / "drain-s1.log"
+    deadline = time.time() + 10
+    while time.time() < deadline and "stdin" not in (log.read_text() if log.exists() else ""):
+        time.sleep(0.05)
+    text = log.read_text()
+    assert "sid True" in text
+    assert "stdin /dev/null" in text

@@ -16,6 +16,7 @@ TODAY = date(2026, 10, 26)
     ("-tmp-pytest-of-fibonadithya-pytest-332-x", True),
     ("TIG-Talos--claude-worktrees-cpu-fallback", True),
     ("-herdr-worktrees-wgan-synthetic-writeup-latex", True),
+    ("-home-fibonadithya-hermes-harness--worktrees-pr29", True),
     ("-home-fibonadithya-hermes-harness", False),
     ("TIG-Talos", False),
 ])

@@ -22,7 +22,7 @@ def load_prompt() -> str:
 
 
 def _is_tmp(cwd: str) -> bool:
-    return cwd.startswith("/tmp/") or "pytest-of-" in cwd
+    return cwd == "/tmp" or cwd.startswith("/tmp/") or "pytest-of-" in cwd
 
 
 def _main_checkout(git_file: Path) -> Path | None:
@@ -173,8 +173,15 @@ def _child_env() -> dict[str, str]:
     return env
 
 
+def _identity(st: os.stat_result) -> tuple[int, int]:
+    return st.st_ino, st.st_mtime_ns
+
+
 def _run_one(cfg: WikiConfig, pending: Path, run) -> tuple[str, bool]:
-    head, _, body = pending.read_text(encoding="utf-8").partition("\n")
+    with open(pending, encoding="utf-8") as fh:
+        # The hook may replace this file while the extractor runs; only the copy read here is done.
+        seen = _identity(os.fstat(fh.fileno()))
+        head, _, body = fh.read().partition("\n")
     cwd = ""
     try:
         meta = json.loads(head)
@@ -206,7 +213,11 @@ def _run_one(cfg: WikiConfig, pending: Path, run) -> tuple[str, bool]:
     finally:
         conf.unlink(missing_ok=True)
     if ok:
-        pending.unlink(missing_ok=True)
+        try:
+            if _identity(pending.stat()) == seen:
+                pending.unlink()
+        except FileNotFoundError:
+            pass
     return session, ok
 
 

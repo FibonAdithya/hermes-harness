@@ -14,7 +14,7 @@ from .schema import NOTE_CHAR_CAP, NOTE_WORD_CAP
 IMPORT_SOURCE = "import-claude-memory"
 _KINDS = {"user": "person", "feedback": "decision", "project": "status", "reference": "fact"}
 _TYPE = re.compile(r"^\s*type:\s*(\w+)")
-_SKIP_MARKERS = ("pytest-of-", "-claude-worktrees-", "herdr-worktrees")
+_SKIP_MARKERS = ("pytest-of-", "-claude-worktrees-", "herdr-worktrees", "--worktrees-")
 _WORD = re.compile(r"\S+")
 
 
