@@ -93,3 +93,12 @@ def test_tmp_removed_on_failure(tmp_path, monkeypatch):
         pass
     assert not list(tmp_path.glob("*.tmp-wiki"))
     assert json.loads(f.read_text()) == ORIGINAL
+
+
+def test_mode_640_preserved(tmp_path):
+    import os, stat
+    f = tmp_path / "settings.json"
+    f.write_text(json.dumps(ORIGINAL), encoding="utf-8")
+    os.chmod(f, 0o640)
+    install_session_end_hook(f, CMD)
+    assert stat.S_IMODE(f.stat().st_mode) == 0o640
