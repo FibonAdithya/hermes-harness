@@ -136,12 +136,31 @@ def run_talos(challenge: str = "", direction: str = "", iterations: int | None =
 
 
 @mcp.tool()
-def run_task(repo: str, prompt: str, minutes: int = 30) -> str:
-    """Run a coding task with Claude Code on the box, PR only. Requires a grant."""
+def run_task(repo: str, prompt: str, minutes: int = 30, context_pages: list[str] | None = None) -> str:
+    """Run a coding task with Claude Code on the box, PR only. Requires a grant.
+
+    context_pages: names of wiki pages that would help the task (page names as in the
+    wiki, without .md). The box appends them to the brief as reference data; private
+    pages are never attached.
+    """
     require_grant(_store(), "tig-server", now=time.time())
     _config().check_repo(repo)
-    r = box.call(_target("tig-server"), "run_task", {"repo": repo, "prompt": prompt, "minutes": int(minutes)})
-    return r.get("error") or f"task {r['id']} started on {repo}. Poll night_status(); read night_log('{r['id']}')."
+    args = {"repo": repo, "prompt": prompt, "minutes": int(minutes)}
+    if context_pages:
+        args["context_pages"] = list(context_pages)
+    r = box.call(_target("tig-server"), "run_task", args)
+    if "error" in r:
+        return r["error"]
+    out = f"task {r['id']} started on {repo}. Poll night_status(); read night_log('{r['id']}')."
+    if context_pages:
+        if "context_included" not in r:
+            out += " Wiki pages not attached: the box has not been updated."
+        else:
+            if r["context_included"]:
+                out += f" Attached wiki pages: {', '.join(r['context_included'])}."
+            if r.get("context_dropped"):
+                out += f" Not attached (private or missing on the box): {', '.join(r['context_dropped'])}."
+    return out
 
 
 @mcp.tool()
