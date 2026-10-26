@@ -1,1 +1,3 @@
-raise SystemExit("cli not built")
+from .cli import main
+
+raise SystemExit(main())
