@@ -504,3 +504,43 @@ session stats.
 - The curator's prompt wording, within the rules in §5.
 - The `delegate_task` brief field name in Hermes v0.19.0.
 - Seed content of `TAGS.md` beyond the starter list.
+
+## Amendments from planning (2026-10-26)
+
+Found while writing the implementation plan. Each changes the body above; the
+plan follows these.
+
+1. **Hermes on the droplet gets no `wiki` MCP server.** The droplet's wiki
+   files are owned by uid 0 with mode 600 (MEASURED: `ls -ln
+   ~/.hermes/sandboxes/docker/default/home/hermes-wiki`), so no process running
+   as `hermes` can read them, and the sandbox image has no `mcp` package
+   (MEASURED: `docker run --rm hermes-sandbox:latest python3 -c "import yaml"`
+   fails; the image has Python 3.12.13, `rg` and `git`). Hermes keeps `rg` and
+   its file tools; `CONVENTIONS.md` documents filtering by tag with `rg`.
+   Droplet-side reads (the curator worklist) run inside `docker run ...
+   hermes-sandbox:latest`, which is why the package core is stdlib-only.
+2. **`context_pages` is resolved on the box, not by the broker.** The broker
+   cannot read the droplet's wiki for the same reason. The broker forwards page
+   names; the box's `run_task` verb reads them from the public export. Private
+   filtering then needs no extra code, at the cost of the export lagging the
+   wiki by up to 15 minutes.
+3. **Executor containers read the public export at `/wiki` with `rg`** instead
+   of running the `wiki` MCP server inside the container.
+4. **Note filenames carry no agent text:**
+   `inbox/<source>/<YYYY-MM-DD>-<kind>-<8 hex>.md`. Paths reach the curator's
+   prompt, and Hermes's scanner reads the whole prompt.
+5. **Rollout order is fixed:** the new pull-before-push sync must be installed
+   on the droplet before anything else writes to the wiki. The current script
+   never pulls, so the first outside commit would make every later droplet
+   push fail as non-fast-forward.
+6. **The curator worklist quarantines with Hermes's own scanner, run from the
+   cron script under Hermes's venv Python** (MEASURED: that interpreter imports
+   `tools.cronjob_tools._scan_cron_skill_assembled`, which returns
+   `Blocked: prompt matches threat pattern 'prompt_injection'` for a test
+   phrase). Deleting a quarantined note uses `docker run` as root, because the
+   files are root-owned.
+7. **The curator's tool restriction is set after creation** with
+   `cron.jobs.update_job(<id>, {"enabled_toolsets": ["file", "terminal"]})`,
+   because `hermes cron create` has no toolset flag (MEASURED: `hermes cron
+   create --help`). Silence when nothing changed uses Hermes's `[SILENT]`
+   reply convention (`cron/scheduler.py`, `SILENT_MARKER`).
