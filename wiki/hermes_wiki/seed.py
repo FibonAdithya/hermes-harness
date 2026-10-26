@@ -5,6 +5,7 @@ the copy taken at planning time (seed/CONVENTIONS.before.md), so an edit Hermes 
 since then is never overwritten without --force.
 """
 import base64
+import binascii
 import json
 import subprocess
 from pathlib import Path
@@ -36,8 +37,11 @@ def _get(repo: str, path: str, run, gh: str) -> dict | None:
     return obj
 
 
-def _decode(obj: dict) -> str:
-    return base64.b64decode(obj.get("content", "")).decode("utf-8")
+def _decode(obj: dict, path: str) -> str:
+    try:
+        return base64.b64decode(obj.get("content", "")).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError, TypeError, ValueError) as e:
+        raise SeedError(f"GET {path}: content not decodable: {e}") from None
 
 
 def _put(repo: str, path: str, text: str, message: str, run, gh: str, sha: str | None = None) -> None:
@@ -70,9 +74,10 @@ def seed(repo: str, force: bool = False, run=subprocess.run, gh: str = "gh",
         actions.append("TAGS.md exists; left alone")
 
     cur = _get(repo, "CONVENTIONS.md", run, gh)
-    if cur is not None and _decode(cur) == new_conv:
+    text = _decode(cur, "CONVENTIONS.md") if cur is not None else None
+    if text == new_conv:
         actions.append("CONVENTIONS.md already seeded")
-    elif force or (cur is not None and _decode(cur) == old_conv):
+    elif force or text == old_conv:
         _put(repo, "CONVENTIONS.md", new_conv, "seed: CONVENTIONS.md", run, gh,
              sha=cur["sha"] if cur is not None else None)
         actions.append("replaced CONVENTIONS.md" if cur is not None else "created CONVENTIONS.md")

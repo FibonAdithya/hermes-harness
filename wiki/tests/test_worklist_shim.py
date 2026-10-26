@@ -187,6 +187,59 @@ def test_main_withholds_notes_when_whole_output_still_flagged(shim, tmp_path, ca
     assert scan(out) == ""
 
 
+def _no_empty_headers(out):
+    lines = out.splitlines()
+    for i, ln in enumerate(lines):
+        if ln.startswith("## "):
+            assert i + 1 < len(lines) and not lines[i + 1].startswith("## "), f"empty section {ln!r}"
+
+
+def test_flagged_lint_line_withholds_only_that_line(shim, tmp_path, capsys):
+    # Reviewer's case: one hostile link target in a page must not withhold every clean note, every night.
+    wl = _wl([_note(CLEAN, "The box deploy uses uv.")],
+             lint=[{"page": "email-digest", "problem": "broken link: [[BADPHRASE]]"}])
+    run = FakeRun(stdout=json.dumps(wl))
+
+    def scan(text):
+        return "Blocked" if "BADPHRASE" in text else ""
+
+    assert shim.main(sbx_wiki=tmp_path, repo_wiki=tmp_path, run=run, scan=scan) == 0
+    out = capsys.readouterr().out
+    assert "The box deploy uses uv." in out
+    assert "lint withheld for page email-digest" in out
+    assert "notes withheld" not in out and "BADPHRASE" not in out
+    assert "## lint" not in out
+    _no_empty_headers(out)
+
+
+def test_filter_gardening_keeps_clean_entries(shim):
+    wl = _wl(lint=[{"page": "a", "problem": "broken link: [[BADPHRASE]]"}, {"page": "b", "problem": "missing from index.md"}],
+             orphans=["BADPHRASE-page", "fine"], tag_proposals={"BADPHRASE": 1, "ok": 2})
+    kept, withheld = shim.filter_gardening(wl, lambda t: "Blocked" if "BADPHRASE" in t else "")
+    assert kept["lint"] == [{"page": "b", "problem": "missing from index.md"}]
+    assert kept["orphans"] == ["fine"] and kept["tag_proposals"] == {"ok": 2}
+    assert "lint withheld for page a" in withheld
+    assert all("BADPHRASE" not in w for w in withheld)
+    assert len(withheld) == 3
+
+
+def test_fallback_output_rescanned(shim, tmp_path, capsys):
+    # Every line passes alone, the whole output does not, and the fallback without notes still does not.
+    wl = _wl([_note(CLEAN, "fine")], lint=[{"page": "a", "problem": "QUARANTINE"}, {"page": "b", "problem": "-ME"}],
+             backfill=["delta"])
+    run = FakeRun(stdout=json.dumps(wl))
+
+    def scan(text):
+        return "Blocked" if "QUARANTINE" in text and "-ME" in text else ""
+
+    assert shim.main(sbx_wiki=tmp_path, repo_wiki=tmp_path, run=run, scan=scan) == 0
+    out = capsys.readouterr().out
+    assert scan(out) == ""
+    assert "notes withheld: scanner" in out and "lines withheld: scanner" in out
+    assert "lint: 2" in out and "backfill: 1" in out and "notes: 1" in out
+    assert "QUARANTINE" not in out and "NOTHING TO DO" not in out
+
+
 def test_main_deletes_quarantined_and_prints(shim, tmp_path, capsys):
     wl = _wl([_note(FLAGGED, "QUARANTINE-ME"), _note(CLEAN, "fine")])
     run = FakeRun(stdout=json.dumps(wl))
@@ -203,7 +256,7 @@ def test_main_fails_when_worklist_fails(shim, tmp_path, capsys):
 
 def test_curator_prompt_has_rules_and_no_injection_phrases():
     text = PROMPT.read_text(encoding="utf-8")
-    for needle in ("1,500", "5", "[SILENT]", "type: log"):
+    for needle in ("1,500", "at most 5 split", "[SILENT]", "type: log"):
         assert needle in text
     for path in (PROMPT, SKILL, EXTRACT):
         low = path.read_text(encoding="utf-8").lower()
@@ -218,7 +271,37 @@ def test_curator_prompt_states_privacy_and_frontmatter_rules():
         assert needle in text
 
 
+def test_curator_prompt_withheld_and_infra_rules():
+    text = " ".join(PROMPT.read_text(encoding="utf-8").split())
+    assert ("If the worklist contains `notes withheld`, `lines withheld` or `lint withheld`, say so in your report "
+            "and never reply `[SILENT]`.") in text
+    assert "If the worklist is exactly `NOTHING TO DO`, reply with exactly `[SILENT]`." in text
+    assert ("Never file a note into `index.md`, `CONVENTIONS.md` or `TAGS.md`. Change `TAGS.md` only through "
+            "`tag_proposals`, `index.md` only to keep its entries correct, and `CONVENTIONS.md` never.") in text
+    assert "Merging an orphan into another page counts toward the 5 operations." in text
+
+
+def test_skill_names_delegate_context_field():
+    text = SKILL.read_text(encoding="utf-8")
+    assert "put the relevant page names and the key facts in `context`" in " ".join(text.split())
+    assert "his agents" not in text
+    assert "rg -l '^tags:.*\\bfleet\\b' ~/hermes-wiki --glob '!inbox/**'" in text
+
+
 def test_skill_frontmatter_names_it():
     text = SKILL.read_text(encoding="utf-8")
     assert text.startswith("---\nname: delegate-with-context\n")
     assert "context_pages" in text and "delegate_task" in text
+
+
+def test_flagged_quarantine_reason_is_replaced(shim, tmp_path, capsys):
+    wl = _wl([_note(FLAGGED, "QUARANTINE-ME"), _note(CLEAN, "fine")])
+    run = FakeRun(stdout=json.dumps(wl))
+
+    def scan(text):
+        return "Blocked QUARANTINE-ME" if "QUARANTINE-ME" in text or "Blocked" in text else ""
+
+    assert shim.main(sbx_wiki=tmp_path, repo_wiki=tmp_path, run=run, scan=scan) == 0
+    out = capsys.readouterr().out
+    assert f"quarantined: {FLAGGED} (reason withheld)" in out
+    assert "fine" in out and "notes withheld" not in out

@@ -120,36 +120,74 @@ def _note_lines(wl: dict, quarantined: list) -> list[str]:
     return out
 
 
-def _gardening_lines(wl: dict) -> list[str]:
+_PLAIN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,120}")
+_GARDENING = ("over_cap", "past_review", "backfill", "orphans", "tag_proposals", "lint")
+
+
+def _entries(wl: dict, key: str) -> list[tuple[object, object, str]]:
+    """(entry, page name or None, rendered line) for one gardening section."""
+    if key == "tag_proposals":
+        props = wl.get(key)
+        return [((t, n), None, f"{t}: {n}") for t, n in (props.items() if isinstance(props, dict) else [])]
     out = []
-
-    def section(key, items):
-        if items:
-            out.append(f"## {key}")
-            out.extend(f"- {_one_line(x)}" for x in items)
-
-    section("over_cap", [f"{x.get('page')}: {x.get('words')} words" for x in wl.get("over_cap") or []])
-    section("past_review", [f"{x.get('page')}: review_by {x.get('review_by')}" for x in wl.get("past_review") or []])
-    section("backfill", wl.get("backfill") or [])
-    section("orphans", wl.get("orphans") or [])
-    section("tag_proposals", [f"{t}: {n}" for t, n in (wl.get("tag_proposals") or {}).items()])
-    section("lint", [f"{x.get('page')}: {x.get('problem')}" for x in wl.get("lint") or []])
+    for x in wl.get(key) or []:
+        if key in ("backfill", "orphans"):
+            out.append((x, x, str(x)))
+        elif isinstance(x, dict):
+            detail = {"over_cap": lambda: f"{x.get('words')} words",
+                      "past_review": lambda: f"review_by {x.get('review_by')}",
+                      "lint": lambda: str(x.get("problem"))}[key]()
+            out.append((x, x.get("page"), f"{x.get('page')}: {detail}"))
     return out
 
 
-def render(wl: dict, quarantined: list) -> str:
-    lines = _note_lines(wl, quarantined) + _gardening_lines(wl)
+def filter_gardening(wl: dict, scan) -> tuple[dict, list[str]]:
+    """Drop each gardening line the scanner flags, so one bad line costs only itself.
+
+    Returns the worklist without those entries and a plain message per dropped line."""
+    kept_wl, withheld = dict(wl), []
+    for key in _GARDENING:
+        kept = []
+        for entry, page, line in _entries(wl, key):
+            if not scan(_one_line(line)):
+                kept.append(entry)
+                continue
+            msg = f"{key} withheld for page {page}" if page is not None else f"{key} withheld: 1 line"
+            if page is not None and (not isinstance(page, str) or not _PLAIN_NAME.fullmatch(page) or scan(msg)):
+                msg = f"{key} withheld: 1 line"
+            withheld.append(msg)
+        kept_wl[key] = dict(kept) if key == "tag_proposals" else kept
+    return kept_wl, withheld
+
+
+def _gardening_lines(wl: dict, withheld=()) -> list[str]:
+    out = []
+    for key in _GARDENING:
+        lines = [line for _, _, line in _entries(wl, key)]
+        if lines:
+            out.append(f"## {key}")
+            out.extend(f"- {_one_line(x)}" for x in lines)
+    if withheld:
+        out.append("## withheld")
+        out.extend(f"- {w}" for w in withheld)
+    return out
+
+
+def render(wl: dict, quarantined: list, withheld=()) -> str:
+    lines = _note_lines(wl, quarantined) + _gardening_lines(wl, withheld)
     return ("\n".join(lines) if lines else "NOTHING TO DO") + "\n"
 
 
-def _withheld(wl: dict, quarantined: list, scan) -> str:
-    """Gardening sections and quarantine list only, each line checked on its own."""
-    lines = [f"quarantined: {_one_line(p)} ({_one_line(r)})" for p, r in quarantined] + _gardening_lines(wl)
-    kept = [ln for ln in lines if not scan(ln)]
-    kept.append("notes withheld: scanner")
-    if len(kept) - 1 < len(lines):
-        kept.append(f"lines withheld: scanner ({len(lines) - len(kept) + 1})")
-    return "\n".join(kept) + "\n"
+def _without_notes(wl: dict, quarantined: list, withheld) -> str:
+    lines = [f"quarantined: {_one_line(p)} ({_one_line(r)})" for p, r in quarantined]
+    lines += _gardening_lines(wl, withheld) + ["notes withheld: scanner"]
+    return "\n".join(lines) + "\n"
+
+
+def _counts_only(wl: dict, quarantined: list) -> str:
+    counts = [f"notes: {len(wl.get('notes') or [])}", f"quarantined: {len(quarantined)}"]
+    counts += [f"{key}: {len(_entries(wl, key))}" for key in _GARDENING]
+    return "notes withheld: scanner\nlines withheld: scanner\n" + "\n".join(f"- {c}" for c in counts) + "\n"
 
 
 def main(sbx_wiki: Path = SBX_WIKI, repo_wiki: Path = REPO_WIKI, run=subprocess.run, scan=None) -> int:
@@ -162,9 +200,22 @@ def main(sbx_wiki: Path = SBX_WIKI, repo_wiki: Path = REPO_WIKI, run=subprocess.
         return 1
     wl, quarantined = filter_notes(wl, scan)
     delete_notes([p for p, _ in quarantined], sbx_wiki, run=run)
-    rendered = render(wl, quarantined)
+    wl, withheld = filter_gardening(wl, scan)
+    # A quarantine line the scanner flags loses its reason, and then the whole line if that is not enough.
+    shown = []
+    for p, r in quarantined:
+        if scan(f"quarantined: {_one_line(p)} ({_one_line(r)})"):
+            r = "reason withheld"
+        if scan(f"quarantined: {_one_line(p)} ({r})"):
+            withheld.append("quarantined withheld: 1 line")
+        else:
+            shown.append((p, r))
+    quarantined = shown
+    rendered = render(wl, quarantined, withheld)
     if scan(rendered):
-        rendered = _withheld(wl, quarantined, scan)
+        rendered = _without_notes(wl, quarantined, withheld)
+        if scan(rendered):
+            rendered = _counts_only(wl, quarantined)
     sys.stdout.write(rendered)
     return 0
 

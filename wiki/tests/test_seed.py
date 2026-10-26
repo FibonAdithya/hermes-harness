@@ -92,15 +92,70 @@ def test_seed_tags_include_private_tags():
     assert len(lines) == 13 and all(" — " in ln for ln in lines)
 
 
+REWORDED = '- Every page gets a one-line entry under "## Pages" in `index.md`.'
+
+
+def _bullets(text):
+    """Each `- ` bullet with its indented continuation lines, as one string."""
+    out, cur = [], None
+    for ln in text.splitlines():
+        if ln.startswith("- "):
+            cur = [ln]
+            out.append(cur)
+        elif cur is not None and ln.startswith("  "):
+            cur.append(ln)
+        else:
+            cur = None
+    return ["\n".join(b) for b in out]
+
+
 def test_conventions_keeps_every_existing_rule():
-    before = _before()
+    before = _bullets(_before())
     after = (SEED_DIR / "CONVENTIONS.md").read_text(encoding="utf-8")
-    for needle in ("never run git inside this repo yourself", "Never record secrets", "kebab-case",
-                   "rg", "[[page-name]]", "Delete or correct pages"):
-        assert needle in before and needle in after
+    assert REWORDED in before, "the deliberately reworded rule is no longer in CONVENTIONS.before.md"
+    assert len(before) == 9
+    for bullet in before:
+        if bullet != REWORDED:
+            assert bullet in after, f"rule dropped or changed: {bullet!r}"
+    assert "Every page gets a one-line entry in `index.md`, under the heading for its\n  type" in after
     for needle in ("only the curator edits pages from notes; never hand-edit `inbox/`",
                    r"rg -l '^tags:.*\bcost\b'", "1,500", "type: person", "[[wikilink]]"):
         assert needle in after
+
+
+def _stub_gh(tmp_path, body):
+    gh = tmp_path / "gh"
+    (tmp_path / "body.json").write_text(json.dumps(body), encoding="utf-8")
+    gh.write_text(f"#!/bin/sh\ncat '{tmp_path / 'body.json'}'\n", encoding="utf-8")
+    gh.chmod(0o755)
+    return str(gh)
+
+
+def test_seed_undecodable_content_is_a_seed_error():
+    for content in ("!!!notbase64", base64.b64encode(b"\xff\xfe").decode()):
+        gh = FakeGh({"TAGS.md": "x"})
+        gh.files["CONVENTIONS.md"] = None
+
+        def run(argv, _gh=gh, _c=content, **kw):
+            if argv[-1].endswith("CONVENTIONS.md") and "-X" not in argv:
+                return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"content": _c, "sha": "s"}), stderr="")
+            return _gh(argv, **kw)
+
+        try:
+            seed.seed(REPO, run=run)
+        except seed.SeedError as e:
+            assert "CONVENTIONS.md" in str(e)
+        else:
+            raise AssertionError("expected SeedError")
+
+
+def test_cli_seed_undecodable_exits_2(tmp_path, capsys):
+    from hermes_wiki import cli
+
+    gh = _stub_gh(tmp_path, {"content": base64.b64encode(b"\xff\xfe").decode(), "sha": "s"})
+    assert cli.main(["seed", "--gh", gh, "--repo", REPO]) == 2
+    err = capsys.readouterr().err.strip().splitlines()
+    assert len(err) == 1 and err[0].startswith("hermes-wiki: seed failed:")
 
 
 def test_cli_seed_parser():

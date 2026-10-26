@@ -68,7 +68,9 @@ going on.
 ```
 
 Expected: worklist sections (`## backfill`, `## orphans`, `## lint`, ...) or
-`NOTHING TO DO`. On today's wiki, expect `## backfill` with 10 pages. This run
+`NOTHING TO DO`. A `## withheld` section or a `notes withheld: scanner` line
+means the script dropped lines that Hermes's scanner flags; the curator reports
+them. On today's wiki, expect `## backfill` with 10 pages. This run
 is real: any note the scanner flags is deleted from `inbox/`.
 
 ### 3. Droplet: prompt and skill against Hermes's strict scanner
@@ -82,6 +84,16 @@ Expected: `''` for both. Anything else names the pattern that matched; fix the
 wording in the repo before creating the job (a match blocks `cron create`).
 
 ### 4. Laptop: seed `TAGS.md` and `CONVENTIONS.md`
+
+First bring the laptop checkout to the merged `master`, so the seed files are
+the reviewed ones:
+
+```bash
+git -C ~/hermes-harness fetch && git -C ~/hermes-harness checkout master && git -C ~/hermes-harness pull --ff-only
+```
+
+Expected: `Already up to date.` or a fast-forward to the merge commit; no
+conflict. Then:
 
 ```bash
 hermes-wiki seed
@@ -97,6 +109,8 @@ created TAGS.md
 replaced CONVENTIONS.md
 ```
 
+If it prints `hermes-wiki: seed failed: ...` (one line, exit 2), nothing after
+the failing step was written; fix the cause and re-run (it is safe to re-run).
 If it prints `CONVENTIONS.md changed since planning; not replaced`, Hermes
 edited `CONVENTIONS.md` after 2026-10-26. Compare
 `gh api repos/FibonAdithya/hermes-wiki/contents/CONVENTIONS.md --jq .content | base64 -d`
