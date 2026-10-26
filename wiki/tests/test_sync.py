@@ -114,3 +114,34 @@ def test_pulls_even_without_local_changes(repos, env):
     assert r.returncode == 0, r.stderr
     assert (droplet / "inbox/claude-laptop/n.md").exists()
     assert r.stdout.strip() == "no changes"
+
+
+def test_rebase_in_progress_leaves_work_alone(repos, env):
+    # The owner is resolving a conflict by hand when the timer fires: the run must not
+    # commit conflict markers or abort the owner's rebase (which would drop the new page).
+    origin, droplet, outside = repos
+    outside_push(outside, env, "alpha.md", "one\nOUTSIDE\nthree\n")
+    outside_sha = git(outside, env, "rev-parse", "HEAD")
+    (droplet / "alpha.md").write_text("one\nDROPLET\nthree\n")
+    git(droplet, env, "commit", "-qam", "local")
+    stuck = subprocess.run(["git", "pull", "-q", "--rebase", "origin", "main"], cwd=droplet,
+                           env=env, capture_output=True, text=True)
+    assert stuck.returncode != 0
+    (droplet / "new-page.md").write_text("fresh\n")
+    r = run(droplet, env)
+    assert r.returncode == 1
+    assert "in progress" in r.stderr
+    assert (droplet / "new-page.md").exists()
+    assert (droplet / ".git" / "rebase-merge").exists() or (droplet / ".git" / "rebase-apply").exists()
+    assert "auto-snapshot" not in git(droplet, env, "log", "--all", "--format=%s")
+    assert git(origin, env, "rev-parse", "main") == outside_sha
+
+
+def test_pull_failure_is_not_called_a_conflict(repos, env, tmp_path):
+    origin, droplet, _ = repos
+    git(droplet, env, "remote", "set-url", "origin", str(tmp_path / "missing.git"))
+    (droplet / "alpha.md").write_text("one\ntwo\nthree\nfour\n")
+    r = run(droplet, env)
+    assert r.returncode == 1
+    assert "FATAL: pull failed" in r.stderr
+    assert "conflict" not in r.stderr

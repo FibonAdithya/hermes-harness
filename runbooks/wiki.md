@@ -232,7 +232,10 @@ check (acceptance check 13).
   update `load_scanner` in `droplet/wiki-worklist.py`.
 - **Sync fails** with `FATAL: rebase conflict, not pushed`: a page edit on the
   droplet conflicts with an outside commit. Only the curator edits pages, so
-  this should not happen; resolve it in the sandbox checkout by hand.
+  this should not happen; resolve it in the sandbox checkout by hand. While
+  the rebase is open, each timer run exits with `FATAL: rebase or merge in
+  progress` and leaves the checkout alone; the next run after you finish
+  pushes. `FATAL: pull failed` is a network or auth error, not a conflict.
 
 ## Rollout log
 

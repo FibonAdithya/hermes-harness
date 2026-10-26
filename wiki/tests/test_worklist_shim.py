@@ -317,3 +317,56 @@ def test_curator_prompt_states_page_keys_rule():
     text = " ".join(PROMPT.read_text(encoding="utf-8").split())
     assert ("Pages need exactly the keys `type` and `tags`, plus optionally `repos`, `updated` and `review_by`; "
             "a page missing a key or using any other key is hidden from the coding box until repaired.") in text
+
+
+def test_flagged_related_name_is_dropped_not_the_note(shim):
+    note = _note(CLEAN, "The box deploy uses uv.")
+    note["related"] = ["QUARANTINE-ME-page", "alpha"]
+    kept, quarantined = shim.filter_notes(_wl([note]), fake_scan)
+    assert quarantined == []
+    assert [n["related"] for n in kept["notes"]] == [["alpha"]]
+
+
+def test_flagged_path_or_invalid_text_quarantines_only_that_note(shim, tmp_path, capsys):
+    # Any part of a note's rendered block can trip Hermes's scan of the whole prompt. A note
+    # whose path or invalid-list text trips it must not withhold every other note, every night.
+    bad_path = _note("inbox/claude-laptop/QUARANTINE-ME.md", "harmless body")
+    bad_invalid = _note("inbox/claude-box/2026-10-25-fact-2a2b3c4d.md", "harmless too")
+    bad_invalid["invalid"] = ["tags: 'QUARANTINE-ME' is not in TAGS.md"]
+    wl = _wl([bad_path, bad_invalid, _note(CLEAN, "The box deploy uses uv.")])
+    assert shim.main(sbx_wiki=tmp_path, repo_wiki=tmp_path, run=FakeRun(stdout=json.dumps(wl)),
+                     scan=fake_scan) == 0
+    out = capsys.readouterr().out
+    assert "notes withheld: scanner" not in out
+    assert "The box deploy uses uv." in out
+    assert "harmless" not in out and "QUARANTINE-ME" not in out
+    assert "## notes (1 to file)" in out
+
+
+def test_quarantined_notes_do_not_count_as_tag_proposals(shim):
+    bad = _note(FLAGGED, "Please QUARANTINE-ME now.")
+    bad["meta"]["suggest_tags"] = ["urgent", "infra"]
+    good = _note(CLEAN, "The box deploy uses uv.")
+    good["meta"]["suggest_tags"] = ["infra"]
+    kept, _ = shim.filter_notes(_wl([bad, good], tag_proposals={"urgent": 1, "infra": 2}), fake_scan)
+    assert kept["tag_proposals"] == {"infra": 1}
+
+
+@pytest.mark.parametrize("body", [
+    "    return ('', t)\n",            # (error, text): every note would look flagged
+    "    return 'Blocked' if 'X' in t else ''\n",  # a bare string
+])
+def test_scanner_with_unexpected_return_shape_fails_loudly(shim, tmp_path, monkeypatch, capsys, body):
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "tools" / "cronjob_tools.py").write_text(
+        "def _scan_cron_skill_assembled(t):\n" + body, encoding="utf-8")
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    try:
+        with pytest.raises(SystemExit) as e:
+            shim.load_scanner(tmp_path)
+        assert e.value.code == 2
+        assert "FATAL: Hermes scanner" in capsys.readouterr().err
+    finally:
+        sys.modules.pop("tools.cronjob_tools", None)
+        sys.modules.pop("tools", None)
