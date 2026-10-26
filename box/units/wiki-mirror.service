@@ -5,3 +5,4 @@ Description=Refresh the read-only hermes-wiki mirror
 Type=oneshot
 ExecStart=/usr/bin/git -C %h/TIG/hermes-wiki fetch -q origin
 ExecStart=/usr/bin/git -C %h/TIG/hermes-wiki reset -q --hard origin/main
+ExecStart=%h/.local/bin/hermes-wiki export-public --src %h/TIG/hermes-wiki --dest %h/TIG/hermes-wiki-public

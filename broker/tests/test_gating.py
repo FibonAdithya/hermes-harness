@@ -232,3 +232,34 @@ def test_night_status_shows_a_doctor_error(monkeypatch):
         "doctor_unit": "ok"})
     out = server.night_status()
     assert "doctor: error gh issue create failed: HTTP 502" in out and "FAILED" not in out
+
+
+def test_run_task_context_pages_still_gated_and_forwarded(store, monkeypatch):
+    from hermes_broker import server
+
+    monkeypatch.setattr(server, "_store", lambda: store)
+    monkeypatch.setattr(server, "_target", lambda box: "tig-server")
+    monkeypatch.setattr(server, "_config", lambda: SimpleNamespace(check_repo=lambda r: None))
+    sent = []
+    reply = {"id": "t", "context_included": ["a"], "context_dropped": ["b"]}
+    monkeypatch.setattr(server.box, "call", lambda t, v, a, timeout=60: sent.append((v, a)) or dict(reply))
+    with pytest.raises(Locked):
+        server.run_task("o/r", "p", 5, context_pages=["a", "b"])
+    assert sent == []
+    store.approve(store.create_request("tig-server", 30, "x", now=time.time()), now=time.time())
+    out = server.run_task("o/r", "p", 5, context_pages=["a", "b"])
+    assert sent[0][1]["context_pages"] == ["a", "b"]
+    assert "Attached wiki pages: a." in out
+    assert "Not attached (private or missing on the box): b." in out
+    reply.clear()
+    reply.update({"id": "t", "context_included": [], "context_dropped": []})
+    out = server.run_task("o/r", "p", 5)
+    assert "context_pages" not in sent[1][1]
+    assert "Attached" not in out and "updated" not in out
+    server.run_task("o/r", "p", 5, context_pages=[])
+    assert "context_pages" not in sent[2][1]
+    reply.clear()
+    reply["id"] = "t"
+    out = server.run_task("o/r", "p", 5, context_pages=["a"])
+    assert "the box has not been updated" in out
+    assert "Attached" not in out

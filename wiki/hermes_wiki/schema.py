@@ -1,0 +1,175 @@
+"""Wiki constants and note validation."""
+import re
+from datetime import datetime
+from pathlib import Path
+
+from . import secretscan
+
+PAGE_TYPES = {"person", "project", "org", "commitment", "topic", "how-to", "decision", "log"}
+NOTE_KINDS = {"fact", "decision", "gotcha", "how-to", "status", "person", "idea"}
+SOURCES = {"claude-laptop", "claude-box", "import-claude-memory"}
+PRIVATE_TYPES = {"person"}
+PRIVATE_TAGS = {"finance", "investing", "health", "people"}
+PAGE_KEYS = {"type", "tags", "repos", "updated", "review_by"}  # any other key makes a page private
+INFRA_PAGES = {"index", "CONVENTIONS", "TAGS"}
+PAGE_WORD_CAP = 1500
+NOTE_WORD_CAP = 300
+NOTE_CHAR_CAP = 4000  # 300 words of technical text with paths can pass 3,000 characters
+META_CHAR_CAP = 500  # any one frontmatter string, including list items
+MAX_TAGS = 40
+
+_TAG_LINE = re.compile(r"^- ([a-z0-9-]+)\b")
+_SUGGEST = re.compile(r"^[a-z0-9-]+$")
+_WORD = re.compile(r"[a-z0-9-]+")
+_PUNCT = " \t\r\n\"'[]"
+_REPO = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def word_count(text: str) -> int:
+    return len(text.split())
+
+
+def load_tags(root: Path) -> set[str]:
+    path = Path(root) / "TAGS.md"
+    if path.is_symlink():  # fail closed: a symlink could point anywhere
+        return set()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return set()
+    tags = set()
+    for line in text.splitlines():
+        m = _TAG_LINE.match(line)
+        if m:
+            tags.add(m.group(1))
+    return tags
+
+
+def normal_tag(t: str) -> str:
+    """A tag or type value without surrounding space, quotes or brackets, lowercased."""
+    return t.strip(_PUNCT).lower()
+
+
+def tag_list(v) -> list[str] | None:
+    """Tags as normalised strings; a string is split on commas. None when not understood."""
+    if isinstance(v, str):
+        v = v.split(",")
+    if not isinstance(v, list) or not all(isinstance(t, str) for t in v):
+        return None
+    return [normal_tag(t) for t in v]
+
+
+def _ascii_strs(v) -> bool:
+    """True when v is a string, or a list of strings, made only of ASCII characters.
+
+    Checked before lowercasing: some non-ASCII letters lowercase to ASCII (KELVIN SIGN to `k`).
+    """
+    items = v if isinstance(v, list) else [v]
+    return all(isinstance(x, str) and x.isascii() for x in items)
+
+
+def is_private(meta: dict | None, allowed_tags: set[str] | None = None) -> bool:
+    """Fail closed: a page is public only when its frontmatter is fully understood.
+
+    That means exactly the keys in PAGE_KEYS, with `type` and `tags` present, an ASCII `type`
+    from PAGE_TYPES that is not private, and ASCII tags that are well formed, not private and,
+    when `allowed_tags` is given, listed in it. Anything else counts as private.
+    """
+    if meta is None:
+        return True
+    if "type" not in meta or "tags" not in meta:
+        return True
+    if any(k not in PAGE_KEYS for k in meta):
+        return True
+    typ = meta["type"]
+    if not isinstance(typ, str) or not typ.isascii():
+        return True
+    typ = normal_tag(typ)
+    if typ not in PAGE_TYPES or typ in PRIVATE_TYPES:
+        return True
+    if not _ascii_strs(meta["tags"]):
+        return True
+    tags = tag_list(meta["tags"])
+    if tags is None or not all(_WORD.fullmatch(t) for t in tags):
+        return True
+    if allowed_tags is not None and not set(tags) <= set(allowed_tags):
+        return True
+    return bool(PRIVATE_TAGS & set(tags))
+
+
+def _date_ok(v) -> bool:
+    if not isinstance(v, str) or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", v):
+        return False
+    try:
+        datetime.strptime(v, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
+
+
+def _str_list(v) -> list[str] | None:
+    if isinstance(v, list) and all(isinstance(x, str) for x in v):
+        return v
+    return None
+
+
+def validate_note(meta: dict, body: str, allowed_tags: set[str]) -> list[str]:
+    errors: list[str] = []
+    if meta.get("kind") not in NOTE_KINDS:
+        errors.append(f"kind: {meta.get('kind')!r} not one of {sorted(NOTE_KINDS)}")
+    if meta.get("source") not in SOURCES:
+        errors.append(f"source: {meta.get('source')!r} not one of {sorted(SOURCES)}")
+
+    tags = _str_list(meta.get("tags"))
+    if tags is None:
+        errors.append("tags: must be a list of strings")
+    else:
+        for t in tags:
+            if t not in allowed_tags:
+                errors.append(f"tags: {t!r} is not in TAGS.md")
+
+    if "suggest_tags" in meta:
+        st = _str_list(meta["suggest_tags"])
+        if st is None:
+            errors.append("suggest_tags: must be a list of strings")
+        else:
+            for t in st:
+                if not _SUGGEST.fullmatch(t):
+                    errors.append(f"suggest_tags: {t!r} must match [a-z0-9-]+")
+
+    if "repos" in meta:
+        repos = _str_list(meta["repos"])
+        if repos is None:
+            errors.append("repos: must be a list of strings")
+        else:
+            for r in repos:
+                if not _REPO.fullmatch(r) or r.strip(".") == "":
+                    errors.append(f"repos: {r!r} is not a safe repo name")
+
+    if not _date_ok(meta.get("created")):
+        errors.append("created: must be a YYYY-MM-DD date")
+    if "review_by" in meta and not _date_ok(meta["review_by"]):
+        errors.append("review_by: must be a YYYY-MM-DD date")
+    verified = meta.get("verified")
+    if not isinstance(verified, str) or not verified.strip():
+        errors.append("verified: required")
+
+    for key, v in meta.items():
+        items = v if isinstance(v, list) else [v]
+        if any(isinstance(x, str) and len(x) > META_CHAR_CAP for x in items):
+            errors.append(f"{key}: longer than {META_CHAR_CAP} characters")
+        found = {sid for x in items if isinstance(x, str) for sid in secretscan.find_secrets(x)}
+        for sid in sorted(found):
+            errors.append(f"{key}: looks like a secret ({sid})")
+
+    chars = len(body.strip())
+    if chars > NOTE_CHAR_CAP:
+        errors.append(f"body: {chars} characters exceeds the {NOTE_CHAR_CAP}-character cap")
+    n = word_count(body)
+    if n == 0:
+        errors.append("body: must not be empty")
+    elif n > NOTE_WORD_CAP:
+        errors.append(f"body: {n} words exceeds the {NOTE_WORD_CAP}-word cap")
+    for sid in secretscan.find_secrets(body):
+        errors.append(f"body: looks like a secret ({sid})")
+    return errors

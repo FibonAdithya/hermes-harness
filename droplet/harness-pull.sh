@@ -34,3 +34,13 @@ if [ "$(cat "$friends_stamp" 2>/dev/null)" != "$want" ]; then
     exit 1
   fi
 fi
+
+# Wiki worklist script: Hermes only runs --script files inside ~/.hermes/scripts,
+# so it is a copy, refreshed here when the repo version changes. Absent files
+# on either side are not an error.
+wl_src="$HOME/hermes-harness/droplet/wiki-worklist.py"
+wl_dst="$HOME/.hermes/scripts/wiki-worklist.py"
+if [ -f "$wl_dst" ] && [ -f "$wl_src" ] && ! cmp -s "$wl_src" "$wl_dst"; then
+  install -m 644 "$wl_src" "$wl_dst"
+  echo "wiki worklist updated"
+fi
