@@ -1,4 +1,5 @@
 """Deterministic worklist for the nightly curator: what to file, split, review and fix."""
+import re
 from collections import Counter
 from datetime import date
 from pathlib import Path
@@ -67,6 +68,28 @@ def _list(v) -> list[str]:
     return [x for x in v if isinstance(x, str)] if isinstance(v, list) else []
 
 
+_TAGS_LINE = re.compile(r"^tags:(.*)$", re.M)
+_CANON_TAGS = re.compile(r"\[\s*(?:[a-z0-9-]+\s*(?:,\s*[a-z0-9-]+\s*)*)?\]")
+
+
+def _malformed_tags(page) -> bool:
+    """True unless `tags` is a plain `[a, b]` list whose values are already normalised.
+
+    The parser unquotes list items, so a quoted spelling is only visible in the raw line.
+    """
+    raw = page.meta["tags"]
+    if not isinstance(raw, list) or schema.tag_list(raw) != raw:
+        return True
+    try:
+        text = page.path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return True
+    head = text.split("\n---", 1)[0]
+    m = _TAGS_LINE.search(head)
+    value = re.sub(r"\s+#.*$", "", m.group(1)).strip() if m else ""
+    return not _CANON_TAGS.fullmatch(value)
+
+
 def _lint(all_pages, tags: set[str]) -> list[dict]:
     out = []
     by_name = {p.name: p for p in all_pages}
@@ -80,7 +103,9 @@ def _lint(all_pages, tags: set[str]) -> list[dict]:
             else:
                 indexed.add(hit.name)
     for p in all_pages:
-        if p.meta is not None:
+        if p.meta is not None and "tags" in p.meta:
+            if _malformed_tags(p):
+                out.append({"page": p.name, "problem": "malformed tags"})
             for t in _list(p.meta.get("tags")):
                 if t not in tags:
                     out.append({"page": p.name, "problem": f"unknown tag: {t}"})

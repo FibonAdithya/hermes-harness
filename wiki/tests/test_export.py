@@ -138,3 +138,44 @@ def test_cli_export_public_git_failure(tmp_path, capsys):
     assert rc == 2
     err = capsys.readouterr().err
     assert "hermes-wiki" in err and "Traceback" not in err
+
+
+from test_schema import LEAKY_FRONTMATTER  # noqa: E402
+
+
+def test_leaky_tag_spellings_not_exported(tmp_path):
+    extra = {f"leak-{n}": f"---\n{fm}---\nsecret-{n} body\n" for n, fm in LEAKY_FRONTMATTER.items()}
+    extra["ok-list"] = "---\ntype: topic\ntags: [hermes, cost]\n---\nok list\n"
+    extra["ok-str"] = '---\ntype: topic\ntags: "hermes"\n---\nok str\n'
+    src = _src(tmp_path, extra_pages=extra)
+    dest = tmp_path / "pub"
+    export_public(src, dest, "h1", 1000)
+    files = _files(dest.resolve())
+    assert {"ok-list.md", "ok-str.md"} <= files
+    assert not [f for f in files if f.startswith("leak-")]
+    text = "".join((dest / f).read_text() for f in files)
+    assert "secret-" not in text and "[[leak-" not in text
+
+
+def test_filter_version_change_forces_rebuild(tmp_path, monkeypatch):
+    from hermes_wiki import export as export_mod
+    src = _src(tmp_path)
+    dest = tmp_path / "dest"
+    export_public(src, dest, "a", 1000)
+    assert (dest / ".source-head").read_text().split() == ["a", export_mod.FILTER_VERSION]
+    assert export_public(src, dest, "a", 1500) == -1
+    monkeypatch.setattr(export_mod, "FILTER_VERSION", "filter-v999")
+    assert export_public(src, dest, "a", 2000) == 3
+    assert dest.resolve().name == ".dest.2000"
+
+
+def test_export_made_before_filter_version_is_rebuilt(tmp_path):
+    # An export written by the old code holds only the head; the same head must not skip the rebuild.
+    src = _src(tmp_path)
+    old = tmp_path / ".dest.500"
+    old.mkdir()
+    (old / ".source-head").write_text("a\n")
+    (old / "leak.md").write_text("old filter output\n")
+    os.symlink(old.name, tmp_path / "dest")
+    assert export_public(src, tmp_path / "dest", "a", 1000) == 3
+    assert not (tmp_path / "dest" / "leak.md").exists()

@@ -9,6 +9,9 @@ from .schema import is_private
 
 _LINK = re.compile(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]")
 _HEAD_FILE = ".source-head"
+# Written next to the head: bump it whenever the privacy filter changes, so an export made by
+# the old filter is rebuilt even when the wiki's HEAD has not moved.
+FILTER_VERSION = "filter-v2"
 
 
 def _strip_links(text: str, visible) -> str:
@@ -37,7 +40,7 @@ def export_public(src: Path, dest: Path, head: str, now: float, keep_seconds: in
     if dest.exists() and not dest.is_symlink():
         raise RuntimeError(f"{dest} is a real directory, not a symlink; refusing to replace it")
     try:
-        if (dest / _HEAD_FILE).read_text(encoding="utf-8").strip() == head:
+        if (dest / _HEAD_FILE).read_text(encoding="utf-8").strip() == f"{head} {FILTER_VERSION}":
             return -1
     except OSError:
         pass
@@ -69,7 +72,7 @@ def export_public(src: Path, dest: Path, head: str, now: float, keep_seconds: in
                 if all(visible(t) for t in links(line))
             ]
             (new / "index.md").write_text("".join(kept), encoding="utf-8")
-        (new / _HEAD_FILE).write_text(head + "\n", encoding="utf-8")
+        (new / _HEAD_FILE).write_text(f"{head} {FILTER_VERSION}\n", encoding="utf-8")
 
         if dest.is_symlink():
             # Retention counts from retirement, not creation: a container may have just mounted it.

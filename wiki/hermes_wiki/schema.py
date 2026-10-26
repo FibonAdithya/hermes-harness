@@ -17,6 +17,8 @@ MAX_TAGS = 40
 
 _TAG_LINE = re.compile(r"^- ([a-z0-9-]+)\b")
 _SUGGEST = re.compile(r"^[a-z0-9-]+$")
+_WORD = re.compile(r"[a-z0-9-]+")
+_PUNCT = " \t\r\n\"'[]"
 _REPO = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
@@ -37,22 +39,36 @@ def load_tags(root: Path) -> set[str]:
     return tags
 
 
+def normal_tag(t: str) -> str:
+    """A tag or type value without surrounding space, quotes or brackets, lowercased."""
+    return t.strip(_PUNCT).lower()
+
+
+def tag_list(v) -> list[str] | None:
+    """Tags as normalised strings; a string is split on commas. None when not understood."""
+    if isinstance(v, str):
+        v = v.split(",")
+    if not isinstance(v, list) or not all(isinstance(t, str) for t in v):
+        return None
+    return [normal_tag(t) for t in v]
+
+
 def is_private(meta: dict | None) -> bool:
+    """Fail closed: any type or tag spelling not fully understood counts as private."""
     if meta is None:
         return True
-    typ = meta.get("type")
-    if typ is not None and not isinstance(typ, str):
-        return True
-    if isinstance(typ, str) and typ.strip().lower() in PRIVATE_TYPES:
-        return True
-    tags = meta.get("tags")
-    if tags is None:
+    if "type" in meta:
+        typ = meta["type"]
+        if not isinstance(typ, str) or not _WORD.fullmatch(normal_tag(typ)):
+            return True
+        if normal_tag(typ) in PRIVATE_TYPES:
+            return True
+    if "tags" not in meta:
         return False
-    if isinstance(tags, str):
-        tags = [tags]
-    if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
+    tags = tag_list(meta["tags"])
+    if tags is None or not all(_WORD.fullmatch(t) for t in tags):
         return True
-    return bool(PRIVATE_TAGS & {t.strip().lower() for t in tags})
+    return bool(PRIVATE_TAGS & set(tags))
 
 
 def _date_ok(v) -> bool:

@@ -6,14 +6,23 @@ _COMMENT = re.compile(r"\s+#.*$")
 _MAX_LINES = 40
 
 
+def _quoted(raw: str) -> bool:
+    return len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'"
+
+
+def _item(raw: str) -> str:
+    raw = raw.strip()
+    return raw[1:-1] if _quoted(raw) else raw
+
+
 def _value(raw: str):
     raw = raw.strip()
-    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+    if _quoted(raw):
         return raw[1:-1].replace('\\"', '"')
     raw = _COMMENT.sub("", raw).strip()
     if raw.startswith("[") and raw.endswith("]"):
         inner = raw[1:-1].strip()
-        return [p.strip() for p in inner.split(",") if p.strip()] if inner else []
+        return [_item(p) for p in inner.split(",") if p.strip()] if inner else []
     return raw
 
 
@@ -34,7 +43,7 @@ def parse(text: str) -> tuple[dict | None, str]:
         if not stripped.strip() or stripped.lstrip().startswith("#"):
             continue
         m = _KEY.match(stripped)
-        if not m:
+        if not m or m.group(1) in meta:  # a repeated key is ambiguous: treat as no frontmatter
             return None, text
         meta[m.group(1)] = _value(m.group(2))
     return meta, "".join(lines[end + 1 :])

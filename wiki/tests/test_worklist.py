@@ -207,3 +207,20 @@ def test_infra_pages_example_links_not_linted(tmp_path):
     problems = [(x["page"], x["problem"]) for x in worklist.build(root, TODAY)["lint"]]
     assert not [p for p in problems if p[0] == "CONVENTIONS"]
     assert any(p == "beta" and "nonexistent" in t for p, t in problems)
+
+
+def test_lint_flags_malformed_tags(tmp_path):
+    root = make(tmp_path)
+    pages = {
+        "q": '---\ntype: topic\ntags: ["ops"]\n---\nx\n',
+        "s": "---\ntype: topic\ntags: ops, hermes\n---\nx\n",
+        "u": "---\ntype: topic\ntags: [Ops]\n---\nx\n",
+        "fine": "---\ntype: topic\ntags: [ops]\n---\nx\n",
+    }
+    for name, text in pages.items():
+        (root / f"{name}.md").write_text(text)
+    with open(root / "index.md", "a") as f:
+        f.write("".join(f"- [[{n}]]\n" for n in pages))
+    problems = [(x["page"], x["problem"]) for x in worklist.build(root, TODAY)["lint"]]
+    bad = {p for p, t in problems if t == "malformed tags"}
+    assert bad == {"q", "s", "u"}

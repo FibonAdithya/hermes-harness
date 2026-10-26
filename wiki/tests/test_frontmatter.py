@@ -47,3 +47,13 @@ def test_dump_quotes_only_when_needed():
     assert 'a: plain\n' in out
     assert 'b: "x: y"\n' in out
     assert 'c: " pad"\n' in out
+
+
+def test_list_items_are_unquoted():
+    meta, _ = frontmatter.parse("---\ntags: [\"finance\", 'health', plain]\n---\nx\n")
+    assert meta == {"tags": ["finance", "health", "plain"]}
+
+
+def test_repeated_key_is_not_frontmatter():
+    text = "---\ntype: topic\ntags: [finance]\ntags: [hermes]\n---\nx\n"
+    assert frontmatter.parse(text) == (None, text)

@@ -141,3 +141,53 @@ def test_trailing_newline_rejected(over):
 )
 def test_is_private_ignores_case_and_space(meta):
     assert schema.is_private(meta) is True
+
+
+from hermes_wiki import frontmatter  # noqa: E402
+
+# Spellings that leaked private pages to the box at bc2f9a6 (controller MEASURED).
+LEAKY_FRONTMATTER = {
+    "dq-list": 'type: topic\ntags: ["finance"]\n',
+    "sq-list": "type: topic\ntags: ['health']\n",
+    "comma-str": "type: topic\ntags: finance, health\n",
+    "quoted-list": 'type: topic\ntags: "[people]"\n',
+    "dup-key": "type: topic\ntags: [finance]\ntags: [hermes]\n",
+}
+
+
+@pytest.mark.parametrize("name", sorted(LEAKY_FRONTMATTER))
+def test_leaky_tag_spellings_are_private(name):
+    meta, _ = frontmatter.parse(f"---\n{LEAKY_FRONTMATTER[name]}---\nbody\n")
+    assert schema.is_private(meta) is True
+
+
+@pytest.mark.parametrize("fm", ["type: topic\ntags: [hermes, cost]\n", 'type: topic\ntags: "hermes"\n',
+                                "type: topic\ntags: hermes, cost\n", "type: \"topic\"\ntags: []\n"])
+def test_wellformed_tag_spellings_stay_public(fm):
+    meta, _ = frontmatter.parse(f"---\n{fm}---\nbody\n")
+    assert schema.is_private(meta) is False
+
+
+@pytest.mark.parametrize(
+    "meta",
+    [
+        {"type": "topic", "tags": ['"finance"']},
+        {"type": "topic", "tags": ["[health]"]},
+        {"type": "topic", "tags": "hermes, Investing"},
+        {"type": "topic", "tags": ["hermes", "two words"]},  # not [a-z0-9-]+: not understood
+        {"type": "topic", "tags": ["hermes", "finánce"]},
+        {"type": "topic", "tags": ""},
+        {"type": "topic", "tags": ["hermes", 5]},
+        {"type": "'person'"},
+        {"type": "[person]"},
+        {"type": "person, topic"},  # not one word: not understood
+        {"type": None},
+    ],
+)
+def test_is_private_fails_closed_on_unclear_spellings(meta):
+    assert schema.is_private(meta) is True
+
+
+def test_normal_tag():
+    assert schema.normal_tag(' "[Finance]" ') == "finance"
+    assert schema.normal_tag("hermes") == "hermes"
