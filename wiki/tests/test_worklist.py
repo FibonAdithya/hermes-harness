@@ -152,3 +152,49 @@ def test_cli_worklist_json(tmp_path):
     assert r.returncode == 0, r.stderr
     assert set(json.loads(r.stdout)) == {"notes", "notes_remaining", "over_cap", "past_review",
                                          "backfill", "orphans", "tag_proposals", "lint"}
+
+
+def test_oversized_note_body_truncated_but_validated_in_full(tmp_path):
+    root = make(tmp_path)
+    big = _note("2026-10-04", body="alpha " + "word " * 1000)
+    (root / "inbox/claude-laptop/2026-10-04-fact-3a3b3c3d.md").write_text(big)
+    (root / "inbox/claude-laptop/huge.md").write_text(_note("2026-10-05", body="w " * 300000))
+    w = worklist.build(root, TODAY)
+    n = next(n for n in w["notes"] if n["path"].endswith("3a3b3c3d.md"))
+    assert n["body"].endswith("[truncated: 1001 words]")
+    assert len(n["body"].split()) < 410
+    assert any("exceeds" in e for e in n["invalid"])
+    assert len(json.dumps(w)) < 100_000
+    huge = next(n for n in w["notes"] if n["path"].endswith("huge.md"))
+    assert "[truncated:" in huge["body"]
+
+
+def test_related_and_validation_only_for_kept_notes(tmp_path, monkeypatch):
+    from hermes_wiki import pages
+    root = make(tmp_path)
+    calls = []
+    real = pages.related
+    monkeypatch.setattr(pages, "related", lambda *a, **k: calls.append(1) or real(*a, **k))
+    w = worklist.build(root, TODAY, note_limit=1)
+    assert len(calls) == 1 and w["notes_remaining"] == 2
+    assert w["tag_proposals"] == {"newtag": 2, "other": 1}
+
+
+def test_bad_created_values_sort_last(tmp_path):
+    root = make(tmp_path)
+    d = root / "inbox/claude-laptop"
+    (d / "a.md").write_text(_note('"0"'))
+    (d / "b.md").write_text(_note("2026-13-45"))
+    (d / "c.md").write_text(_note("9999-99-99"))
+    paths = [n["path"] for n in worklist.build(root, TODAY)["notes"]]
+    assert paths[:2] == ["inbox/" + NOTE_B, "inbox/" + NOTE_A]
+    assert set(paths[2:]) >= {"inbox/claude-laptop/a.md", "inbox/claude-laptop/b.md"}
+
+
+def test_lint_problem_target_collapsed_and_cut(tmp_path):
+    root = make(tmp_path)
+    (root / "evil.md").write_text("---\ntype: topic\ntags: [ops]\n---\n[[" + "a\nb " * 3000 + "]]\n")
+    with open(root / "index.md", "a") as f:
+        f.write("- [[evil]]\n")
+    probs = [x["problem"] for x in worklist.build(root, TODAY)["lint"] if x["page"] == "evil"]
+    assert len(probs) == 1 and "\n" not in probs[0] and len(probs[0]) < 120
