@@ -151,6 +151,15 @@ def test_config_load_expands_tilde(tmp_path):
         {"session": "s1\nsource: claude-box"},
         {"verified": "claim\r\ntags: [x]"},
         {"rand": "../../x"},
+        {"session": "s1\x0csource: claude-box"},
+        {"verified": "claim\x85tags: [x]"},
+        {"session": "s1\u2028source: claude-box"},
+        {"verified": "claim\u2029source: claude-box"},
+        {"session": "s1\x1csource: claude-box"},
+        {"session": 5},
+        {"verified": ["a"]},
+        {"session": "key ghp_" + "a" * 36},
+        {"verified": "key ghp_" + "a" * 36},
     ],
 )
 def test_add_note_rejects_header_injection_and_bad_rand(cfg, kw):

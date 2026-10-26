@@ -7,9 +7,11 @@ from datetime import date
 
 from .config import WikiConfig
 from .frontmatter import dump
+from .secretscan import find_secrets
 from .schema import load_tags, validate_note
 
 
+_CONTROL = re.compile("[\\x00-\\x1f\\x7f\\x85\\u2028\\u2029]")
 _RAND = re.compile(r"[0-9a-f]{8}")
 
 
@@ -73,9 +75,17 @@ def add_note(
     if review_by is not None:
         meta["review_by"] = review_by
     errors = validate_note(meta, body, load_tags(cfg.root))
-    for key in ("session", "verified"):
-        if any(c in meta[key] for c in "\r\n"):
-            errors.append(f"{key}: must be a single line")
+    for key in ("session", "verified", "review_by"):
+        if key not in meta:
+            continue
+        v = meta[key]
+        if not isinstance(v, str):
+            errors.append(f"{key}: must be a string")
+        elif len(v.splitlines()) > 1 or _CONTROL.search(v):
+            errors.append(f"{key}: must be a single line without control characters")
+        elif key != "review_by":
+            for sid in find_secrets(v):
+                errors.append(f"{key}: looks like a secret ({sid})")
     if not _RAND.fullmatch(rand):
         errors.append("rand: must be 8 lowercase hex characters")
     if errors:
