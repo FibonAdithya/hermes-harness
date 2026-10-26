@@ -150,3 +150,22 @@ def test_type_filter_is_normalised(tmp_path):
     root = build_wiki(tmp_path, extra_pages=extra)
     assert names(sr.search(root, "", type="decision")) == ["beta", "d2"]
     assert names(sr.search(root, "", type="DECISION ")) == ["beta", "d2"]
+
+
+def test_tag_filter_is_normalised(tmp_path):
+    extra = {"s1": "---\ntype: topic\ntags: hermes, cost\n---\nbody\n",
+             "s2": "---\ntype: topic\ntags: [Hermes]\n---\nbody\n"}
+    root = build_wiki(tmp_path, extra_pages=extra)
+    assert names(sr.search(root, "", tags=["hermes"])) == ["alpha", "s1", "s2"]
+    assert names(sr.search(root, "", tags=["Hermes "])) == ["alpha", "s1", "s2"]
+
+
+def test_public_only_hides_tags_missing_from_tags_md(tmp_path):
+    # Same rule as the box export: a tag TAGS.md does not list counts as private.
+    extra = {"odd": "---\ntype: topic\ntags: [unlisted]\n---\nodd page\n"}
+    root = build_wiki(tmp_path, extra_pages=extra)
+    assert "odd" not in names(sr.search(root, "", public_only=True))
+    with pytest.raises(sr.PageNotFound):
+        sr.read(root, "odd", public_only=True)
+    hub = build_wiki(tmp_path / "hub", extra_pages={**extra, "hub": "---\ntype: topic\ntags: [ops]\n---\nSee [[odd]].\n"})
+    assert "linked: odd" not in sr.read(hub, "hub", follow_links=True, public_only=True)

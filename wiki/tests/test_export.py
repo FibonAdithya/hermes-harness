@@ -253,9 +253,9 @@ def test_missing_or_empty_tags_md_fails_closed(tmp_path, tags_md):
     assert not {"alpha.md", "beta.md", "nights/2026-09-25.md"} & files
 
 
-def test_filter_version_is_v3():
+def test_filter_version_is_v4():
     from hermes_wiki import export as export_mod
-    assert export_mod.FILTER_VERSION == "filter-v3"
+    assert export_mod.FILTER_VERSION == "filter-v4"
 
 
 def test_v2_export_is_rebuilt_by_v3(tmp_path):
@@ -268,3 +268,58 @@ def test_v2_export_is_rebuilt_by_v3(tmp_path):
     os.symlink(old.name, tmp_path / "dest")
     assert export_public(src, tmp_path / "dest", "a", 1000) == 3
     assert not (tmp_path / "dest" / "labelled.md").exists()
+
+
+@pytest.mark.parametrize("infra", ["TAGS", "CONVENTIONS", "index"])
+def test_symlinked_infra_file_not_exported(tmp_path, infra):
+    # git checks symlinks out, so a wiki file can point at a private page or any host file.
+    src = _src(tmp_path)
+    outside = tmp_path / "outside.md"
+    outside.write_text("# Leak\n- [[alpha]] PRIVATE-MARK\n- hermes — PRIVATE-MARK\n")
+    (src / f"{infra}.md").unlink()
+    (src / f"{infra}.md").symlink_to(outside)
+    dest = tmp_path / "pub"
+    export_public(src, dest, "h1", 1000)
+    root = dest.resolve()
+    leaked = [f for f in _files(root) if "PRIVATE-MARK" in (root / f).read_text()]
+    assert leaked == []
+
+
+def test_symlinked_tags_md_fails_closed(tmp_path):
+    src = _src(tmp_path)
+    real = tmp_path / "tags-elsewhere.md"
+    real.write_text((src / "TAGS.md").read_text())
+    (src / "TAGS.md").unlink()
+    (src / "TAGS.md").symlink_to(real)
+    dest = tmp_path / "pub"
+    assert export_public(src, dest, "h1", 1000) == 0
+
+
+def test_conventions_links_to_private_pages_become_text(tmp_path):
+    src = _src(tmp_path)
+    (src / "CONVENTIONS.md").write_text("# Conventions\n\nSee [[gamma]] and [[alpha]].\n")
+    dest = tmp_path / "pub"
+    export_public(src, dest, "h1", 1000)
+    text = (dest / "CONVENTIONS.md").read_text()
+    assert "[[gamma]]" not in text and "gamma" in text and "[[alpha]]" in text
+
+
+def test_v3_export_is_rebuilt_by_v4(tmp_path):
+    # A v3 export of the same head may hold a symlinked infra file's target; it must not be kept.
+    src = _src(tmp_path)
+    old = tmp_path / ".dest.500"
+    old.mkdir()
+    (old / ".source-head").write_text("a filter-v3\n")
+    (old / "CONVENTIONS.md").write_text("v3 output\n")
+    os.symlink(old.name, tmp_path / "dest")
+    assert export_public(src, tmp_path / "dest", "a", 1000) == 3
+    assert (tmp_path / "dest" / "CONVENTIONS.md").read_text() != "v3 output\n"
+
+
+def test_infra_symlink_to_private_page_inside_wiki_not_exported(tmp_path):
+    src = _src(tmp_path)
+    (src / "CONVENTIONS.md").unlink()
+    (src / "CONVENTIONS.md").symlink_to("gamma.md")
+    dest = tmp_path / "pub"
+    export_public(src, dest, "h1", 1000)
+    assert not (dest / "CONVENTIONS.md").exists()

@@ -11,7 +11,7 @@ _LINK = re.compile(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]")
 _HEAD_FILE = ".source-head"
 # Written next to the head: bump it whenever the privacy filter changes, so an export made by
 # the old filter is rebuilt even when the wiki's HEAD has not moved.
-FILTER_VERSION = "filter-v3"
+FILTER_VERSION = "filter-v4"
 
 
 def _strip_links(text: str, visible) -> str:
@@ -30,6 +30,15 @@ def _index_line_public(line: str, visible) -> bool:
     if not all(visible(t) for t in targets):
         return False
     return bool(targets) or line.lstrip().startswith("#")
+
+
+def _plain_file(src: Path, name: str) -> Path | None:
+    """src/name when it is a regular file, not a symlink: git checks symlinks out, and one
+    could point at a private page or any file on the host."""
+    path = src / name
+    if path.is_symlink() or not path.is_file():
+        return None
+    return path
 
 
 def _unique_dir(parent: Path, base: str) -> Path:
@@ -75,11 +84,16 @@ def export_public(src: Path, dest: Path, head: str, now: float, keep_seconds: in
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(_strip_links(p.path.read_text(encoding="utf-8", errors="replace"), visible),
                            encoding="utf-8")
-        for name in ("TAGS", "CONVENTIONS"):
-            if (src / f"{name}.md").is_file():
-                shutil.copyfile(src / f"{name}.md", new / f"{name}.md")
-        index = src / "index.md"
-        if index.is_file():
+        tags_md = _plain_file(src, "TAGS.md")
+        if tags_md is not None:
+            shutil.copyfile(tags_md, new / "TAGS.md")
+        conventions = _plain_file(src, "CONVENTIONS.md")
+        if conventions is not None:
+            (new / "CONVENTIONS.md").write_text(
+                _strip_links(conventions.read_text(encoding="utf-8", errors="replace"), visible),
+                encoding="utf-8")
+        index = _plain_file(src, "index.md")
+        if index is not None:
             kept = [line for line in index.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
                     if _index_line_public(line, visible)]
             (new / "index.md").write_text("".join(kept), encoding="utf-8")

@@ -9,7 +9,6 @@ from pathlib import Path
 
 from .config import WikiConfig
 from .frontmatter import dump
-from .secretscan import find_secrets
 from .schema import load_tags, validate_note
 
 
@@ -49,8 +48,10 @@ def publish(repo: str, path: str, content: str, run=subprocess.run, gh: str = "g
         proc = run(argv, capture_output=True, text=True, timeout=30)
     except subprocess.TimeoutExpired:
         raise PublishError("timeout") from None
+    except OSError as e:
+        raise PublishError(f"could not run {gh}: {e}") from None
     if proc.returncode != 0:
-        raise PublishError(proc.stderr or "timeout")
+        raise PublishError(proc.stderr or f"gh exited {proc.returncode}")
 
 
 def add_note(
@@ -91,9 +92,6 @@ def add_note(
             errors.append(f"{key}: must be a string")
         elif len(v.splitlines()) > 1 or _CONTROL.search(v):
             errors.append(f"{key}: must be a single line without control characters")
-        elif key != "review_by":
-            for sid in find_secrets(v):
-                errors.append(f"{key}: looks like a secret ({sid})")
     if not _RAND.fullmatch(rand):
         errors.append("rand: must be 8 lowercase hex characters")
     if errors:

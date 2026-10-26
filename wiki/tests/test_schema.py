@@ -85,14 +85,44 @@ def test_word_cap_boundary():
         ("your code is 123456", "otp"),
         ("password: hunter2", "password"),
         ("api key = abc", "password"),
+        ("DB_PASSWORD=hunter2xyz", "password"),
+        ("DEEPINFRA_API_KEY=abcd1234efgh5678", "password"),
+        ("export OPENAI_API_KEY='abcd1234'", "password"),
+        ("the db password is hunter2-prod", "password"),
+        ("password was hunter2xyz", "password"),
+        ("the api key abcd1234efgh5678ijkl", "password"),
+        ("Authorization: bearer " + "a" * 30, "bearer"),
+        ("123456 is your verification code", "otp"),
+        ("-----BEGIN PGP PRIVATE KEY BLOCK-----", "pem"),
     ],
 )
 def test_find_secrets(text, ident):
     assert ident in secretscan.find_secrets(text)
 
 
-def test_find_secrets_clean():
-    assert secretscan.find_secrets("the sky is blue; ask about the API") == []
+@pytest.mark.parametrize("text", [
+    "the sky is blue; ask about the API",
+    "rotate the api key monthly",
+    "reset the password.",
+    "the password is short",
+])
+def test_find_secrets_clean(text):
+    assert secretscan.find_secrets(text) == []
+
+
+def test_find_secrets_reports_each_kind_once():
+    assert secretscan.find_secrets("password: hunter2xyz and password is hunter2xyz") == ["password"]
+
+
+@pytest.mark.parametrize("key,value", [
+    ("repos", ["AKIA" + "A1" * 8]),
+    ("suggest_tags", ["sk-" + "a" * 24]),
+    ("verified", "ran it with ghp_" + "a" * 36),
+    ("session", "sk-" + "a" * 24),
+])
+def test_validate_note_scans_frontmatter_for_secrets(key, value):
+    errors = schema.validate_note({**good(), key: value}, "a short body", {"hermes"})
+    assert any("looks like a secret" in e and e.startswith(key) for e in errors)
 
 
 def test_load_tags(tmp_path):

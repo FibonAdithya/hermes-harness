@@ -30,8 +30,11 @@ def word_count(text: str) -> int:
 
 
 def load_tags(root: Path) -> set[str]:
+    path = Path(root) / "TAGS.md"
+    if path.is_symlink():  # fail closed: a symlink could point anywhere
+        return set()
     try:
-        text = (Path(root) / "TAGS.md").read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8")
     except OSError:
         return set()
     tags = set()
@@ -155,6 +158,9 @@ def validate_note(meta: dict, body: str, allowed_tags: set[str]) -> list[str]:
         items = v if isinstance(v, list) else [v]
         if any(isinstance(x, str) and len(x) > META_CHAR_CAP for x in items):
             errors.append(f"{key}: longer than {META_CHAR_CAP} characters")
+        found = {sid for x in items if isinstance(x, str) for sid in secretscan.find_secrets(x)}
+        for sid in sorted(found):
+            errors.append(f"{key}: looks like a secret ({sid})")
 
     chars = len(body.strip())
     if chars > NOTE_CHAR_CAP:

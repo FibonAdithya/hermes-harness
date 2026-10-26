@@ -181,3 +181,20 @@ def test_add_note_rejects_long_body_and_meta(cfg):
             nt.add_note(cfg, kind="fact", tags=["hermes"], today=TODAY, rand="0a1b2c3d",
                         publisher=pub, **args)
     assert len(pub.calls) == 1
+
+
+def test_publish_missing_gh_is_a_publish_error():
+    def run(argv, **kw):
+        raise FileNotFoundError(2, "No such file or directory", argv[0])
+
+    with pytest.raises(nt.PublishError, match="could not run"):
+        nt.publish("o/r", "inbox/a.md", "x", run=run, gh="/nope/gh")
+
+
+def test_publish_failure_without_stderr_names_exit_code():
+    def run(argv, **kw):
+        return subprocess.CompletedProcess(argv, 4, "", "")
+
+    with pytest.raises(nt.PublishError, match="exited 4") as ei:
+        nt.publish("o/r", "inbox/a.md", "x", run=run)
+    assert "timeout" not in str(ei.value)

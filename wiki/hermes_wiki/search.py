@@ -2,7 +2,7 @@
 from pathlib import Path
 
 from .pages import Page, iter_pages, links, resolve, valid_name
-from .schema import is_private, normal_tag
+from .schema import is_private, load_tags, normal_tag, tag_list
 
 
 class PageNotFound(Exception):
@@ -28,7 +28,7 @@ def _passes(page: Page, tags, type, repos, updated_after) -> bool:
     meta = page.meta
     if meta is None:
         return False
-    if tags and not set(tags) <= set(_as_list(meta.get("tags"))):
+    if tags and not {normal_tag(t) for t in tags} <= set(tag_list(meta.get("tags")) or []):
         return False
     typ = meta.get("type")
     if type and not (isinstance(typ, str) and normal_tag(typ) == normal_tag(type)):
@@ -52,8 +52,9 @@ def search(
 ) -> list[dict]:
     terms = [t.lower() for t in query.split()]
     hits = []
+    allowed = load_tags(root)
     for page in iter_pages(root):
-        if page.infra or (public_only and is_private(page.meta)):
+        if page.infra or (public_only and is_private(page.meta, allowed_tags=allowed)):
             continue
         if not _passes(page, list(tags), type, list(repos), updated_after):
             continue
@@ -86,8 +87,9 @@ def read(root: Path, page: str, follow_links: bool = False, public_only: bool = 
     if not valid_name(page):
         raise missing
     pages = iter_pages(root)
+    allowed = load_tags(root)
     hit = next((p for p in pages if p.name == page), None)
-    if hit is None or hit.infra or (public_only and is_private(hit.meta)):
+    if hit is None or hit.infra or (public_only and is_private(hit.meta, allowed_tags=allowed)):
         raise missing
     text = hit.path.read_text(encoding="utf-8", errors="replace")
     if not follow_links:
@@ -100,7 +102,7 @@ def read(root: Path, page: str, follow_links: bool = False, public_only: bool = 
         linked = resolve(target, pages)
         if linked is None or linked.infra or linked.name in seen:
             continue
-        if public_only and is_private(linked.meta):
+        if public_only and is_private(linked.meta, allowed_tags=allowed):
             continue
         seen.add(linked.name)
         excerpt = " ".join(linked.body.split()[:400])
