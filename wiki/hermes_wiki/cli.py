@@ -112,7 +112,49 @@ def _add_extract_dir(sub) -> None:
     p.set_defaults(func=_cmd_extract_dir)
 
 
-_COMMANDS = [_add_mcp, _add_export_public, _add_worklist, _add_session_end, _add_drain, _add_extract_dir]
+def _cmd_install_hook(args, cfg) -> int:
+    from . import hooks
+
+    settings = Path(args.settings).expanduser()
+    try:
+        changed = hooks.install_session_end_hook(settings, args.command)
+    except (OSError, ValueError) as e:
+        print(f"hermes-wiki: cannot update {settings}: {e}", file=sys.stderr)
+        return 2
+    print(f"hook added to {settings}" if changed else f"hook already present in {settings}")
+    return 0
+
+
+def _add_install_hook(sub) -> None:
+    p = sub.add_parser("install-hook", help="add the SessionEnd hook to a Claude Code settings.json")
+    p.add_argument("--settings", required=True)
+    p.add_argument("--command", default=str(Path("~/.local/bin/hermes-wiki session-end").expanduser()))
+    p.set_defaults(func=_cmd_install_hook, needs_config=False)
+
+
+def _cmd_import_memory(args, cfg) -> int:
+    from . import importer, notes
+
+    add = importer.validate_only if args.dry_run else notes.add_note
+    results = importer.import_claude_memory(Path(args.projects).expanduser(), cfg, add=add)
+    skipped = 0
+    for f, res in results:
+        skipped += res.startswith("skipped: ")
+        print(f"{f}\t{res}")
+    verb = "would import" if args.dry_run else "imported"
+    print(f"{len(results) - skipped} {verb}, {skipped} skipped")
+    return 0
+
+
+def _add_import_memory(sub) -> None:
+    p = sub.add_parser("import-claude-memory", help="one-time import of Claude Code memory files as inbox notes")
+    p.add_argument("--projects", required=True)
+    p.add_argument("--dry-run", action="store_true", help="validate only; publish nothing")
+    p.set_defaults(func=_cmd_import_memory)
+
+
+_COMMANDS = [_add_mcp, _add_export_public, _add_worklist, _add_session_end, _add_drain, _add_extract_dir,
+             _add_install_hook, _add_import_memory]
 
 
 def build_parser() -> argparse.ArgumentParser:
