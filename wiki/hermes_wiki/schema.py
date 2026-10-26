@@ -13,6 +13,8 @@ PRIVATE_TAGS = {"finance", "investing", "health", "people"}
 INFRA_PAGES = {"index", "CONVENTIONS", "TAGS"}
 PAGE_WORD_CAP = 1500
 NOTE_WORD_CAP = 300
+NOTE_CHAR_CAP = 4000  # 300 words of technical text with paths can pass 3,000 characters
+META_CHAR_CAP = 500  # any one frontmatter string, including list items
 MAX_TAGS = 40
 
 _TAG_LINE = re.compile(r"^- ([a-z0-9-]+)\b")
@@ -128,6 +130,14 @@ def validate_note(meta: dict, body: str, allowed_tags: set[str]) -> list[str]:
     if not isinstance(verified, str) or not verified.strip():
         errors.append("verified: required")
 
+    for key, v in meta.items():
+        items = v if isinstance(v, list) else [v]
+        if any(isinstance(x, str) and len(x) > META_CHAR_CAP for x in items):
+            errors.append(f"{key}: longer than {META_CHAR_CAP} characters")
+
+    chars = len(body.strip())
+    if chars > NOTE_CHAR_CAP:
+        errors.append(f"body: {chars} characters exceeds the {NOTE_CHAR_CAP}-character cap")
     n = word_count(body)
     if n == 0:
         errors.append("body: must not be empty")

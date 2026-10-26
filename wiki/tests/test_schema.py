@@ -191,3 +191,22 @@ def test_is_private_fails_closed_on_unclear_spellings(meta):
 def test_normal_tag():
     assert schema.normal_tag(' "[Finance]" ') == "finance"
     assert schema.normal_tag("hermes") == "hermes"
+
+
+def test_body_char_cap_boundary():
+    assert schema.validate_note(good(), "x" * 4000, {"hermes"}) == []
+    errors = schema.validate_note(good(), "x" * 4001, {"hermes"})
+    assert errors and all(e.startswith("body:") for e in errors)
+
+
+@pytest.mark.parametrize("key", ["verified", "session", "other"])
+def test_meta_string_cap_boundary(key):
+    assert schema.validate_note(good(**{key: "v" * 500}), BODY, {"hermes"}) == []
+    errors = schema.validate_note(good(**{key: "v" * 501}), BODY, {"hermes"})
+    assert errors and all(e.startswith(f"{key}:") for e in errors)
+
+
+def test_meta_list_item_cap_boundary():
+    assert schema.validate_note(good(suggest_tags=["a" * 500]), BODY, {"hermes"}) == []
+    errors = schema.validate_note(good(suggest_tags=["a" * 501]), BODY, {"hermes"})
+    assert errors and all(e.startswith("suggest_tags:") for e in errors)

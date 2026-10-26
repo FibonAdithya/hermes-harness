@@ -224,3 +224,39 @@ def test_lint_flags_malformed_tags(tmp_path):
     problems = [(x["page"], x["problem"]) for x in worklist.build(root, TODAY)["lint"]]
     bad = {p for p, t in problems if t == "malformed tags"}
     assert bad == {"q", "s", "u"}
+
+
+def test_emitted_note_is_bounded_in_characters(tmp_path):
+    root = make(tmp_path)
+    long_token = "y" * 60000
+    (root / "inbox/claude-laptop/2026-10-03-fact-5a5b5c5d.md").write_text(
+        _note("2026-10-03", body=long_token, extra="session: " + "s" * 30000 + "\n"
+              + "suggest_tags: [" + "t" * 900 + "]\n").replace("verified: yes", "verified: " + "v" * 30000))
+    w = worklist.build(root, TODAY)
+    n = next(n for n in w["notes"] if n["path"].endswith("5a5b5c5d.md"))
+    assert n["body"].startswith("y" * 4000) and "y" * 4001 not in n["body"]
+    assert n["body"].endswith("[truncated: 60000 characters]")
+    assert n["meta"]["verified"] == "v" * 500 + " [truncated]"
+    assert n["meta"]["session"] == "s" * 500 + " [truncated]"
+    assert n["meta"]["suggest_tags"] == ["t" * 500 + " [truncated]"]
+    assert any(e.startswith("body:") for e in n["invalid"])
+    assert any(e.startswith("verified:") for e in n["invalid"])
+    assert len(json.dumps(n)) < 7000
+
+
+def test_emitted_note_at_char_cap_is_whole(tmp_path):
+    root = make(tmp_path)
+    (root / "inbox/claude-laptop/2026-10-03-fact-6a6b6c6d.md").write_text(
+        _note("2026-10-03", body="z" * 4000).replace("verified: yes", "verified: " + "v" * 500))
+    n = next(n for n in worklist.build(root, TODAY)["notes"] if n["path"].endswith("6a6b6c6d.md"))
+    assert n["body"] == "z" * 4000 + "\n"
+    assert n["meta"]["verified"] == "v" * 500
+
+
+def test_emitted_meta_lists_and_errors_are_capped(tmp_path):
+    root = make(tmp_path)
+    many = ", ".join(f"t{i}" for i in range(100))
+    (root / "inbox/claude-laptop/2026-10-03-fact-7a7b7c7d.md").write_text(_note("2026-10-03", tags=f"[{many}]"))
+    n = next(n for n in worklist.build(root, TODAY)["notes"] if n["path"].endswith("7a7b7c7d.md"))
+    assert n["meta"]["tags"] == [f"t{i}" for i in range(20)] + ["[truncated: 100 items]"]
+    assert len(n["invalid"]) == 21 and n["invalid"][-1].startswith("[truncated: ")

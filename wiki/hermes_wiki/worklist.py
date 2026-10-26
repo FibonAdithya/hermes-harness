@@ -13,6 +13,9 @@ _LAST = "￿"  # notes with no usable `created` sort after dated ones
 
 MAX_READ_BYTES = 200 * 1024  # an inbox file is read up to this size; the rest is treated as absent
 BODY_WORDS = 400  # emitted note bodies are cut to this many words (the prompt must stay bounded)
+BODY_CHARS = schema.NOTE_CHAR_CAP  # ... and to this many characters
+META_CHARS = schema.META_CHAR_CAP  # each emitted frontmatter string is cut to this many characters
+META_ITEMS = 20  # emitted frontmatter lists keep this many items
 _TARGET_MAX = 80
 
 
@@ -46,18 +49,35 @@ def _created(note: dict) -> str:
     return _LAST
 
 
+def _clip(v):
+    if isinstance(v, str) and len(v) > META_CHARS:
+        return v[:META_CHARS] + " [truncated]"
+    if isinstance(v, list):
+        out = [_clip(x) for x in v[:META_ITEMS]]
+        return out + [f"[truncated: {len(v)} items]"] if len(v) > META_ITEMS else out
+    return v
+
+
+def _shown_body(body: str) -> str:
+    shown, cut = body, []
+    words = body.split()
+    if len(words) > BODY_WORDS:
+        shown = " ".join(words[:BODY_WORDS])
+        cut.append(f"{len(words)} words")
+    if len(shown.strip()) > BODY_CHARS:
+        shown = shown.strip()[:BODY_CHARS]
+        cut.append(f"{len(body.strip())} characters")
+    return shown + f"\n[truncated: {', '.join(cut)}]" if cut else shown
+
+
 def _emit(note: dict, all_pages, tags: set[str]) -> dict:
     meta, body = note["meta"], note["body"]
     if meta is None:
         meta, invalid = {}, ["no frontmatter"]
     else:
         invalid = schema.validate_note(meta, body, tags)
-    words = body.split()
-    shown = body
-    if len(words) > BODY_WORDS:
-        shown = " ".join(words[:BODY_WORDS]) + f"\n[truncated: {len(words)} words]"
-    return {"path": note["path"], "meta": meta, "body": shown,
-            "related": pagelib.related(body, all_pages), "invalid": invalid}
+    return {"path": note["path"], "meta": {k: _clip(v) for k, v in meta.items()}, "body": _shown_body(body),
+            "related": pagelib.related(body, all_pages), "invalid": _clip(invalid)}
 
 
 def _short(target: str) -> str:
@@ -143,7 +163,8 @@ def build(root: Path, today: date, note_limit: int = 30, backfill_limit: int = 1
     infra = {p.name for p in all_pages if p.infra}
     orphans = [p.name for p in content if not (inbound[p.name] - infra - {p.name})]
 
-    proposals = Counter(t for n in notes for t in _list((n["meta"] or {}).get("suggest_tags")))
+    proposals = Counter(t for n in notes for t in _list((n["meta"] or {}).get("suggest_tags"))
+                        if len(t) <= META_CHARS)
     return {
         "notes": [_emit(n, all_pages, tags) for n in notes[:note_limit]],
         "notes_remaining": max(0, len(notes) - note_limit),

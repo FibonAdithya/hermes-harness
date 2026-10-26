@@ -168,3 +168,16 @@ def test_add_note_rejects_header_injection_and_bad_rand(cfg, kw):
     with pytest.raises(nt.NoteRejected):
         nt.add_note(cfg, kind="fact", body="a b", tags=[], publisher=pub, **args)
     assert pub.calls == []
+
+
+def test_add_note_rejects_long_body_and_meta(cfg):
+    pub = FakePublisher()
+    nt.add_note(cfg, kind="fact", body="x" * 4000, tags=["hermes"], verified="v" * 500,
+                session="s" * 500, today=TODAY, rand="0a1b2c3d", publisher=pub)
+    assert len(pub.calls) == 1
+    for kw in ({"body": "x" * 4001}, {"verified": "v" * 501}, {"session": "s" * 501}):
+        args = {"body": "short body", **kw}
+        with pytest.raises(nt.NoteRejected):
+            nt.add_note(cfg, kind="fact", tags=["hermes"], today=TODAY, rand="0a1b2c3d",
+                        publisher=pub, **args)
+    assert len(pub.calls) == 1
