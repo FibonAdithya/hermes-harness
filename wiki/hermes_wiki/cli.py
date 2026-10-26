@@ -1,6 +1,9 @@
 """Command line entry point. Each subcommand registers itself in `_COMMANDS`."""
 import argparse
+import subprocess
 import sys
+import time
+from pathlib import Path
 
 from . import config
 
@@ -18,7 +21,25 @@ def _add_mcp(sub) -> None:
     p.set_defaults(func=_cmd_mcp)
 
 
-_COMMANDS = [_add_mcp]
+def _cmd_export_public(args, cfg) -> int:
+    from . import export
+
+    src = Path(args.src).expanduser()
+    head = subprocess.run(["git", "-C", str(src), "rev-parse", "HEAD"], capture_output=True,
+                          text=True, check=True).stdout.strip()
+    n = export.export_public(src, Path(args.dest).expanduser(), head, time.time())
+    print("unchanged" if n < 0 else f"exported {n} pages")
+    return 0
+
+
+def _add_export_public(sub) -> None:
+    p = sub.add_parser("export-public", help="build the filtered public export of a wiki checkout")
+    p.add_argument("--src", required=True)
+    p.add_argument("--dest", required=True, help="symlink to point at the new export")
+    p.set_defaults(func=_cmd_export_public, needs_config=False)
+
+
+_COMMANDS = [_add_mcp, _add_export_public]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -33,6 +54,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if not getattr(args, "needs_config", True):
+        return args.func(args, None)
     try:
         cfg = config.load(args.config)
     except (OSError, ValueError, TypeError) as e:
