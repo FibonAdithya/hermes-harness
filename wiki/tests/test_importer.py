@@ -102,24 +102,115 @@ def test_import_reports_secret_rejection(tmp_path, cfg):
     assert out[b].startswith("inbox/import-claude-memory/2026-10-26-person-")
 
 
-def test_dry_run_cli_never_publishes(tmp_path, monkeypatch, capsys):
-    from hermes_wiki import notes
+def _cli_setup(tmp_path):
     root = build_wiki(tmp_path / "wiki")
     conf = tmp_path / "c.json"
-    conf.write_text(json.dumps({"root": str(root), "source": "claude-laptop"}))
-    projects = tmp_path / "projects"
+    state = tmp_path / "state"
+    conf.write_text(json.dumps({"root": str(root), "source": "claude-laptop", "state_dir": str(state)}))
+    return conf, state, tmp_path / "projects"
+
+
+def test_dry_run_cli_never_publishes(tmp_path, monkeypatch, capsys):
+    from hermes_wiki import notes
+    conf, state, projects = _cli_setup(tmp_path)
     _mem(projects, "d", "a.md", "---\ntype: user\n---\nclean note\n")
     _mem(projects, "d", "b.md", "---\ntype: user\n---\ntoken ghp_" + "a" * 36 + "\n")
+    monkeypatch.setenv("HERMES_WIKI_DRY_PUBLISH", "1")
 
     def boom(*a, **k):
         raise AssertionError("published")
 
     monkeypatch.setattr(notes, "publish", boom)
+    monkeypatch.setattr(notes.subprocess, "run", boom)
     assert cli.main(["import-claude-memory", "--projects", str(projects), "--dry-run", "--config", str(conf)]) == 0
     out = capsys.readouterr().out
     assert "inbox/import-claude-memory/" in out
     assert "skipped: " in out
-    assert "1 would import, 1 skipped" in out
+    assert "would import 1, skipped 1, failed 0" in out
+    assert not state.exists()  # no dry dir, no imported.json
+
+
+def _publisher_failing_after(n, calls):
+    def pub(repo, path, content, **kw):
+        if len(calls) >= n:
+            raise notes_mod.PublishError("network")
+        calls.append(path)
+    return pub
+
+
+from hermes_wiki import notes as notes_mod  # noqa: E402
+
+
+def test_rerun_after_partial_failure_publishes_only_remaining(tmp_path, cfg):
+    projects = tmp_path / "projects"
+    for n in "abc":
+        _mem(projects, "d", f"{n}.md", f"---\ntype: user\n---\nnote {n}\n")
+    ledger = tmp_path / "state" / "imported.json"
+    calls = []
+
+    def add_fail(c, **kw):
+        return notes_mod.add_note(c, publisher=_publisher_failing_after(2, calls), **kw)
+
+    out = importer.import_claude_memory(projects, cfg, add=add_fail, today=TODAY, ledger=ledger)
+    assert [r.startswith("inbox/") for _, r in out] == [True, True, False]
+    assert out[2][1].startswith("failed: ")
+    assert len(json.loads(ledger.read_text())) == 2
+    calls2 = []
+
+    def add_ok(c, **kw):
+        return notes_mod.add_note(c, publisher=lambda r, p, t, **k: calls2.append(p), **kw)
+
+    out2 = importer.import_claude_memory(projects, cfg, add=add_ok, today=TODAY, ledger=ledger)
+    assert len(calls2) == 1
+    assert [r for _, r in out2][:2] == ["skipped: already imported"] * 2
+    assert len(json.loads(ledger.read_text())) == 3
+
+
+def test_changed_file_is_reimported(tmp_path, cfg):
+    projects = tmp_path / "projects"
+    _mem(projects, "d", "a.md", "---\ntype: user\n---\nv1\n")
+    ledger = tmp_path / "imported.json"
+    seen = []
+    add = lambda c, **kw: seen.append(kw["body"]) or "p"  # noqa: E731
+    importer.import_claude_memory(projects, cfg, add=add, ledger=ledger)
+    _mem(projects, "d", "a.md", "---\ntype: user\n---\nv2\n")
+    importer.import_claude_memory(projects, cfg, add=add, ledger=ledger)
+    assert len(seen) == 2
+
+
+def _fake_gh(tmp_path):
+    """A stand-in for `gh`: logs each call; fails while <tmp>/fail exists and one call has succeeded."""
+    log, flag = tmp_path / "gh.log", tmp_path / "fail"
+    script = tmp_path / "fake-gh"
+    script.write_text(f"#!/bin/sh\nif [ -e '{flag}' ] && [ -s '{log}' ]; then echo boom >&2; exit 1; fi\n"
+                      f"echo call >> '{log}'\n")
+    script.chmod(0o755)
+    return script, log, flag
+
+
+def test_cli_exit_1_on_publish_failure_and_resume(tmp_path, capsys):
+    conf, state, projects = _cli_setup(tmp_path)
+    gh, log, flag = _fake_gh(tmp_path)  # never the real gh
+    data = json.loads(conf.read_text())
+    data["gh"] = str(gh)
+    conf.write_text(json.dumps(data))
+    _mem(projects, "d", "a.md", "---\ntype: user\n---\nnote a\n")
+    _mem(projects, "d", "b.md", "---\ntype: user\n---\nnote b\n")
+    flag.write_text("")
+    argv = ["import-claude-memory", "--projects", str(projects), "--config", str(conf)]
+    assert cli.main(argv) == 1
+    assert "imported 1, skipped 0, failed 1" in capsys.readouterr().out
+    flag.unlink()
+    assert cli.main(argv) == 0
+    assert "imported 1, skipped 1, failed 0" in capsys.readouterr().out
+    assert len(log.read_text().splitlines()) == 2
+
+
+def test_missing_projects_dir_exits_2(tmp_path, capsys):
+    conf, _, projects = _cli_setup(tmp_path)
+    assert cli.main(["import-claude-memory", "--projects", str(projects), "--config", str(conf)]) == 2
+    err = capsys.readouterr().err
+    assert len(err.strip().splitlines()) == 1
 
 
 def test_install_hook_cli(tmp_path):

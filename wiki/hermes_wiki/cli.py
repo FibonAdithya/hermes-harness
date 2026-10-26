@@ -135,15 +135,25 @@ def _add_install_hook(sub) -> None:
 def _cmd_import_memory(args, cfg) -> int:
     from . import importer, notes
 
+    projects = Path(args.projects).expanduser()
+    if not projects.is_dir():
+        print(f"hermes-wiki: --projects {projects} is not a directory", file=sys.stderr)
+        return 2
     add = importer.validate_only if args.dry_run else notes.add_note
-    results = importer.import_claude_memory(Path(args.projects).expanduser(), cfg, add=add)
-    skipped = 0
+    try:
+        results = importer.import_claude_memory(projects, cfg, add=add, ledger=cfg.state_dir / "imported.json",
+                                                record=not args.dry_run)
+    except (OSError, ValueError) as e:
+        print(f"hermes-wiki: import failed: {e}", file=sys.stderr)
+        return 2
+    skipped = failed = 0
     for f, res in results:
         skipped += res.startswith("skipped: ")
+        failed += res.startswith("failed: ")
         print(f"{f}\t{res}")
-    verb = "would import" if args.dry_run else "imported"
-    print(f"{len(results) - skipped} {verb}, {skipped} skipped")
-    return 0
+    done = len(results) - skipped - failed
+    print(f"{'would import' if args.dry_run else 'imported'} {done}, skipped {skipped}, failed {failed}")
+    return 1 if failed else 0
 
 
 def _add_import_memory(sub) -> None:

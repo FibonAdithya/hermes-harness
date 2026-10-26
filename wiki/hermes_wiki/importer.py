@@ -1,5 +1,8 @@
 """One-time import of Claude Code per-project memory files into inbox notes."""
 import dataclasses
+import hashlib
+import json
+import os
 import re
 from datetime import date
 from pathlib import Path
@@ -50,9 +53,34 @@ def validate_only(cfg: WikiConfig, **kw) -> str:
     return notes.add_note(cfg, publisher=lambda *a, **k: None, **kw)
 
 
+def _load_ledger(ledger: Path | None) -> dict[str, str]:
+    if ledger is None or not Path(ledger).exists():
+        return {}
+    data = json.loads(Path(ledger).read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{ledger}: must be a JSON object")
+    return data
+
+
+def _save_ledger(ledger: Path, data: dict[str, str]) -> None:
+    ledger = Path(ledger)
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    tmp = ledger.with_name(ledger.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, ledger)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def import_claude_memory(projects: Path, cfg: WikiConfig, add=notes.add_note,
-                         today: date | None = None) -> list[tuple[str, str]]:
+                         today: date | None = None, ledger: Path | None = None,
+                         record: bool = True) -> list[tuple[str, str]]:
+    """Import memory files. With `ledger`, files already imported (same path and content hash) are
+    skipped, and each success is recorded right after its publish unless `record` is False.
+    Results are `(file, path | "skipped: <reason>" | "failed: <reason>")`."""
     cfg = dataclasses.replace(cfg, source=IMPORT_SOURCE)
+    done = _load_ledger(ledger)
     results: list[tuple[str, str]] = []
     for pdir in sorted(Path(projects).iterdir()):
         if not pdir.is_dir() or skip_project_dir(pdir.name):
@@ -60,17 +88,32 @@ def import_claude_memory(projects: Path, cfg: WikiConfig, add=notes.add_note,
         for f in sorted((pdir / "memory").glob("*.md")):
             if f.name == "MEMORY.md":
                 continue
+            key = str(f.resolve())
             try:
-                text = f.read_text(encoding="utf-8")
+                raw = f.read_bytes()
+                digest = hashlib.sha256(raw).hexdigest()
+                if done.get(key) == digest:
+                    results.append((str(f), "skipped: already imported"))
+                    continue
+                text = raw.decode("utf-8")
                 body = _truncate(f"Imported from Claude Code project {pdir.name}.\n\n" + _split(text)[1].strip(),
                                  NOTE_WORD_CAP)
                 kw = dict(kind=memory_kind(text), body=body, tags=[], repos=[], verified="claim",
                           session=f"import:{pdir.name}"[:80])
                 if today is not None:
                     kw["today"] = today
-                results.append((str(f), add(cfg, **kw)))
-            except (notes.NoteRejected, notes.PublishError) as e:
+                path = add(cfg, **kw)
+            except notes.NoteRejected as e:
                 results.append((str(f), f"skipped: {e}"))
+                continue
+            except notes.PublishError as e:
+                results.append((str(f), f"failed: {e}"))
+                continue
             except (OSError, UnicodeDecodeError) as e:
                 results.append((str(f), f"skipped: unreadable ({type(e).__name__})"))
+                continue
+            results.append((str(f), path))
+            if ledger is not None and record:
+                done[key] = digest
+                _save_ledger(ledger, done)
     return results
