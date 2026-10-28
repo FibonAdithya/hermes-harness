@@ -4,8 +4,7 @@ Text read here stays inside the tuner process; callers report counts and boolean
 """
 from __future__ import annotations
 
-from collections import Counter
-from typing import Sequence
+from typing import Iterable, Sequence
 
 from . import policy
 from .reducers import text_view
@@ -75,8 +74,9 @@ def _maximal_matches(sam, b: str, min_len: int):
 def used_strings(result: str, later: Sequence[str], exclude: Sequence[str]) -> frozenset[str]:
     """Strings of `result` the model reused verbatim in `later` messages.
 
-    For each normalised later message, the maximal substrings of length >=
-    USED_MIN_CHARS that occur in the normalised text view of `result`. Strings found
+    For each normalised later message, the maximal substrings that occur in the
+    normalised text view of `result`, stripped of edge spaces, of length >=
+    USED_MIN_CHARS after stripping. Strings found
     in any normalised `exclude` text (the prompt) are dropped. Only the first
     USED_MAX_CHARS normalised chars of the result and of each message are compared.
     """
@@ -84,7 +84,11 @@ def used_strings(result: str, later: Sequence[str], exclude: Sequence[str]) -> f
     sam = _automaton(norm(text_view(result))[:cap])
     found: set[str] = set()
     for msg in later:
-        found.update(_maximal_matches(sam, norm(msg)[:cap], policy.USED_MIN_CHARS))
+        for m in _maximal_matches(sam, norm(msg)[:cap], policy.USED_MIN_CHARS):
+            # A match can start or end with a space; the reduced text need not keep it.
+            m = m.strip()
+            if len(m) >= policy.USED_MIN_CHARS:
+                found.add(m)
     excl = [norm(e) for e in exclude]
     return frozenset(s for s in found if not any(s in e for e in excl))
 
@@ -94,8 +98,14 @@ def survives(s: str, reduced: str) -> bool:
     return s in norm(text_view(reduced))
 
 
-def boilerplate(per_result: Sequence[frozenset[str]]) -> frozenset[str]:
-    """Strings present in more than BOILERPLATE_SHARE of the results."""
-    counts = Counter(s for strings in per_result for s in strings)
-    limit = policy.BOILERPLATE_SHARE * len(per_result)
-    return frozenset(s for s, n in counts.items() if n > limit)
+def boilerplate(used: Iterable[str], results: Sequence[str]) -> frozenset[str]:
+    """Strings of `used` present in more than BOILERPLATE_SHARE of a tool's results.
+
+    Presence is a substring of the result's normalised text view. With fewer than
+    BOILERPLATE_MIN_RESULTS results nothing is boilerplate.
+    """
+    if len(results) < policy.BOILERPLATE_MIN_RESULTS:
+        return frozenset()
+    views = [norm(text_view(r)) for r in results]
+    limit = policy.BOILERPLATE_SHARE * len(results)
+    return frozenset(s for s in set(used) if sum(s in v for v in views) > limit)

@@ -141,3 +141,5 @@ USED_MIN_CHARS = 8
 USED_MAX_CHARS = 50_000
 # Drop strings present in more than this share of a tool's results.
 BOILERPLATE_SHARE = 0.5
+# With fewer results than this in the window, nothing counts as boilerplate.
+BOILERPLATE_MIN_RESULTS = 4

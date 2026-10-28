@@ -65,7 +65,7 @@ def test_used_strings_exclusion_drops_substrings_of_exclude():
 def test_used_strings_unions_later_messages_and_is_maximal():
     res = "Dentist appointment on Friday at 12 High Street"
     got = used_strings(res, ["dentist appointment", "see 12 high street!"], [])
-    assert got == frozenset({"dentist appointment", " 12 high street"})
+    assert got == frozenset({"dentist appointment", "12 high street"})
 
 
 def test_used_strings_result_bound_is_50000_normalised_chars():
@@ -100,7 +100,7 @@ def _brute_maximal(a: str, b: str, min_len: int) -> set[str]:
             right_ok = j == len(b) or b[i:j + 1] not in a
             if left_ok and right_ok:
                 out.add(sub)
-    return out
+    return {s.strip() for s in out if len(s.strip()) >= min_len}
 
 
 def test_used_strings_matches_brute_force():
@@ -136,10 +136,49 @@ def test_survives_uses_text_view_and_norm():
     assert not survives("dentist appointment", json.dumps({"result": "Dentist"}))
 
 
-def test_boilerplate_strictly_more_than_half():
-    a, b, c = "unsubscribe here", "view in browser", "dentist appointment"
-    per = [frozenset({a, b}), frozenset({a, b}), frozenset({a, c}), frozenset()]
-    assert boilerplate(per) == frozenset({a})          # b is in exactly half: kept
-    assert boilerplate([]) == frozenset()
-    assert boilerplate([frozenset({c})]) == frozenset({c})
+def test_used_strings_strips_edge_spaces():
+    res = json.dumps({"snippet": "Dentist appointment at 3pm, 12 High Street", "subject": "Reminder"})
+    got = used_strings(res, ["I created the dentist appointment at noon"], [])
+    assert got == frozenset({"dentist appointment at"})
+    assert survives("dentist appointment at", json.dumps({"snippet": "Dentist appointment at"}))
+
+
+def test_used_strings_exclusion_applies_to_stripped_string():
+    res = "Please sync calendar events now"
+    assert used_strings(res, ["x sync calendar events"], []) == frozenset({"sync calendar events"})
+    assert used_strings(res, ["x sync calendar events"], ["Sync calendar events"]) == frozenset()
+
+
+def test_used_strings_min_length_applies_after_strip():
+    res = "x abcdefg y"
+    assert used_strings(res, ["q abcdefg q"], []) == frozenset()   # " abcdefg " is 9, "abcdefg" 7
+
+
+_S = "weekly standup"
+
+
+def test_boilerplate_needs_min_results():
+    assert policy.BOILERPLATE_MIN_RESULTS == 4
+    assert boilerplate([_S], [f"r{i} {_S}" for i in range(3)]) == frozenset()
+
+
+def test_boilerplate_more_than_half_of_results():
+    results = [f"a {_S}", f"b {_S}", f"c {_S}", "d nothing"]
+    assert boilerplate([_S, "dentist appointment"], results) == frozenset({_S})
     assert policy.BOILERPLATE_SHARE == 0.5
+
+
+def test_boilerplate_exactly_half_is_kept():
+    results = [f"a {_S}", f"b {_S}", "c nothing", "d nothing"]
+    assert boilerplate([_S], results) == frozenset()
+
+
+def test_boilerplate_counts_results_not_used_sets():
+    # Used in every result's used set, but in only half of the result texts.
+    results = [f"a {_S}", f"b {_S}", "c nothing", "d nothing"]
+    assert boilerplate([_S] * 4, results) == frozenset()
+
+
+def test_boilerplate_reads_normalised_text_view():
+    results = [json.dumps({"result": "Weekly\nStandup " + x}) for x in "abc"] + ["d nothing"]
+    assert boilerplate([_S], results) == frozenset({_S})
