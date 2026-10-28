@@ -55,13 +55,15 @@ def iso(t):
 
 
 def triage_calls(n):
-    """Search -> read -> modify. Every result and argument value carries a sentinel."""
+    """Search -> read -> modify, one call per model turn (a sequence candidate only
+    saves turns when its calls sit on separate turns). Every result and argument value
+    carries a sentinel."""
     return [
         (SEARCH, {"query": f"{ARG_SENTINEL} newer_than:1d"},
-         f"{RESULT_SENTINEL} results: " + "x" * 400),
-        (GET, {"message_id": f"{ARG_SENTINEL}-{n}"}, f"{RESULT_SENTINEL} body " + "y" * 800),
+         f"{RESULT_SENTINEL} results: " + "x" * 400, 1),
+        (GET, {"message_id": f"{ARG_SENTINEL}-{n}"}, f"{RESULT_SENTINEL} body " + "y" * 800, 2),
         (MOD, {"message_id": f"{ARG_SENTINEL}-{n}", "add_label_ids": ["STARRED"]},
-         f"{RESULT_SENTINEL} ok"),
+         f"{RESULT_SENTINEL} ok", 3),
     ]
 
 

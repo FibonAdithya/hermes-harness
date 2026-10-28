@@ -342,3 +342,98 @@ def test_distinct_loops_kept():
 def test_briefing_loop_is_one_candidate():
     cands = detect(briefing_runs(), NOW, FLAT)
     assert len(_seqs(cands, "3bc4e11d29b1", GET)) == 1
+
+
+# --- carried bytes and turns removed (Task 2) ---------------------------------------
+from factory import NOUS_V4_PRO  # noqa: E402
+from hermes_tuner.detect import carried_usd, saved_turns  # noqa: E402
+
+
+def tcall(i, name, turn, later=0, chars=10, ref=None):
+    return ToolCall(call_id=f"t{i}", name=name, arg_keys=("k",), ref=ref, result_chars=chars,
+                    turn=turn, later_turns=later)
+
+
+def tsess(sid, calls, turns, job="j1", age_days=1.0, cost=0.1):
+    s = sess(sid, calls, job=job, age_days=age_days, cost=cost)
+    return Session(**{**s.__dict__, "turns": turns})
+
+
+def test_parallel_reads_save_no_turns():
+    sessions = [tsess(f"p{r}", [tcall(i, GET, 5, chars=100, ref=f"m{i}") for i in range(8)],
+                      turns=10, age_days=r + 1) for r in range(12)]
+    seq = [c for c in detect(sessions, NOW, NOUS_V4_PRO) if c.kind == "sequence"]
+    assert all(c.est_monthly_usd == 0 for c in seq) or not seq
+    assert not seq
+
+
+def test_serial_reads_save_turns():
+    sessions = [tsess(f"q{r}", [tcall(i, GET, 2 + i, chars=100, ref=f"m{i}") for i in range(8)],
+                      turns=10, age_days=r + 1) for r in range(12)]
+    seq = next(c for c in detect(sessions, NOW, NOUS_V4_PRO) if c.kind == "sequence")
+    expect = sum(7 * priced_cost(s, NOUS_V4_PRO) / s.turns for s in sessions) * 30 / 28
+    assert seq.est_monthly_usd == pytest.approx(expect)
+
+
+def test_saved_turns_edge_turns_with_other_calls():
+    s = tsess("e", [tcall(0, "A", 1), tcall(1, "g", 1), tcall(2, "g", 1), tcall(3, "g", 2),
+                    tcall(4, "g", 3), tcall(5, "B", 3)], turns=4)
+    assert saved_turns(s, ("g", "g", "g")) == 1
+
+
+def test_saved_turns_all_full():
+    s = tsess("f", [tcall(i, "g", 2 + i) for i in range(8)], turns=10)
+    assert saved_turns(s, ("g", "g", "g")) == 7
+
+
+def test_saved_turns_parallel_is_zero_not_negative():
+    s = tsess("z", [tcall(i, "g", 3) for i in range(5)], turns=5)
+    assert saved_turns(s, ("g", "g", "g")) == 0
+
+
+def test_saved_turns_counts_each_run_separately():
+    # two separate runs of three g's (split by X), each serial and full: 2 + 2
+    calls = [tcall(0, "g", 1), tcall(1, "g", 2), tcall(2, "g", 3), tcall(3, "X", 4),
+             tcall(4, "g", 5), tcall(5, "g", 6), tcall(6, "g", 7)]
+    assert saved_turns(tsess("r", calls, turns=8), ("g", "g", "g")) == 4
+
+
+def test_carried_usd():
+    p = NOUS_V4_PRO  # input 0.94, cache read 0.08 per M
+    assert carried_usd(4000, 0, p) == 0
+    assert carried_usd(4000, 1, p) == pytest.approx(1000 * 0.94 / 1e6)
+    assert carried_usd(4000, 3, p) == pytest.approx(1000 * (0.94 + 2 * 0.08) / 1e6)
+
+
+def test_bytes_ranks_biggest_carried_tool_first():
+    sessions = []
+    for r in range(12):
+        sessions.append(tsess(f"k{r}", [
+            tcall(0, SEARCH, 1, later=9, chars=8000),
+            tcall(1, "get_events", 10, later=0, chars=40_000)], turns=10, age_days=r + 1))
+    b = [c for c in detect(sessions, NOW, NOUS_V4_PRO) if c.kind == "bytes"]
+    assert [c.key for c in b] == [f"bytes:{SEARCH}"]  # get_events carries nothing
+    assert b[0].sessions == 12 and b[0].occurrences == 12 and b[0].result_chars == 12 * 8000
+    expect = 12 * carried_usd(8000, 9, NOUS_V4_PRO) * 30 / 28
+    assert b[0].est_monthly_usd == pytest.approx(expect)
+    assert b[0].job_id == "j1"
+
+
+def test_bytes_needs_min_sessions():
+    sessions = [tsess(f"m{r}", [tcall(0, SEARCH, 1, later=5, chars=8000)], turns=6,
+                      age_days=r + 1) for r in range(9)]
+    assert not [c for c in detect(sessions, NOW, NOUS_V4_PRO) if c.kind == "bytes"]
+
+
+def test_aliases_count_composed_results_under_called_tool():
+    sessions = []
+    for r in range(12):
+        sessions.append(tsess(f"a{r}", [
+            tcall(0, GET, 1, later=4, chars=1000),
+            tcall(1, "tuned_x", 2, later=3, chars=2000)], turns=5, age_days=r + 1))
+    b = [c for c in detect(sessions, NOW, NOUS_V4_PRO, aliases={"tuned_x": GET})
+         if c.kind == "bytes"]
+    assert [c.key for c in b] == [f"bytes:{GET}"]
+    assert b[0].result_chars == 12 * 3000 and b[0].occurrences == 24
+    expect = 12 * (carried_usd(1000, 4, NOUS_V4_PRO) + carried_usd(2000, 3, NOUS_V4_PRO)) * 30 / 28
+    assert b[0].est_monthly_usd == pytest.approx(expect)

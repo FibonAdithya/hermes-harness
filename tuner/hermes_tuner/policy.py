@@ -117,3 +117,7 @@ RESTART_WINDOW = (2, 5)
 RESTART_TZ = "Europe/London"
 QUIET_MIN = 30
 JOB_MARGIN_MIN = 15
+
+# Carried-bytes ranking (tuner design 2026-10-28).
+CHARS_PER_TOKEN = 4  # ESTIMATE: messages.token_count is NULL on every tool row
+MIN_DRAFT_MONTHLY_USD = 0.05  # ESTIMATE
