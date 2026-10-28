@@ -268,7 +268,12 @@ held in code.
 - drop quoted replies
 - drop footers after common unsubscribe or legal markers
 - collapse whitespace
-- drop JSON fields that never contain a used string
+- drop top-level JSON fields when every used string survives without them.
+  Amended in the plan audit, 2026-10-28. The original rule was "fields that
+  never contain a used string". MEASURED: all 794 live results of the three
+  allowlisted tools carry the same text twice, as `result` and
+  `structuredContent.result`. A field holding a copy of a used string would
+  never be dropped, and the duplicate is about half of every result.
 - cap the body at N chars
 
 Each transform is a pure function with unit tests.
