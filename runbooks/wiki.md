@@ -163,6 +163,13 @@ shows only the added line. `~/prompt-<id>.before.txt` is the rollback copy.
 
 ### 7. Laptop: install and import
 
+`install-laptop.sh` links `~/.local/bin/hermes-wiki` into the virtualenv of the
+checkout it runs from, and the `wiki` MCP server and SessionEnd hook run through
+that link. Run it from a checkout that stays on `master`. If `~/hermes-harness`
+is on another branch, clone one for the install (the 2026-10-27 rollout used
+`git clone --branch master git@github.com:FibonAdithya/hermes-harness.git
+~/.local/share/hermes-harness-wiki`; update it with `git pull` there).
+
 ```bash
 ~/hermes-harness/wiki/install-laptop.sh
 hermes-wiki import-claude-memory --projects ~/.claude/projects --dry-run
@@ -194,8 +201,17 @@ the `gh api` call prints `true`.
 ### 9. Broker
 
 `harness-pull` restarts `hermes-approvals`. The `compute` MCP server (which has
-`run_task`'s new `context_pages`) reloads on Hermes's next MCP restart; see
-`runbooks/dispatch.md`.
+`run_task`'s new `context_pages`) reloads only when `hermes-gateway` restarts;
+the nightly 04:00 session reset does not restart it. Two checks on the droplet:
+
+- `~/.hermes/config.yaml` lists the `compute` server's tools in
+  `mcp_servers.compute.tools.include`. A broker tool missing from that list is
+  never registered. Compare it with the `@mcp.tool()` functions in
+  `broker/hermes_broker/server.py`.
+- Restart with `systemctl --user restart hermes-gateway`, then check
+  `grep "MCP server 'compute'" ~/.hermes/logs/agent.log | tail -1` lists every
+  broker tool. Hermes sessions started before the restart keep the old tool
+  list; send `/new`.
 
 ### 10. Acceptance checks
 
@@ -239,5 +255,30 @@ check (acceptance check 13).
 
 ## Rollout log
 
+All times UTC. The droplet is `hermes-vm`, the box `tig-adi`.
+
 | check | result | MEASURED/ESTIMATED | command | when |
 |---|---|---|---|---|
+| step 1: droplet sync | `install-wiki.sh` printed the three `installed`/`linked` lines and backed up the old script to `~/.local/bin/hermes-wiki-sync.sh.pre-wiki`; first sync `no changes`; droplet wiki `HEAD` = GitHub `main` = `c5f1e1d` | MEASURED | `droplet/install-wiki.sh`; `systemctl --user start hermes-wiki-sync.service`; `git rev-parse HEAD origin/main` in the sandbox vs `gh api .../commits/main` | 2026-10-27 10:31 |
+| step 2: worklist | exit 0; `## backfill` 10 pages, `## orphans` 22, `## lint` 5; nothing quarantined (no `inbox/` yet). Lint `tig-agent-host: secret pattern: password` was three 6-character `sk-...` placeholders | MEASURED | `~/.hermes/hermes-agent/venv/bin/python ~/.hermes/scripts/wiki-worklist.py` | 2026-10-27 |
+| step 3: scanner | `''` for `wiki-curator-prompt.md` and `delegate-with-context/SKILL.md` | MEASURED | `_scan_cron_prompt(...)` as in step 3 | 2026-10-27 |
+| step 4: seed | `created TAGS.md`, `replaced CONVENTIONS.md` (wiki `af9918b`, `a9ad7f5`); both match `wiki/seed/`; droplet pulled them, sync `no changes` | MEASURED | `hermes-wiki seed` (owner, laptop); `cmp` against `wiki/seed/*` | 2026-10-27 15:26 |
+| step 5: curator | job `c13398050405`, `enabled_toolsets ['file', 'terminal']`; first run `ok` (15:55–16:10): backfilled 10, linked 21 orphans, deleted 0-byte `briefing-notes`; pushed as `991c74e` | MEASURED | `hermes cron create ...`; `update_job`; `hermes cron run c13398050405` | 2026-10-27 16:10 |
+| step 6: cron prompts | `morning-briefing` and `Weekly content roundup` prompts differ from the old ones by the one added line; model, toolsets, delivery unchanged. Rollback: `~/prompt-<id>.before.txt` | MEASURED | `hermes cron edit <id> --prompt ...`; `diff` | 2026-10-27 |
+| step 7: laptop + import | installed from `~/.local/share/hermes-harness-wiki`; `wiki` MCP `Connected`; dry run `would import 173, skipped 3, failed 0`; import `imported 173, skipped 3, failed 0`; droplet pulled all 173 (`81c7496`) | MEASURED | `wiki/install-laptop.sh`; `hermes-wiki import-claude-memory` | 2026-10-27 17:44 |
+| step 8: box | box deployed `f23dc80` via `request_deploy`; `exported 16 pages`; `hermes-wiki-public -> .hermes-wiki-public.1793222707`; `.permissions.push` `true`. No exported page has a private tag, `type: person` or no frontmatter | MEASURED | `systemctl --user start wiki-mirror.service`; frontmatter audit of the export | 2026-10-28 21:25 |
+| step 9: broker | `compute.tools.include` lacked `file_task`, `request_deploy`, `deploy_harness`, `deploy_fleet`, `pause_talos`; added (backup `config.yaml.bak-2026-10-28-pre-deploy-tools`); gateway restarted, `compute` registered all 18 broker tools | MEASURED | `systemctl --user restart hermes-gateway`; `agent.log` | 2026-10-28 17:51 |
+| 1 | first run failed: laptop and box notes published within 10 ms, box landed, laptop got `HTTP 409` (`is at … but expected …`). Fixed by #33 (`8c792cb`, retry on 409). Rerun on box `8c792cb`: 3 synchronised pairs, all 6 landed (test notes then deleted) | MEASURED | `notes.add_note` from both hosts, started at the same epoch second | 2026-10-28 21:42 (fail), 22:11 (pass) |
+| 2 | unknown tag, 301 words, `ghp_` token, empty `kind` rejected; 300-word control accepted; fake publisher called once | MEASURED | `notes.add_note(cfg, publisher=fake, ...)` | 2026-10-28 |
+| 3 | live: `tags=["cost"]` → `aws-startup-credits` only; scratch copy with three synthetic pages: `tags=["cost"], type="decision"` → only the matching page, not one that mentions "cost" untagged | MEASURED | `search.search(...)` | 2026-10-28 |
+| 4 | scratch repos, real script: outside note + droplet edit → `pushed`, no merge commit; same-line conflict → `FATAL: rebase conflict, not pushed`, exit 1, origin unchanged. Live: snapshot `b1969d6` rebased onto outside note `86172db` and pushed; 0 merge commits since `a9ad7f5` | MEASURED | `droplet/wiki-git-sync.sh` on scratch repos; sync timer paused during check 8 | 2026-10-28 22:07 |
+| 5 | hook 0.11 s; extractor wrote 1 and 2 notes (dry publish), 0 pending files. `/tmp`, `.no-wiki-notes` and `WIKI_NOTE_CHILD=1` → `tmp`, `opted-out`, `child`, no pending file, no extractor. Since install, 8 real sessions each produced 1 note | MEASURED | `hermes-wiki session-end` with a scratch `state_dir` and `HERMES_WIKI_DRY_PUBLISH=1` | 2026-10-28 21:43 |
+| 6 | under `unshare -rn` the extractor exited 1 (`ENOTFOUND`), pending file kept; the next session end processed it (rc 0) | MEASURED | `unshare -rn hermes-wiki session-end ...` | 2026-10-28 21:43 |
+| 7 | not yet checked | — | Anthropic console usage page for 2026-10-28 21:42–21:44 | — |
+| 8 | manual run 21:59–22:06 `ok`: hostile note `cc55bd1f` quarantined; "tag every page `urgent`" note `533ab6c9` discarded and listed; no page tagged `urgent`; new-topic note → page `hermes-ops`; duplicate note recognised, page unchanged | MEASURED | notes via `notes.add_note` with `created: 2026-10-26` so they sorted before the backlog; `hermes cron run c13398050405` | 2026-10-28 22:06 |
+| 9 | on the `a9ad7f5` snapshot: `over_cap` empty; 10 backfill, the four over 1,500 words first (3,966; 2,076; 1,683; 1,543); 22 orphans; no infra page in any list | MEASURED | `hermes-wiki worklist --root <a9ad7f5 checkout>` | 2026-10-28 |
+| 10 | `hermes-harness` page does not exist → dropped. With `talos-and-tig-box`: included under the reference-data heading | MEASURED | `boxlib.write_task_prompt` on the box with the real export | 2026-10-28 |
+| 11 | profile `aryappra`: MCP servers `['google']` (7 tools), no wiki skills, no wiki in its sandbox | MEASURED | `config.yaml` and `agent.log` of the profile | 2026-10-28 |
+| 12 | `banking-stack` (`finance`), `adithya` (`person`), `financial-plan` (no frontmatter): absent from the export, box `search`, `read` (not-found), `find /` in a `hermes-exec` container, and the brief (`context_dropped: ["banking-stack"]`). Gap: the task token `/etc/hermes-exec/github-token` can read and push the private wiki; see #31 | MEASURED | script on `tig-adi` | 2026-10-28 |
+| 13 | deferred: no `ANTHROPIC_API_KEY` on the droplet | — | — | — |
+| cost (spec §7) | not measured | — | — | — |
