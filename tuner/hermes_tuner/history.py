@@ -109,6 +109,38 @@ def assistant_row_ids(rows) -> dict[str, list[int]]:
     return out
 
 
+@dataclasses.dataclass(frozen=True)
+class ReplayCall:
+    pos: int            # row order within the run
+    call_id: str
+    name: str
+    args: dict
+    text: str           # result with Hermes's untrusted wrapper removed
+    chars: int          # len(text)
+    turn: int           # as ToolCall.turn
+    later_turns: int    # as ToolCall.later_turns
+    ref: str | None     # as ToolCall.ref
+
+
+@dataclasses.dataclass(frozen=True)
+class ReplayRun:
+    session_id: str
+    started_at: float
+    calls: tuple[ReplayCall, ...]
+    said: tuple[tuple[int, str], ...]   # (pos, text) of assistant content and arg string leaves
+
+
+def _string_leaves(value) -> Iterator[str]:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for v in value.values():
+            yield from _string_leaves(v)
+    elif isinstance(value, list):
+        for v in value:
+            yield from _string_leaves(v)
+
+
 class History:
     def __init__(self, conn: sqlite3.Connection):
         self._conn = conn
@@ -301,6 +333,77 @@ class History:
                 cache_write_tokens=write,
                 turns=sum(counts[sid] for sid in chains[r["id"]]),
             ))
+        return out
+
+    def replay_runs(self, job_id: str, since: float,
+                    until: float | None = None) -> list[ReplayRun]:
+        """Recorded runs of cron job `job_id` (compression chains merged, as `sessions`
+        does) with each call's unwrapped result text and what the model said later.
+        Texts stay in the caller's memory: nothing here logs or writes them."""
+        sql = (f"select {_SESSION_COLS} from sessions s "
+               "left join sessions p on p.id = s.parent_session_id "
+               "where s.started_at >= ? and coalesce(p.end_reason, '') != 'compression'")
+        params: tuple = (since,)
+        if until is not None:
+            sql += " and s.started_at < ?"
+            params += (until,)
+        roots = [r for r in self._q(sql + " order by s.started_at", params)
+                 if (m := JOB_SESSION_RE.match(r["id"])) and m.group(1) == job_id]
+        if not roots:
+            return []
+        chains = self._chains(roots)
+        sids = [sid for ids in chains.values() for sid in ids]
+        rows_by_session: dict[str, list[sqlite3.Row]] = {sid: [] for sid in sids}
+        for i in range(0, len(sids), _CHUNK):
+            part = sids[i:i + _CHUNK]
+            for r in self._q(
+                    "select id, session_id, role, content, tool_calls, tool_call_id, tool_name "
+                    f"from messages where role in ('assistant', 'tool') and session_id in "
+                    f"({','.join('?' * len(part))}) order by id", tuple(part)):
+                rows_by_session[r["session_id"]].append(r)
+        out = []
+        for root in roots:
+            members = chains[root["id"]]
+            pending = []   # (pos, call_id, name, args, text, turn, later)
+            said_raw: list[tuple[int, str]] = []
+            seen: set[str] = set()
+            pos = 0
+            offset = 0
+            for sid in members:
+                rows = rows_by_session[sid]
+                assistants = assistant_row_ids(rows).get(sid, [])
+                issued: dict[str, tuple[str, dict, int]] = {}
+                for r in rows:
+                    pos += 1
+                    if r["role"] == "assistant":
+                        turn = bisect.bisect_right(assistants, r["id"])
+                        if r["content"]:
+                            said_raw.append((pos, r["content"]))
+                        for cid, name, args in _issued_calls(r["tool_calls"]):
+                            issued[cid] = (name, args, turn)
+                            said_raw.extend((pos, leaf) for leaf in _string_leaves(args))
+                        continue
+                    cid = r["tool_call_id"]
+                    if cid and cid in seen:
+                        continue
+                    if cid:
+                        seen.add(cid)
+                    name, args, turn = issued.get(cid, ("?", {}, 0)) if cid else ("?", {}, 0)
+                    if r["tool_name"]:
+                        name = r["tool_name"]
+                    later = len(assistants) - bisect.bisect_right(assistants, r["id"])
+                    pending.append((pos, cid or "", name, args, r["content"] or "",
+                                    turn + offset if turn else turn, later))
+                offset += len(assistants)
+            tools = frozenset(p[2] for p in pending)
+            calls = []
+            for p, cid, name, args, text, turn, later in pending:
+                text = _unwrap(text, tools)
+                calls.append(ReplayCall(pos=p, call_id=cid, name=name, args=args, text=text,
+                                        chars=len(text), turn=turn, later_turns=later,
+                                        ref=_key_ref(args)))
+            out.append(ReplayRun(session_id=root["id"], started_at=root["started_at"],
+                                 calls=tuple(calls), said=tuple(said_raw)))
         return out
 
     def last_activity(self) -> float:

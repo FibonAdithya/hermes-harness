@@ -65,10 +65,13 @@ def make_db(path: Path, sessions: list[dict]) -> Path:
                 conn.execute(
                     "insert into messages(session_id, role, content, tool_call_id, tool_name, timestamp) "
                     "values (?, 'tool', ?, ?, ?, ?)", (s["id"], result, f"{s['id']}-c{i}", name, t))
-        for _ in range(s.get("final_turns", 0)):
+        # `final_content`: optional texts for the final assistant rows, in order.
+        finals = s.get("final_content", [])
+        for n in range(max(s.get("final_turns", 0), len(finals))):
             conn.execute(
                 "insert into messages(session_id, role, content, timestamp) "
-                "values (?, 'assistant', '', ?)", (s["id"], t))
+                "values (?, 'assistant', ?, ?)",
+                (s["id"], finals[n] if n < len(finals) else '', t))
     conn.commit()
     conn.close()
     return path

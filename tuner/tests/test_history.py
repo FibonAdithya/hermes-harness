@@ -455,3 +455,66 @@ def test_empty_turns_between_calls_keep_ordinals(tmp_path):
     db = make_db(tmp_path / "s.db", [_sess("a", [("t", {}, "r", 3)], final_turns=1)])
     (s,) = History.open(db).sessions(0)
     assert s.calls[0].turn == 3 and s.calls[0].later_turns == 1 and s.turns == 4
+
+
+A = "cron_aaaaaaaaaaaa_20261024_060000"
+B = "cron_bbbbbbbbbbbb_20261024_060000"
+
+
+def test_replay_runs_texts_and_said(tmp_path):
+    body = "made-up body"
+    db = make_db(tmp_path / "s.db", [
+        {"id": A, "source": "cron", "started_at": 10.0, "final_content": ["Created Dentist 14:00"],
+         "calls": [(G, {"message_id": "m1"}, hermes_wrap(G, body), 1)]},
+        {"id": B, "source": "cron", "started_at": 10.0,
+         "calls": [(G, {"message_id": "other"}, "zzz", 1)]}])
+    (run,) = History.open(db).replay_runs("aaaaaaaaaaaa", 0)
+    assert run.session_id == A and run.started_at == 10.0
+    (c,) = run.calls
+    assert " ".join(c.text.split()) == body and "untrusted_tool_result" not in c.text
+    assert c.chars == len(c.text)
+    assert (c.name, c.args, c.ref, c.turn, c.later_turns) == (
+        G, {"message_id": "m1"}, "m1", 1, 1)
+    said = [(p, t) for p, t in run.said if t == "Created Dentist 14:00"]
+    assert len(said) == 1 and said[0][0] > c.pos
+    assert ("m1" in [t for _p, t in run.said]) and min(p for p, t in run.said if t == "m1") < c.pos
+
+
+def test_replay_runs_window(tmp_path):
+    db = make_db(tmp_path / "s.db", [
+        {"id": f"cron_aaaaaaaaaaaa_2026102{n}_060000", "source": "cron",
+         "started_at": float(t), "calls": [("t", {}, "r")]} for n, t in ((1, 10), (2, 20), (3, 30))])
+    h = History.open(db)
+    assert [r.started_at for r in h.replay_runs("aaaaaaaaaaaa", 15, 30)] == [20.0]
+    assert [r.started_at for r in h.replay_runs("aaaaaaaaaaaa", 0)] == [10.0, 20.0, 30.0]
+
+
+def test_said_uses_arg_leaves(tmp_path):
+    args = {"event": {"description": "line one\nline two", "tags": ["a b", 5, ["deep"]]}, "n": 3}
+    db = make_db(tmp_path / "s.db", [
+        {"id": A, "source": "cron", "started_at": 1.0, "calls": [("create", args, "ok")]}])
+    (run,) = History.open(db).replay_runs("aaaaaaaaaaaa", 0)
+    texts = [t for _p, t in run.said]
+    assert "line one\nline two" in texts
+    assert sorted(t for t in texts if t != "line one\nline two") == ["a b", "deep"]
+
+
+def test_replay_runs_chain_offsets_and_dedup(tmp_path):
+    db = make_db(tmp_path / "s.db", [
+        {"id": A, "source": "cron", "started_at": 1000.0, "end_reason": "compression",
+         "calls": [("a", {}, "r1", 1)], "final_turns": 1},
+        {"id": "kid", "source": "cron", "started_at": 2000.0, "parent": A,
+         "calls": [("b", {}, "r2", 1)], "final_turns": 1}])
+    conn = sqlite3.connect(db)
+    conn.execute(  # the handoff: the root's rows copied into the child, ids kept
+        "insert into messages(session_id, role, content, tool_call_id, tool_calls, tool_name,"
+        " timestamp) select 'kid', role, content, tool_call_id, tool_calls, tool_name, 1999.0"
+        " from messages where session_id = ? order by id", (A,))
+    conn.commit()
+    h = History.open(db)
+    (run,) = h.replay_runs("aaaaaaaaaaaa", 0)
+    assert [c.name for c in run.calls] == ["a", "b"]
+    assert [c.pos for c in run.calls] == sorted({c.pos for c in run.calls})
+    (s,) = h.sessions(0)
+    assert [(c.turn, c.later_turns) for c in run.calls] == [
+        (c.turn, c.later_turns) for c in s.calls]
