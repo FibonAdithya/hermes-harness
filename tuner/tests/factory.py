@@ -47,19 +47,28 @@ def make_db(path: Path, sessions: list[dict]) -> Path:
             (s["id"], s["source"], s["started_at"], s.get("in", 0), s.get("out", 0),
              s.get("cache", 0), s.get("cw", 0), s.get("cost", 0.0), s.get("model", "m"),
              s.get("parent"), s.get("end_reason")))
-        calls = s.get("calls", [])
+        # A call is (name, args, result) or (name, args, result, turn); turn is a
+        # 1-based assistant row, default 1. Each turn up to the last used one gets an
+        # assistant row (empty if it issues nothing) followed by its tool rows;
+        # `final_turns` empty assistant rows come last.
+        calls = [(c + (1,))[:4] for c in s.get("calls", [])]
         t = s["started_at"]
-        if calls:
+        for turn in range(1, max((c[3] for c in calls), default=0) + 1):
+            mine = [(i, c) for i, c in enumerate(calls) if c[3] == turn]
             tc = [{"id": f"{s['id']}-c{i}", "type": "function",
                    "function": {"name": name, "arguments": json.dumps(args)}}
-                  for i, (name, args, _r) in enumerate(calls)]
+                  for i, (name, args, _r, _t) in mine]
             conn.execute(
                 "insert into messages(session_id, role, content, tool_calls, timestamp) "
-                "values (?, 'assistant', '', ?, ?)", (s["id"], json.dumps(tc), t))
-            for i, (name, _args, result) in enumerate(calls):
+                "values (?, 'assistant', '', ?, ?)", (s["id"], json.dumps(tc) if tc else None, t))
+            for i, (name, _args, result, _t) in mine:
                 conn.execute(
                     "insert into messages(session_id, role, content, tool_call_id, tool_name, timestamp) "
                     "values (?, 'tool', ?, ?, ?, ?)", (s["id"], result, f"{s['id']}-c{i}", name, t))
+        for _ in range(s.get("final_turns", 0)):
+            conn.execute(
+                "insert into messages(session_id, role, content, timestamp) "
+                "values (?, 'assistant', '', ?)", (s["id"], t))
     conn.commit()
     conn.close()
     return path

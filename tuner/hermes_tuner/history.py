@@ -1,7 +1,9 @@
 """Read-only view of Hermes's state.db."""
 from __future__ import annotations
 
+import bisect
 import json
+import dataclasses
 import posixpath
 import re
 import sqlite3
@@ -87,6 +89,26 @@ def _is_untrusted(name: str, args: dict) -> bool:
     return name in policy.UNTRUSTED_TOOLS or name.startswith(policy.UNTRUSTED_PREFIXES)
 
 
+def _key_ref(args: dict) -> str | None:
+    """The call's key: its message_id, else its search query."""
+    for k in ("message_id", "query"):
+        v = args.get(k)
+        if isinstance(v, str):
+            return v
+    return None
+
+
+def assistant_row_ids(rows) -> dict[str, list[int]]:
+    """Ids of each session's assistant rows, ascending. A row's turn is its 1-based
+    position in its session's list. `rows` need `id`, `session_id` and `role`, and
+    must be ordered by id."""
+    out: dict[str, list[int]] = {}
+    for r in rows:
+        if r["role"] == "assistant":
+            out.setdefault(r["session_id"], []).append(r["id"])
+    return out
+
+
 class History:
     def __init__(self, conn: sqlite3.Connection):
         self._conn = conn
@@ -128,26 +150,32 @@ class History:
             "tool_calls, tool_name, timestamp "
             f"from messages {where}{' and' if where else ' where'} role in ('assistant', 'tool') "
             "order by id", params)
-        issued: dict[tuple[str, str], tuple[str, dict]] = {}
+        assistants = assistant_row_ids(rows)
+        issued: dict[tuple[str, str], tuple[str, dict, int]] = {}
         for r in rows:
             if r["role"] == "assistant" and r["tool_calls"]:
+                turn = bisect.bisect_right(assistants[r["session_id"]], r["id"])
                 for cid, name, args in _issued_calls(r["tool_calls"]):
-                    issued[(r["session_id"], cid)] = (name, args)
+                    issued[(r["session_id"], cid)] = (name, args, turn)
             elif r["role"] == "tool":
                 if since is not None and session_ids is None and r["timestamp"] < since:
                     continue
                 cid = r["tool_call_id"]
-                name, args = issued.get((r["session_id"], cid), ("?", {})) if cid else ("?", {})
+                name, args, turn = (issued.get((r["session_id"], cid), ("?", {}, 0))
+                                    if cid else ("?", {}, 0))
+                own = assistants.get(r["session_id"], [])
+                later = len(own) - bisect.bisect_right(own, r["id"])
                 if r["tool_name"]:
                     name = r["tool_name"]
                 text = (r["content"] or "") if with_text else None
-                ref = args.get("message_id")
                 yield r["session_id"], ToolCall(
                     call_id=cid or "",
                     name=name,
                     arg_keys=tuple(sorted(args)),
-                    ref=ref if isinstance(ref, str) else None,
+                    ref=_key_ref(args),
                     result_chars=r["clen"] or 0,
+                    turn=turn,
+                    later_turns=later,
                 ), args, text
 
     def _chains(self, roots: list[sqlite3.Row]) -> dict[str, list[str]]:
@@ -178,6 +206,17 @@ class History:
             frontier = nxt
         return chains
 
+    def _turn_counts(self, session_ids: list[str]) -> dict[str, int]:
+        """Assistant rows per session id (0 for a session with none)."""
+        counts = dict.fromkeys(session_ids, 0)
+        for i in range(0, len(session_ids), _CHUNK):
+            part = session_ids[i:i + _CHUNK]
+            for r in self._q("select session_id, count(*) as n from messages "
+                             "where role = 'assistant' and session_id in "
+                             f"({','.join('?' * len(part))}) group by session_id", tuple(part)):
+                counts[r["session_id"]] = r["n"]
+        return counts
+
     def _chain_calls(self, chains: dict[str, list[str]],
                      with_text: bool = False) -> dict[str, list]:
         """Group (ToolCall, args, text) by root id, root session first. text is None
@@ -189,8 +228,10 @@ class History:
         for i in range(0, len(ids), _CHUNK):
             for sid, call, args, text in self._calls(ids[i:i + _CHUNK], with_text=with_text):
                 per_session[sid].append((call, args, text))
+        counts = self._turn_counts(ids)
         out: dict[str, list] = {}
         for root, sids in chains.items():
+            offset = 0  # assistant rows of earlier chain members: turns unique per run
             # Hermes copies the compressed tail (tool rows and their ids included)
             # into the continuation: count each tool call once per run.
             seen: set[str] = set()
@@ -202,7 +243,10 @@ class History:
                         continue
                     if cid:
                         seen.add(cid)
-                    merged.append(x)
+                    call = x[0]
+                    merged.append((dataclasses.replace(call, turn=call.turn + offset)
+                                   if call.turn else call, x[1], x[2]))
+                offset += counts[sid]
             out[root] = merged
         return out
 
@@ -232,6 +276,7 @@ class History:
                              f"({','.join('?' * len(part))})", tuple(part)):
                 member_rows[r["id"]] = r
         calls = self._chain_calls(chains)
+        counts = self._turn_counts([sid for ids in chains.values() for sid in ids])
         out = []
         for r in roots:
             members = [member_rows[sid] for sid in chains[r["id"]]]
@@ -254,6 +299,7 @@ class History:
                 input_tokens=fresh,
                 cache_read_tokens=read,
                 cache_write_tokens=write,
+                turns=sum(counts[sid] for sid in chains[r["id"]]),
             ))
         return out
 

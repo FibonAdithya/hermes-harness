@@ -256,7 +256,9 @@ def test_sessions_read_result_lengths_without_fetching_content(tmp_path):
     (call,) = h.sessions(0)[0].calls
     assert call.result_chars == 300  # characters, as len() counts them
     msg_queries = [q for q in seen if "from messages" in q]
-    assert msg_queries and all("length(content)" in q for q in msg_queries)
+    # no query reads raw content: it appears only inside length(content)
+    assert msg_queries and all("content" not in q.replace("length(content)", "")
+                               for q in msg_queries)
     assert not any("content," in q.replace("length(content)", "") for q in msg_queries)
     seen.clear()
     assert list(h.untrusted_texts(0)) == ["é" * 300]
@@ -396,3 +398,60 @@ def test_call_results_follow_the_compression_chain(tmp_path):
     h = History.open(_chain_db(tmp_path))
     assert h.call_results(ROOT) == [("a", "r1"), ("b", "r2"), ("c", "r3"), ("d", "r4")]
     assert h.call_results(CHILD) == [("c", "r3"), ("d", "r4")]
+
+
+# --- turn positions and key refs ------------------------------------------
+
+SEARCH = "mcp__google__search_gmail_messages"
+CRON = "cron_cc68e24f21cd_20261024_060034"
+
+
+def test_turn_positions(tmp_path):
+    db = make_db(tmp_path / "s.db", [{"id": CRON, "source": "cron",
+        "started_at": 1.0, "final_turns": 1, "calls": [
+            (SEARCH, {"query": "in:inbox"}, "x" * 10, 1),
+            ("mcp__google__get_events", {}, "y" * 10, 1),
+            (G, {"message_id": "m1"}, "z" * 10, 2)]}])
+    s = History.open(db).sessions(0)[0]
+    assert [c.turn for c in s.calls] == [1, 1, 2]
+    assert [c.later_turns for c in s.calls] == [2, 2, 1]
+    assert s.turns == 3
+    assert s.calls[0].ref == "in:inbox" and s.calls[2].ref == "m1"
+
+
+def test_three_tuple_calls_share_turn_one(tmp_path):
+    db = make_db(tmp_path / "s.db", [_sess("a", [("t", {}, "r"), ("u", {}, "r")])])
+    s = History.open(db).sessions(0)[0]
+    assert [c.turn for c in s.calls] == [1, 1]
+    assert [c.later_turns for c in s.calls] == [0, 0]
+    assert s.turns == 1
+
+
+def test_message_id_wins_over_query(tmp_path):
+    db = make_db(tmp_path / "s.db", [_sess("a", [
+        (SEARCH, {"message_id": "m9", "query": "q"}, "r"),
+        (SEARCH, {"message_id": 5, "query": "q2"}, "r")])])
+    c1, c2 = History.open(db).sessions(0)[0].calls
+    assert c1.ref == "m9"
+    assert c2.ref == "q2"
+
+
+def test_later_turns_per_row_not_chain(tmp_path):
+    """Root ends with compression after 1 turn; the continuation adds 2 turns. The
+    root's tool row has later_turns 1 (rows of its own session only), not 3."""
+    db = make_db(tmp_path / "s.db", [
+        _sess("root", [("a", {}, "r1", 1)], started_at=1000.0, end_reason="compression",
+              final_turns=1),
+        _sess("kid", [("b", {}, "r2", 1)], started_at=2000.0, parent="root",
+              final_turns=1)])
+    (s,) = History.open(db).sessions(0)
+    a, b = s.calls
+    assert (a.turn, a.later_turns) == (1, 1)
+    assert (b.turn, b.later_turns) == (3, 1)  # offset by root's 2 assistant rows
+    assert s.turns == 4
+
+
+def test_empty_turns_between_calls_keep_ordinals(tmp_path):
+    db = make_db(tmp_path / "s.db", [_sess("a", [("t", {}, "r", 3)], final_turns=1)])
+    (s,) = History.open(db).sessions(0)
+    assert s.calls[0].turn == 3 and s.calls[0].later_turns == 1 and s.turns == 4

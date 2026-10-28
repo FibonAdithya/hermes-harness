@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .model import Session, ToolCall
 
-VERSION = 2  # 2: token breakdown (input, cache read, cache write)
+VERSION = 3  # 2: token breakdown (input, cache read, cache write); 3: turn positions
 
 
 def _hash_ref(salt: bytes, ref: str) -> str:
@@ -20,10 +20,11 @@ def dump(sessions: list[Session], out: Path, salt: bytes) -> None:
         "id": s.id, "source": s.source, "job_id": s.job_id, "started_at": s.started_at,
         "est_cost": s.est_cost, "prompt_tokens": s.prompt_tokens, "output_tokens": s.output_tokens,
         "input_tokens": s.input_tokens, "cache_read_tokens": s.cache_read_tokens,
-        "cache_write_tokens": s.cache_write_tokens,
+        "cache_write_tokens": s.cache_write_tokens, "turns": s.turns,
         "calls": [{"name": c.name, "arg_keys": list(c.arg_keys),
                    "ref": None if c.ref is None else _hash_ref(salt, c.ref),
-                   "result_chars": c.result_chars} for c in s.calls],
+                   "result_chars": c.result_chars,
+                   "turn": c.turn, "later_turns": c.later_turns} for c in s.calls],
     } for s in sessions]}
     raw = json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()
     with open(out, "wb") as f:
@@ -40,9 +41,10 @@ def _session(s: dict) -> Session:
         id=s["id"], source=s["source"], job_id=s["job_id"], started_at=s["started_at"],
         est_cost=s["est_cost"], prompt_tokens=s["prompt_tokens"], output_tokens=s["output_tokens"],
         calls=tuple(ToolCall(call_id=f"{s['id']}-c{i}", name=c["name"], arg_keys=tuple(c["arg_keys"]),
-                             ref=c["ref"], result_chars=c["result_chars"])
+                             ref=c["ref"], result_chars=c["result_chars"],
+                             turn=c.get("turn", 0), later_turns=c.get("later_turns", 0))
                     for i, c in enumerate(s["calls"])),
-        **breakdown)
+        turns=s.get("turns", 0), **breakdown)
 
 
 def load(path: Path) -> list[Session]:

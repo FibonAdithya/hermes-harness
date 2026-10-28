@@ -111,3 +111,21 @@ def test_scrub_load_refuses_a_dump_without_the_breakdown(tmp_path, field):
     (tmp_path / "old.json.gz").write_bytes(gzip.compress(json.dumps(doc).encode()))
     with pytest.raises(ValueError, match="fixture predates token breakdown"):
         scrub.load(tmp_path / "old.json.gz")
+
+
+def test_scrub_v3_roundtrip_and_v2_loads(tmp_path):
+    call = ToolCall("c", "t", (), None, 5, turn=2, later_turns=3)
+    ss = [Session("s1", "cron", "j", 1.0, 0.0, 11, 9, (call,), input_tokens=1,
+                  cache_read_tokens=9, cache_write_tokens=1, turns=5)]
+    scrub.dump(ss, tmp_path / "f.json.gz", SALT)
+    (b,) = scrub.load(tmp_path / "f.json.gz")
+    assert b.turns == 5 and (b.calls[0].turn, b.calls[0].later_turns) == (2, 3)
+    doc = json.loads(gzip.decompress((tmp_path / "f.json.gz").read_bytes()))
+    assert doc["version"] == 3
+    doc["version"] = 2
+    del doc["sessions"][0]["turns"]
+    for c in doc["sessions"][0]["calls"]:
+        del c["turn"], c["later_turns"]
+    (tmp_path / "v2.json.gz").write_bytes(gzip.compress(json.dumps(doc).encode()))
+    (o,) = scrub.load(tmp_path / "v2.json.gz")
+    assert o.turns == 0 and (o.calls[0].turn, o.calls[0].later_turns) == (0, 0)
