@@ -27,6 +27,16 @@ _BLOCK_TAGS = frozenset({
 })
 
 
+_HTML_TAGS = _BLOCK_TAGS | frozenset({
+    "a", "abbr", "b", "big", "center", "code", "em", "font", "i", "img",
+    "small", "span", "strong", "sub", "sup", "u", "s", "strike", "label",
+    "style", "script", "head", "html", "body", "title", "meta", "link",
+    "tbody", "thead", "tfoot", "td", "th", "tr", "table", "col", "colgroup",
+    "caption", "wbr",
+})
+_HAS_TAG_RE = re.compile(r"</?(?:" + "|".join(sorted(_HTML_TAGS)) + r")(?=[\s/>])", re.I)
+
+
 class _TextExtractor(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -34,17 +44,26 @@ class _TextExtractor(HTMLParser):
         self._skip = 0
 
     def handle_starttag(self, tag, attrs):
-        if tag in ("script", "style"):
+        if tag not in _HTML_TAGS:
+            if not self._skip:
+                self.parts.append(self.get_starttag_text())
+        elif tag in ("script", "style"):
             self._skip += 1
         elif tag in _BLOCK_TAGS:
             self.parts.append("\n")
 
     def handle_startendtag(self, tag, attrs):
-        if tag in _BLOCK_TAGS:
+        if tag not in _HTML_TAGS:
+            if not self._skip:
+                self.parts.append(self.get_starttag_text())
+        elif tag in _BLOCK_TAGS:
             self.parts.append("\n")
 
     def handle_endtag(self, tag):
-        if tag in ("script", "style"):
+        if tag not in _HTML_TAGS:
+            if not self._skip:
+                self.parts.append(f"</{tag}>")
+        elif tag in ("script", "style"):
             self._skip = max(0, self._skip - 1)
         elif tag in _BLOCK_TAGS:
             self.parts.append("\n")
@@ -55,6 +74,8 @@ class _TextExtractor(HTMLParser):
 
 
 def html_to_text(text: str, params: dict) -> str:
+    if not _HAS_TAG_RE.search(text):
+        return text
     p = _TextExtractor()
     p.feed(text)
     p.close()

@@ -113,3 +113,16 @@ def test_validate_spec():
     assert validate_spec(spec({"op": "drop_fields", "fields": "a"}))
     assert validate_spec("nope") and validate_spec(None)
     assert validate_spec({"tool": T, "job": J})
+
+
+def test_html_to_text_keeps_angle_addresses_and_urls():
+    f = OPS["html_to_text"]
+    assert "<bob@example.com>" in f("<p>From: Bob <bob@example.com></p>", {})
+    assert "<https://meet.google.com/abc-def>" in f("<div>Meet: <https://meet.google.com/abc-def></div>", {})
+    assert f("From: Bob <bob@example.com>", {}) == "From: Bob <bob@example.com>"
+    assert f("<b@x.com>", {}) == "<b@x.com>"
+
+
+def test_html_to_text_plain_text_unchanged():
+    t = "  line one\n\n\n    indented <a@b.co>\n\nend  "
+    assert OPS["html_to_text"](t, {}) == t
