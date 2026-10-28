@@ -198,3 +198,49 @@ def test_publish_failure_without_stderr_names_exit_code():
     with pytest.raises(nt.PublishError, match="exited 4") as ei:
         nt.publish("o/r", "inbox/a.md", "x", run=run)
     assert "timeout" not in str(ei.value)
+
+
+# Two agents publishing at the same moment: GitHub rejects the second PUT because
+# main moved under it (seen in acceptance check 1, 2026-10-28). No commit was made,
+# so sending the same PUT again is safe.
+_CONFLICT = "gh: is at 0a47fd8b487c0ccee84537be9f4c4a954fd34997 but expected 981b0fb87164ad46da86eb4ffebce1cc31994681 (HTTP 409)\n"
+
+
+class ScriptedRun:
+    def __init__(self, *results):
+        self.results = list(results)
+        self.argvs = []
+
+    def __call__(self, argv, **kw):
+        self.argvs.append(argv)
+        rc, err = self.results.pop(0)
+        return subprocess.CompletedProcess(argv, rc, "", err)
+
+
+def test_publish_retries_a_409_branch_conflict():
+    run = ScriptedRun((1, _CONFLICT), (1, _CONFLICT), (0, ""))
+    sleeps = []
+    nt.publish("o/r", "inbox/a.md", "x", run=run, sleep=sleeps.append)
+    assert len(run.argvs) == 3
+    assert run.argvs[0] == run.argvs[1] == run.argvs[2]
+    assert len(sleeps) == 2 and all(s > 0 for s in sleeps)
+
+
+def test_publish_gives_up_after_bounded_409_retries():
+    run = ScriptedRun(*[(1, _CONFLICT)] * 10)
+    sleeps = []
+    with pytest.raises(nt.PublishError, match="HTTP 409"):
+        nt.publish("o/r", "inbox/a.md", "x", run=run, sleep=sleeps.append)
+    assert len(run.argvs) == nt.PUBLISH_ATTEMPTS
+    assert 1 < nt.PUBLISH_ATTEMPTS < 10
+    assert len(sleeps) == nt.PUBLISH_ATTEMPTS - 1
+
+
+@pytest.mark.parametrize("err", ["gh: Invalid request. \"sha\" wasn't supplied. (HTTP 422)\n",
+                                 "could not resolve host\n"])
+def test_publish_does_not_retry_other_errors(err):
+    run = ScriptedRun((1, err), (0, ""))
+    sleeps = []
+    with pytest.raises(nt.PublishError):
+        nt.publish("o/r", "inbox/a.md", "x", run=run, sleep=sleeps.append)
+    assert len(run.argvs) == 1 and sleeps == []
