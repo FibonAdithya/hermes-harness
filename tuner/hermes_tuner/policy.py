@@ -132,3 +132,12 @@ REDUCER_TOOLS = frozenset({
 # A subdomain matches too: us02web.zoom.us matches zoom.us.
 MEETING_HOSTS = frozenset({"meet.google.com", "zoom.us", "teams.microsoft.com"})
 REDUCER_CAP_LADDER = (16000, 8000, 4000, 2000)
+
+# Replay used-string check (tuner design 2026-10-28). A reducer goes live only if
+# every string the model reused verbatim from a result survives the reduction.
+USED_MIN_CHARS = 8
+# Only the first this-many normalised chars of a result and of each later message
+# are compared; used strings past that point are not found.
+USED_MAX_CHARS = 50_000
+# Drop strings present in more than this share of a tool's results.
+BOILERPLATE_SHARE = 0.5
