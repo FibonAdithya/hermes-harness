@@ -121,3 +121,14 @@ JOB_MARGIN_MIN = 15
 # Carried-bytes ranking (tuner design 2026-10-28).
 CHARS_PER_TOKEN = 4  # ESTIMATE: messages.token_count is NULL on every tool row
 MIN_DRAFT_MONTHLY_USD = 0.05  # ESTIMATE
+
+# Result reducers (tuner design 2026-10-28). Calendar sync only.
+REDUCER_JOBS = frozenset({"cc68e24f21cd"})
+REDUCER_TOOLS = frozenset({
+    "mcp__google__get_gmail_message_content",
+    "mcp__google__search_gmail_messages",
+    "mcp__google__get_events",
+})
+# A subdomain matches too: us02web.zoom.us matches zoom.us.
+MEETING_HOSTS = frozenset({"meet.google.com", "zoom.us", "teams.microsoft.com"})
+REDUCER_CAP_LADDER = (16000, 8000, 4000, 2000)
