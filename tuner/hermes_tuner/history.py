@@ -377,10 +377,17 @@ class History:
                     pos += 1
                     if r["role"] == "assistant":
                         turn = bisect.bisect_right(assistants, r["id"])
+                        calls_here = list(_issued_calls(r["tool_calls"]))
+                        for cid, name, args in calls_here:
+                            issued[cid] = (name, args, turn)
+                        # A row whose calls were all seen already is the compressed tail
+                        # copied into this continuation: it says nothing new. (A copied
+                        # row that issued no calls cannot be told apart and is kept.)
+                        if calls_here and all(c[0] in seen for c in calls_here):
+                            continue
                         if r["content"]:
                             said_raw.append((pos, r["content"]))
-                        for cid, name, args in _issued_calls(r["tool_calls"]):
-                            issued[cid] = (name, args, turn)
+                        for _cid, _name, args in calls_here:
                             said_raw.extend((pos, leaf) for leaf in _string_leaves(args))
                         continue
                     cid = r["tool_call_id"]
