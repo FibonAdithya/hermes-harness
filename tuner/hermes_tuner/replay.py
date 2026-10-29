@@ -6,15 +6,18 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 from urllib.parse import urlsplit
 
 from . import policy
 from .detect import carried_usd
-from .history import ReplayCall, ReplayRun
+from .history import ReplayCall, ReplayRun, _key_ref
 from .model import Pricing
 from .reducers import _URL_RE, apply_reducer, text_view
+from .trial import call_failed
 
 
 def norm(text: str) -> str:
@@ -255,3 +258,157 @@ def search_reducer(runs: Sequence[ReplayRun], tool: str, job: str, exclude: Sequ
     spec = {"tool": tool, "job": job, "steps": steps} if reason == "ok" else None
     return ReducerResult(spec, reason, sessions, len(calls), before, total,
                          used_total, used_total, saving / sessions)
+
+
+# --- composed-tool replay ------------------------------------------------------------
+
+# Error messages relay.run_program returns when a run hits a limit (relay.py: the
+# output cap, the call limit, the deadline).
+LIMIT_PREFIXES = ("output exceeds", "tool call limit", "program timed out")
+
+
+@dataclass(frozen=True)
+class ComposedReplay:
+    sessions: int        # runs replayed (a stub miss skips a run; it is not counted)
+    limit_hits: int
+    errors: int          # failed outputs that are not limit hits (trial.call_failed)
+    in_bytes: int        # UTF-8 bytes of the replaced calls' recorded results
+    out_bytes: int       # UTF-8 bytes of the program outputs
+    reason: str          # "ok" | "limit_hit" | "program_error" | "too_few_sessions"
+    eligible: int = 0    # runs given with at least one call to a tool in payload calls
+    saving_per_run: float = 0.0   # mean carried-bytes saving over replayed runs, USD
+
+
+def limit_hit(out: str) -> bool:
+    """True when `out` is relay's {"error": ...} for a limit."""
+    try:
+        obj = json.loads(out)
+    except ValueError:
+        return False
+    msg = obj.get("error") if isinstance(obj, dict) else None
+    return isinstance(msg, str) and msg.startswith(LIMIT_PREFIXES)
+
+
+class _Miss(LookupError):
+    pass
+
+
+class _Stub:
+    """Recorded results by (name, exact args), else by (name, ref). Relay hands any
+    exception to the program as an error result; `missed` tells the replay."""
+
+    def __init__(self, calls: Sequence[ReplayCall]):
+        self.exact: dict[tuple[str, str], str] = {}
+        self.by_ref: dict[tuple[str, str], str] = {}
+        self.missed = False
+        for c in calls:
+            self.exact.setdefault((c.name, json.dumps(c.args, sort_keys=True, default=str)), c.text)
+            if c.ref is not None:
+                self.by_ref.setdefault((c.name, c.ref), c.text)
+
+    def __call__(self, name: str, args: dict) -> str:
+        hit = self.exact.get((name, json.dumps(args, sort_keys=True, default=str)))
+        if hit is not None:
+            return hit
+        ref = _key_ref(args)
+        if ref is not None and (name, ref) in self.by_ref:
+            return self.by_ref[(name, ref)]
+        self.missed = True
+        raise _Miss("no recorded result")
+
+
+def _replay_args(payload: dict, calls: Sequence[ReplayCall]) -> dict | None:
+    """The tool's input for one run, from all its replaced calls; None when a "first"
+    input has no value. A "list" input keeps each distinct value once, in order."""
+    out: dict = {}
+    for e in payload["replay_inputs"]:
+        vals = [c.args[e["arg"]] for c in calls if c.name == e["from_call"] and e["arg"] in c.args]
+        if e["collect"] == "first":
+            if not vals:
+                return None
+            out[e["param"]] = vals[0]
+            continue
+        seen: set[str] = set()
+        uniq = []
+        for v in vals:
+            k = json.dumps(v, sort_keys=True, default=str)
+            if k not in seen:
+                seen.add(k)
+                uniq.append(v)
+        out[e["param"]] = uniq
+    props = payload.get("parameters", {}).get("properties", {})
+    if isinstance(props, dict) and "dry_run" in props:
+        out["dry_run"] = True
+    return out
+
+
+def replay_composed(payload: dict, runs: Sequence[ReplayRun],
+                    run_program: Callable[..., str], *, pricing: Pricing,
+                    argv_for: Callable[[str], list[str]]) -> ComposedReplay:
+    """Replay a composed tool (payload already passed limits.check_fix) in the sandbox
+    on the newest REPLAY_MAX_SESSIONS replayable runs, each fed every replaced call of
+    its run: the worst case. Stops at the first limit hit. `run_program` has
+    relay.run_program's signature; `argv_for(container_name)` gives the runner argv.
+    Result text stays in this process and the sandbox; the result holds counts."""
+    tools = frozenset(payload["calls"])
+    eligible = [r for r in runs if any(c.name in tools for c in r.calls)]
+    picked = []
+    for run in sorted(eligible, key=lambda r: (r.started_at, r.session_id), reverse=True):
+        replaced = [c for c in run.calls if c.name in tools]
+        args = _replay_args(payload, replaced)
+        if args is not None:
+            picked.append((replaced, args))
+        if len(picked) == policy.REPLAY_MAX_SESSIONS:
+            break
+    sessions = hits = errors = in_bytes = out_bytes = 0
+    saving = 0.0
+    for replaced, args in picked:
+        stub = _Stub(replaced)
+        name = f"tuner-replay-{uuid.uuid4().hex[:8]}"
+        out = run_program(payload["program"], args, call=stub, runner_argv=argv_for(name),
+                          dry_run=True, intents=[], timeout_s=policy.REPLAY_TIMEOUT_S,
+                          max_calls=policy.MAX_CALLS, max_output=policy.MAX_OUTPUT_BYTES,
+                          allowed=tools, container_name=name)
+        if stub.missed:
+            continue
+        sessions += 1
+        in_bytes += sum(len(c.text.encode()) for c in replaced)
+        out_bytes += len(out.encode())
+        saving += (sum(carried_usd(c.chars, c.later_turns, pricing) for c in replaced)
+                   - carried_usd(len(out), replaced[0].later_turns, pricing))
+        if limit_hit(out):
+            hits += 1
+            break
+        if call_failed(out):
+            errors += 1
+    if hits:
+        reason = "limit_hit"
+    elif errors:
+        reason = "program_error"
+    elif sessions < policy.REPLAY_MIN_SESSIONS:
+        reason = "too_few_sessions"
+    else:
+        reason = "ok"
+    return ComposedReplay(sessions, hits, errors, in_bytes, out_bytes, reason, len(eligible),
+                          saving / sessions if sessions else 0.0)
+
+
+def composed_monthly(rep: ComposedReplay, turns_usd: float) -> float:
+    """USD per month: the mean carried-bytes saving per replayed run, times the runs in
+    the REPLAY_WINDOW_DAYS window that call a replaced tool, scaled to 30 days, plus
+    `turns_usd`, the candidate's turns-removed estimate (already monthly)."""
+    return rep.saving_per_run * rep.eligible * 30 / policy.REPLAY_WINDOW_DAYS + turns_usd
+
+
+def composed_gate(rep: ComposedReplay, monthly: float) -> str | None:
+    """The rejection reason (counts only), or None when the draft may go to shadow."""
+    m = rep.sessions
+    if rep.limit_hits > 0:
+        return f"replay: limit hit in {rep.limit_hits} of {m} sessions"
+    if rep.errors > 0:
+        return f"replay: program error in {rep.errors} of {m} sessions"
+    if m < policy.REPLAY_MIN_SESSIONS:
+        return f"replay: too few sessions ({m})"
+    if monthly <= policy.MIN_DRAFT_MONTHLY_USD:
+        return "replay: saving below floor"
+    return None

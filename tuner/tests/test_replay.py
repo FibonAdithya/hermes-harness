@@ -396,3 +396,223 @@ def test_search_tie_goes_to_first_listed_key():
         runs.append(_run(i, [_call(1, json.dumps({"b": text, "a": text}))], [(2, quote)]))
     r = search_reducer(runs, GMAIL_GET, CAL, [], NOUS_V4_PRO)
     assert r.spec["steps"][0] == {"op": "drop_fields", "fields": ["a"]}
+
+
+# --- composed-tool replay (Task 9) ---------------------------------------------------
+
+import re as _re  # noqa: E402
+
+from factory import FLAT  # noqa: E402
+from hermes_tuner.replay import (ComposedReplay, LIMIT_PREFIXES, composed_gate,  # noqa: E402
+                                 composed_monthly, limit_hit, replay_composed)
+from test_relay import RUNNER, relay  # noqa: E402
+
+EMAIL = "owner@example.test"
+BATCH = {
+    "name": "tuned_fetch", "description": "fetch messages", "mutating": False,
+    "parameters": {"type": "object", "properties": {"message_ids": {"type": "array"}}},
+    "calls": [GMAIL_GET], "job_prompt": None,
+    "replay_inputs": [{"param": "message_ids", "from_call": GMAIL_GET, "arg": "message_id",
+                       "collect": "list"}],
+    "program": (f"def main(args, call):\n"
+                f"    return [call({GMAIL_GET!r}, {{'message_id': m}}) for m in args['message_ids']]\n"),
+}
+
+
+def _mail_run(i, n=8, chars=7000, later_turns=3, started=None):
+    """A run of `n` recorded fetches whose args carry a key the program never sends."""
+    calls = tuple(
+        ReplayCall(pos=k + 1, call_id=f"c{i}-{k}", name=GMAIL_GET,
+                   args={"message_id": f"m{i}-{k}", "user_google_email": EMAIL},
+                   text=(f"mail {i}-{k} " + "z" * chars)[:chars], chars=chars, turn=1,
+                   later_turns=later_turns, ref=f"m{i}-{k}")
+        for k in range(n))
+    return ReplayRun(f"cron_x_{i}", 1000.0 * i if started is None else started, calls, ())
+
+
+def _argv(name):
+    return RUNNER
+
+
+def test_replay_composed_hits_output_cap():
+    """Acceptance check 3 on synthetic data: 8 x 7,000-char mails batched exceed the
+    50,000-byte cap. Catches: an exact-args-only stub (the program sends no
+    user_google_email, so every run would be skipped as too few sessions)."""
+    runs = [_mail_run(i) for i in range(3)]
+    rep = replay_composed(BATCH, runs, relay().run_program, pricing=FLAT, argv_for=_argv)
+    assert rep.limit_hits >= 1 and rep.reason == "limit_hit"
+    assert rep.sessions == 1                       # stops at the first hit
+    assert composed_gate(rep, 10.0) == "replay: limit hit in 1 of 1 sessions"
+
+
+def test_replay_composed_under_the_cap_replays_every_run_by_ref():
+    """The same program on 4 small mails per run fits: 3 sessions, no hits, no errors.
+    Catches: the ref fallback missing (sessions 0) and a positive saving lost."""
+    runs = [_mail_run(i, n=4, chars=500) for i in range(3)]
+    count = (f"def main(args, call):\n"
+             f"    return len([call({GMAIL_GET!r}, {{'message_id': m}}) for m in args['message_ids']])\n")
+    rep = replay_composed({**BATCH, "program": count}, runs, relay().run_program,
+                          pricing=FLAT, argv_for=_argv)
+    assert (rep.sessions, rep.limit_hits, rep.errors, rep.reason) == (3, 0, 0, "ok")
+    assert rep.in_bytes == 3 * 4 * 500
+    assert rep.out_bytes == 3 * len(json.dumps({"result": 4}))
+    want = (carried_usd(4 * 500, 3, FLAT) - carried_usd(len(json.dumps({"result": 4})), 3, FLAT))
+    assert rep.saving_per_run == pytest.approx(want)
+    assert rep.eligible == 3
+
+
+def _fake(out):
+    seen = []
+
+    def run_program(program, args, call, runner_argv, **kw):
+        seen.append((args, runner_argv, kw))
+        return out
+    return run_program, seen
+
+
+def test_replay_composed_bounded():
+    """10 replayable runs: the newest REPLAY_MAX_SESSIONS only, each with its own
+    container name, the replay timeout, a dry run and only the payload's tools."""
+    assert (policy.REPLAY_MAX_SESSIONS, policy.REPLAY_TIMEOUT_S) == (6, 60)
+    runs = [_mail_run(i, n=2, chars=100) for i in range(10)]
+    run_program, seen = _fake(json.dumps({"result": 1}))
+    names = []
+    rep = replay_composed(BATCH, runs, run_program, pricing=FLAT,
+                          argv_for=lambda name: names.append(name) or ["argv", name])
+    assert len(seen) == policy.REPLAY_MAX_SESSIONS == rep.sessions
+    assert rep.eligible == 10
+    assert [a["message_ids"] for a, _r, _k in seen] == [[f"m{i}-0", f"m{i}-1"]
+                                                         for i in range(9, 3, -1)]
+    assert all(kw["timeout_s"] == policy.REPLAY_TIMEOUT_S for _a, _r, kw in seen)
+    assert all(kw["dry_run"] is True and kw["intents"] == [] for _a, _r, kw in seen)
+    assert all(kw["allowed"] == frozenset({GMAIL_GET}) for _a, _r, kw in seen)
+    assert all(kw["max_output"] == policy.MAX_OUTPUT_BYTES and kw["max_calls"] == policy.MAX_CALLS
+               for _a, _r, kw in seen)
+    assert len(set(names)) == 6 and all(_re.fullmatch(r"tuner-replay-[0-9a-f]{8}", n) for n in names)
+    assert [kw["container_name"] for _a, _r, kw in seen] == names
+    assert [r for _a, r, _k in seen] == [["argv", n] for n in names]
+
+    hit, seen = _fake(json.dumps({"error": "output exceeds 50000 bytes"}))
+    rep = replay_composed(BATCH, runs, hit, pricing=FLAT, argv_for=_argv)
+    assert len(seen) == 1 and (rep.sessions, rep.limit_hits) == (1, 1)
+
+
+def test_replay_skips_runs_without_the_tool_or_a_first_input():
+    """A run with no call to the payload's tools is not replayable; nor is one where a
+    "first" input has no value. Neither is counted as a session."""
+    other = ReplayRun("cron_x_other", 99_999.0,
+                      (ReplayCall(1, "o", "web_search", {"query": "q"}, "t", 1, 1, 1, "q"),), ())
+    first = {**BATCH, "replay_inputs": [{"param": "message_ids", "from_call": GMAIL_GET,
+                                         "arg": "thread_id", "collect": "first"}]}
+    run_program, seen = _fake(json.dumps({"result": 1}))
+    rep = replay_composed(first, [other, _mail_run(1)], run_program, pricing=FLAT, argv_for=_argv)
+    assert seen == [] and rep.sessions == 0 and rep.reason == "too_few_sessions"
+    rep = replay_composed(BATCH, [other] + [_mail_run(i, n=1) for i in range(3)], run_program,
+                          pricing=FLAT, argv_for=_argv)
+    assert len(seen) == 3 and rep.eligible == 3
+    assert all(a == {"message_ids": [f"m{i}-0"]} for (a, _r, _k), i in zip(seen, (2, 1, 0)))
+
+
+def test_replay_stub_miss_skips_the_run():
+    """A program asking for a call that was never recorded: that run is skipped, not
+    counted as an error."""
+    prog = (f"def main(args, call):\n"
+            f"    return call({GMAIL_GET!r}, {{'message_id': 'never-recorded'}})\n")
+    runs = [_mail_run(i, n=1, chars=50) for i in range(3)]
+    rep = replay_composed({**BATCH, "program": prog}, runs, relay().run_program,
+                          pricing=FLAT, argv_for=_argv)
+    assert (rep.sessions, rep.errors, rep.limit_hits) == (0, 0, 0)
+    assert rep.reason == "too_few_sessions"
+
+
+def test_replay_exact_args_lookup_comes_first():
+    """Two recorded calls share a ref; the exact (name, args) one is returned."""
+    a = ReplayCall(1, "a", GMAIL_GET, {"message_id": "m", "format": "full"}, "FULL", 4, 1, 3, "m")
+    b = ReplayCall(2, "b", GMAIL_GET, {"message_id": "m", "format": "min"}, "MIN", 3, 1, 3, "m")
+    prog = (f"def main(args, call):\n"
+            f"    return [call({GMAIL_GET!r}, {{'message_id': 'm', 'format': 'min'}}),\n"
+            f"            call({GMAIL_GET!r}, {{'message_id': 'm'}})]\n")
+    run_program = relay().run_program
+    outs = []
+
+    def spy(*a_, **kw):
+        outs.append(run_program(*a_, **kw))
+        return outs[-1]
+    runs = [ReplayRun(f"r{i}", float(i), (a, b), ()) for i in range(3)]
+    rep = replay_composed({**BATCH, "program": prog}, runs, spy, pricing=FLAT, argv_for=_argv)
+    assert rep.sessions == 3 and rep.errors == 0
+    assert json.loads(outs[0]) == {"result": ["MIN", "FULL"]}
+
+
+def test_replay_program_error_is_counted():
+    prog = "def main(args, call):\n    raise RuntimeError('boom')\n"
+    runs = [_mail_run(i, n=1, chars=50) for i in range(3)]
+    rep = replay_composed({**BATCH, "program": prog}, runs, relay().run_program,
+                          pricing=FLAT, argv_for=_argv)
+    assert (rep.sessions, rep.errors, rep.limit_hits, rep.reason) == (3, 3, 0, "program_error")
+    assert composed_gate(rep, 10.0) == "replay: program error in 3 of 3 sessions"
+    # An {"error": ...} returned as the result is a failure too (trial.call_failed).
+    prog = "def main(args, call):\n    return {'error': 'no'}\n"
+    rep = replay_composed({**BATCH, "program": prog}, runs, relay().run_program,
+                          pricing=FLAT, argv_for=_argv)
+    assert rep.errors == 3
+
+
+def test_limit_messages_match_the_relay():
+    """Pins LIMIT_PREFIXES to the messages relay.run_program actually returns."""
+    assert LIMIT_PREFIXES == ("output exceeds", "tool call limit", "program timed out")
+    run = relay().run_program
+    big = run("def main(args, call):\n    return 'x' * 60000\n", {}, lambda n, a: "r", RUNNER,
+              dry_run=True, intents=[])
+    many = run(f"def main(args, call):\n    return [call({GMAIL_GET!r}, {{}}) for _ in range(60)]\n",
+               {}, lambda n, a: "r", RUNNER, dry_run=True, intents=[])
+    slow = run("import time\ndef main(args, call):\n    time.sleep(30)\n", {}, lambda n, a: "r",
+               RUNNER, dry_run=True, intents=[], timeout_s=1)
+    for out in (big, many, slow):
+        assert limit_hit(out), out
+    assert not limit_hit(json.dumps({"error": "boom"}))
+    assert not limit_hit(json.dumps({"result": "output exceeds"}))
+    assert not limit_hit("not json")
+
+
+def test_composed_estimate_units():
+    """Output as large as its inputs, a sequence that saves no turns: the estimate is
+    at most 0 and the gate rejects below MIN_DRAFT_MONTHLY_USD."""
+    echo = (f"def main(args, call):\n"
+            f"    return [call({GMAIL_GET!r}, {{'message_id': m}}) for m in args['message_ids']]\n")
+    runs = [_mail_run(i, n=2, chars=1000) for i in range(4)]
+    rep = replay_composed({**BATCH, "program": echo}, runs, relay().run_program,
+                          pricing=FLAT, argv_for=_argv)
+    assert (rep.sessions, rep.errors, rep.limit_hits) == (4, 0, 0)
+    assert rep.out_bytes >= rep.in_bytes
+    monthly = composed_monthly(rep, 0.0)
+    assert monthly <= 0
+    assert composed_gate(rep, monthly) == "replay: saving below floor"
+
+
+def test_composed_monthly_formula():
+    """mean saving per replayed run x runs with a replaced call in the 28-day window x
+    30/28, plus the turns part (already monthly)."""
+    rep = ComposedReplay(sessions=3, limit_hits=0, errors=0, in_bytes=0, out_bytes=0,
+                         reason="ok", eligible=28, saving_per_run=0.01)
+    assert composed_monthly(rep, 0.1) == pytest.approx(0.01 * 28 * 30 / 28 + 0.1)
+    assert composed_monthly(rep, 0.0) == pytest.approx(0.30)
+
+
+@pytest.mark.parametrize("sessions,monthly,want", [
+    (2, 10.0, "replay: too few sessions (2)"),
+    (3, policy.MIN_DRAFT_MONTHLY_USD, "replay: saving below floor"),
+    (3, policy.MIN_DRAFT_MONTHLY_USD + 1e-9, None),
+])
+def test_composed_gate_boundaries(sessions, monthly, want):
+    assert policy.REPLAY_MIN_SESSIONS == 3
+    rep = ComposedReplay(sessions, 0, 0, 0, 0, "ok", 3, 0.0)
+    assert composed_gate(rep, monthly) == want
+
+
+def test_composed_gate_order():
+    """limit hit before error before session count before the floor."""
+    rep = ComposedReplay(1, 1, 1, 0, 0, "limit_hit", 3, -1.0)
+    assert composed_gate(rep, -1.0) == "replay: limit hit in 1 of 1 sessions"
+    rep = ComposedReplay(2, 0, 1, 0, 0, "program_error", 3, -1.0)
+    assert composed_gate(rep, -1.0) == "replay: program error in 1 of 2 sessions"

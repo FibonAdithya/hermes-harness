@@ -139,6 +139,13 @@ REDUCER_MIN_CUT = 0.15
 REDUCER_STEP_MIN = 0.02
 # Fewer replayed runs with a result for the tool than this: no reducer.
 REPLAY_MIN_SESSIONS = 3
+# Days of recorded history replayed and priced.
+REPLAY_WINDOW_DAYS = 28
+# Composed-tool replay (tuner design 2026-10-28): the newest this-many replayable runs,
+# each under this sandbox timeout. 6 x 60 s fits the service's TimeoutStartSec=1800
+# alongside 3 drafts at 360 s.
+REPLAY_MAX_SESSIONS = 6
+REPLAY_TIMEOUT_S = 60
 
 # Replay used-string check (tuner design 2026-10-28). A reducer goes live only if
 # every string the model reused verbatim from a result survives the reduction.

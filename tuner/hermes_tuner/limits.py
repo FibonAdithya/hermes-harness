@@ -111,6 +111,36 @@ def _check_composed(fix: Fix, ctx: LimitContext) -> list[str]:
             reasons.append(f"call {c!r} is not on the callable allowlist")
     if any(c in policy.MUTATING_TOOLS for c in calls) and p.get("mutating") is not True:
         reasons.append("tool calls a mutating tool but is not declared mutating")
+    return reasons + _check_replay_inputs(p, calls)
+
+
+_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+
+
+def _check_replay_inputs(p: dict, calls: list[str]) -> list[str]:
+    """Each entry: {"param": a key of parameters.properties, "from_call": one of calls,
+    "arg": an identifier, "collect": "list" | "first"}; at least one entry."""
+    entries = p.get("replay_inputs")
+    if not isinstance(entries, list) or not entries:
+        return ["replay_inputs must be a non-empty list"]
+    params = p.get("parameters")
+    props = params.get("properties") if isinstance(params, dict) else None
+    props = props if isinstance(props, dict) else {}
+    reasons = []
+    for i, e in enumerate(entries):
+        where = f"replay_inputs[{i}]"
+        if not isinstance(e, dict):
+            reasons.append(f"{where} must be an object")
+            continue
+        param, src, arg = e.get("param"), e.get("from_call"), e.get("arg")
+        if not isinstance(param, str) or param not in props:
+            reasons.append(f"{where}.param must name a property of parameters")
+        if not isinstance(src, str) or src not in calls:
+            reasons.append(f"{where}.from_call must be one of calls")
+        if not isinstance(arg, str) or not _IDENT.fullmatch(arg):
+            reasons.append(f"{where}.arg must be an identifier")
+        if e.get("collect") not in ("list", "first"):
+            reasons.append(f"{where}.collect must be \"list\" or \"first\"")
     return reasons
 
 

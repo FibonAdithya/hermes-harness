@@ -74,9 +74,12 @@ def test_unknown_key_does_not_change_id():
     assert a.id == b.id
 
 
-COMPOSED = {"name": "tuned_x", "description": "d", "parameters": {"type": "object"},
+COMPOSED = {"name": "tuned_x", "description": "d",
+            "parameters": {"type": "object", "properties": {"paths": {"type": "array"}}},
             "calls": ["read_file"], "mutating": False, "program": "def main(a, call): return 1",
-            "job_prompt": None}
+            "job_prompt": None,
+            "replay_inputs": [{"param": "paths", "from_call": "read_file", "arg": "path",
+                               "collect": "list"}]}
 CASES = [
     ("composed_tool", COMPOSED),
     ("composed_tool", {**COMPOSED, "job_prompt": "use it"}),
@@ -317,3 +320,66 @@ def test_global_fix_target_comes_from_its_payload(kind, target, payload, want):
     ledger.active_for(job) block that job's fixes."""
     fix = D.parse_draft(reply(kind=kind, target=target, payload=payload), CAND, NOW)
     assert fix.target == want
+
+
+# --- Task 9: replay_inputs, limits and turn layout ---------------------------------------
+
+def test_clean_composed_requires_replay_inputs():
+    """Catches: a composed draft with no replay_inputs (it could not be replayed)."""
+    missing = {k: v for k, v in COMPOSED.items() if k != "replay_inputs"}
+    assert D.parse_draft(reply("composed_tool", payload=missing), CAND, NOW) is None
+    for bad in ("paths", {"param": "paths"}, ["paths"], [1], None):
+        assert D.parse_draft(reply("composed_tool", payload={**COMPOSED, "replay_inputs": bad}),
+                             CAND, NOW) is None, bad
+    extra = {**COMPOSED, "replay_inputs": [{**COMPOSED["replay_inputs"][0], "note": "x"}]}
+    fix = D.parse_draft(reply("composed_tool", payload=extra), CAND, NOW)
+    assert fix.payload["replay_inputs"] == COMPOSED["replay_inputs"]   # unknown keys dropped
+
+
+def _fixture_session():
+    from hermes_tuner.model import Session, ToolCall
+    turns = [1, 1, 1, 1, 2, 3, 3, 3]
+    calls = tuple(ToolCall(f"c{i}", "mcp__google__get_gmail_message_content", ("message_id",),
+                           None, 10, turn=t) for i, t in enumerate(turns))
+    return Session("cron_3bc4e11d29b1_20261018_070000", "cron", "3bc4e11d29b1", 0.0, 0.0,
+                   0, 0, calls)
+
+
+def test_request_carries_limits_and_layout():
+    """Catches: the layout dropped from the request, or the limits missing from the
+    instructions (the cause of the first live tool's 14 cap hits)."""
+    layout = D.turn_layout(_fixture_session().calls)
+    assert layout == [4, 1, 3]
+    instr, user = D.build_request(CAND, None, None, {}, [], turn_layout=layout)
+    assert json.loads(user)["turn_layout"] == [4, 1, 3]
+    assert str(policy.MAX_OUTPUT_BYTES) in instr and instr == D.INSTRUCTIONS
+    assert (f"The program's JSON output must stay under {policy.MAX_OUTPUT_BYTES} bytes, at most "
+            f"{policy.MAX_CALLS} tool calls and {policy.RUN_TIMEOUT_S} seconds; return only what "
+            "the job needs, not whole tool results.") in instr
+    assert ("turn_layout lists how many of the observed calls the agent already sends per turn; "
+            "merging calls that already share a turn saves nothing.") in instr
+    assert "replay_inputs" in instr
+
+
+def test_turn_layout_orders_by_turn_not_by_call_order():
+    from hermes_tuner.model import ToolCall
+    calls = [ToolCall(str(i), "x", (), None, 1, turn=t) for i, t in enumerate([3, 1, 3, 2, 1])]
+    assert D.turn_layout(calls) == [2, 1, 2]
+    assert D.turn_layout([]) == []
+
+
+def test_build_request_without_layout_sends_an_empty_list():
+    _i, user = D.build_request(CAND, None, None, {}, [])
+    assert json.loads(user)["turn_layout"] == []
+
+
+def test_build_request_layout_keeps_only_counts():
+    _i, user = D.build_request(CAND, None, None, {}, [], turn_layout=[2, "x", True, -1, 3])
+    assert json.loads(user)["turn_layout"] == [2, 3]
+
+
+def test_draft_forwards_turn_layout():
+    b = FakeBridge(oneshot_script=[script(reply())])
+    D.draft(CAND, None, None, {}, [], b, NOW, FLAT, turn_layout=[1, 2])
+    (_m, (_instr, user, _mt)), = b.calls
+    assert json.loads(user)["turn_layout"] == [1, 2]

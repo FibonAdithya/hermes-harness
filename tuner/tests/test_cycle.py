@@ -667,13 +667,27 @@ def state(cfg):
     return json.loads((cfg.root / "cycle_state.json").read_text())
 
 
-COMPOSED_REPLY = {"kind": "composed_tool", "target": TRIAGE, "payload": dict(TOOL)}
+COMPOSED_REPLY = {"kind": "composed_tool", "target": TRIAGE, "payload": dict(TOOL) | {
+    "parameters": {"type": "object", "properties": {"ids": {"type": "array"}}},
+    "replay_inputs": [{"param": "ids", "from_call": GET, "arg": "message_id",
+                       "collect": "list"}]}}
+
+
+def _relay_mod():
+    from test_relay import relay
+    return relay()
+
+
+def replay_kw():
+    """The real relay.run_program with the local stub runner (no Docker)."""
+    from test_relay import RUNNER
+    return {"run_program": _relay_mod().run_program, "replay_argv": lambda name: RUNNER}
 
 
 def test_composed_shadow_requests_restart(env):
     build(env, triage_runs())
     bridge = FakeBridge(jobs=jobs(), oneshot_script=[reply(COMPOSED_REPLY)])
-    report = run_cycle(env, bridge, NOW)  # 04:00 London, quiet, no job within 15 min
+    report = run_cycle(env, bridge, NOW, **replay_kw())  # 04:00 London, quiet, no job within 15 min
     (rec,) = Ledger.load(env.root).records
     assert rec.state == "shadow_pending" and rec.needs_restart
     assert (env.root / "tools" / "tuned_triage" / "program.py").exists()
@@ -903,7 +917,7 @@ def test_composed_shadow_restarted_in_its_scheduling_cycle_reaches_trial(env):
     compares them and the fix goes into trial."""
     build(env, triage_runs())
     b1 = FakeBridge(jobs=jobs(), oneshot_script=[reply(COMPOSED_REPLY)])
-    r1 = run_cycle(env, b1, NOW)
+    r1 = run_cycle(env, b1, NOW, **replay_kw())
     assert r1.restarted and state(env)["restart_times"] == [NOW]
     (shadow_id, entry), = json.loads((env.root / "shadow_jobs.json").read_text()).items()
     assert entry["scheduled_at"] == NOW
@@ -1757,3 +1771,115 @@ def test_reducer_projection_has_no_drafting_estimate(env):
     assert report.budget == ""
     recs = [r for r in Ledger.load(env.root).records if r.kind == "reducer"]
     assert [r.state for r in recs] == ["shadow_pending"]
+
+
+# --- Task 9: composed tools are replayed before shadow ----------------------------------
+
+BATCH_REPLY = {"kind": "composed_tool", "target": TRIAGE, "payload": {
+    "name": "tuned_fetch", "description": "fetch messages in one step", "mutating": False,
+    "parameters": {"type": "object", "properties": {"message_ids": {"type": "array"}}},
+    "calls": [GET], "job_prompt": "Triage the inbox; fetch messages with tuned_fetch.",
+    "replay_inputs": [{"param": "message_ids", "from_call": GET, "arg": "message_id",
+                       "collect": "list"}],
+    "program": (f"def main(args, call):\n"
+                f"    return [call({GET!r}, {{'message_id': m}}) for m in args['message_ids']]\n")}}
+
+
+def mail_runs(days=range(1, 13), n=8, chars=7000):
+    """Triage runs: a search, then `n` fetches of `chars`-char mails on one turn, whose
+    recorded args carry user_google_email (which the program never sends)."""
+    base = NOW - 3 * 3600 + 7 * 3600
+    out = []
+    for d in days:
+        calls = [(SEARCH, {"query": "newer_than:1d"}, "results " + "x" * 400, 1)]
+        calls += [(GET, {"message_id": f"m{d}-{k}", "user_google_email": "o@example.test"},
+                   (f"{RESULT_SENTINEL} {d}-{k} " + "y" * chars)[:chars], 2) for k in range(n)]
+        out.append({"id": sid(TRIAGE, base - d * DAY), "source": "cron",
+                    "started_at": base - d * DAY, "cost": 0.0, "in": tok(0.10) - 1000,
+                    "out": 1000, "calls": calls, "final_turns": 3})
+    return out
+
+
+def test_replay_composed_hits_output_cap(env):
+    """Acceptance check 3: a batch fetcher over 8 x 7,000-char mails exceeds the
+    50,000-byte cap on replay and is rejected before shadow, at the draft's spend.
+    Catches: an exact-args-only stub (reason would be "too few sessions")."""
+    build(env, mail_runs())
+    bridge = FakeBridge(jobs=jobs(), oneshot_script=[reply(BATCH_REPLY)])
+    report = run_cycle(env, bridge, NOW, **replay_kw())
+    assert len(oneshots(bridge)) == 1
+    (rec,) = Ledger.load(env.root).records
+    assert rec.kind == "composed_tool" and rec.state == "rejected"
+    assert rec.reason == "replay: limit hit in 1 of 1 sessions"
+    assert rec.spend_usd == pytest.approx(1200 * FLAT_RATE / 1e6)
+    assert rec.est_saving_per_run is None
+    assert rec.id in report.rejected and report.shadowed == []
+    assert not (env.root / "shadow_jobs.json").exists()
+    assert not (env.root / "tools").exists() or not any((env.root / "tools").iterdir())
+    assert not report.restarted
+    assert RESULT_SENTINEL not in json.dumps(report.__dict__, default=str)
+
+
+def test_composed_draft_that_fits_reaches_shadow_with_an_estimate(env):
+    """The same program on 2 small mails per run fits; it is shadowed and its record
+    carries est_saving_per_run = monthly / (runs x 30/28)."""
+    build(env, mail_runs(n=2, chars=300))
+    bridge = FakeBridge(jobs=jobs(), oneshot_script=[reply(BATCH_REPLY)])
+    calls = []
+    real = _relay_mod().run_program
+
+    def spy(*a, **kw):
+        out = real(*a, **kw)
+        calls.append(out)
+        return out
+    kw = replay_kw() | {"run_program": spy}
+    report = run_cycle(env, bridge, NOW, **kw)
+    (rec,) = Ledger.load(env.root).records
+    assert rec.state == "shadow_pending", rec.reason
+    assert len(calls) == policy.REPLAY_MAX_SESSIONS
+    assert rec.est_saving_per_run is not None and rec.est_saving_per_run > 0
+    assert rec.id in report.shadowed
+
+
+def test_composed_replay_failure_rejects_with_the_type_only(env):
+    """A replay that raises: rejected with the exception type; no message text (it
+    could hold result text) reaches the ledger or the report."""
+    build(env, triage_runs())
+    bridge = FakeBridge(jobs=jobs(), oneshot_script=[reply(COMPOSED_REPLY)])
+
+    def boom(*a, **kw):
+        raise ValueError(RESULT_SENTINEL)
+    report = run_cycle(env, bridge, NOW, **(replay_kw() | {"run_program": boom}))
+    (rec,) = Ledger.load(env.root).records
+    assert rec.state == "rejected" and rec.reason == "replay: internal error ValueError"
+    assert rec.spend_usd > 0
+    assert RESULT_SENTINEL not in json.dumps(report.__dict__, default=str)
+    assert RESULT_SENTINEL not in (env.root / "ledger.json").read_text()
+
+
+def test_composed_request_carries_the_turn_layout(env):
+    """triage_calls puts one call on each of three turns."""
+    build(env, triage_runs())
+    bridge = FakeBridge(jobs=jobs(), oneshot_script=[reply(COMPOSED_REPLY)])
+    run_cycle(env, bridge, NOW, **replay_kw())
+    (_m, (_instr, user, _mt)), = oneshots(bridge)
+    assert json.loads(user)["turn_layout"] == [1, 1, 1]
+
+
+def test_turns_part_counts_only_for_sequence_candidates():
+    """A bytes candidate's est_monthly_usd is carried bytes; adding it would count
+    the bytes saving twice."""
+    from hermes_tuner.cycle_draft import DraftSteps
+    from hermes_tuner.detect import Candidate
+    seq = Candidate("sequence", "seq:a>b", TRIAGE, 3, 3, 10, 0.7)
+    assert DraftSteps._turns_usd(seq) == 0.7
+    assert DraftSteps._turns_usd(Candidate("bytes", "bytes:" + GET, TRIAGE, 3, 3, 10, 0.7)) == 0.0
+
+
+def test_default_replay_runner_is_the_plugin_relay_in_docker():
+    from hermes_tuner.cycle_draft import load_relay
+    relay = load_relay()
+    argv = relay.production_argv("tuner-replay-abcd1234")
+    assert argv[:len(policy.SANDBOX_ARGV)] == list(policy.SANDBOX_ARGV)
+    assert argv[argv.index("--name") + 1] == "tuner-replay-abcd1234"
+    assert relay.run_program.__name__ == "run_program"

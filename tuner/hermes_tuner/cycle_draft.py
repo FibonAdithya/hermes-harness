@@ -6,8 +6,11 @@ and its `_close`, `_went_live`, `_shadow_tool` and `_remove_shadow_tool` helpers
 """
 from __future__ import annotations
 
+import functools
 import hashlib
+import importlib.util
 import json
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
@@ -16,7 +19,7 @@ from . import policy, trial
 from .bridge import BridgeError
 from .budget import DAY, JOB_KINDS, iso_week_start, job_runs, savings, tuner_spend
 from .detect import SCHEMA_TOOL, SKILL_TOOL, Candidate, detect
-from .draft import draft
+from .draft import draft, turn_layout
 from .fingerprint import CopyIndex
 from .history import HistoryUnavailable
 from .ledger import (ACTIVE_STATES, APPLIED_STATES, BASE_KEY, FixRecord, _Failed, apply,
@@ -25,10 +28,11 @@ from .limits import LimitContext, changeable_settings, check_fix
 from .measure import priced_cost
 from .model import Fix, Session
 from .proposals import approved_callables, write_proposal
-from .replay import search_reducer
+from .replay import composed_gate, composed_monthly, replay_composed, search_reducer
 
 COPY_INDEX_DAYS = 14
-REPLAY_WINDOW_DAYS = 28
+REPLAY_WINDOW_DAYS = policy.REPLAY_WINDOW_DAYS
+RELAY_PATH = Path(__file__).resolve().parents[1] / "plugin" / "hermes-tuner" / "relay.py"
 PLUGIN_NOT_LOADED = "plugin not loaded; shadow not scheduled"
 GLOBAL_KINDS = frozenset({"config", "skill"})
 GLOBAL_CANDIDATES = ("schema_lookup", "skill_load")
@@ -76,7 +80,22 @@ def bundled_skills(skills_root: Path) -> frozenset[str] | None:
     return frozenset(n for n in names if n)
 
 
+@functools.cache
+def load_relay():
+    """The plugin's relay module, loaded from its file (it is not a package module)."""
+    spec = importlib.util.spec_from_file_location("hermes_tuner_replay_relay", RELAY_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 class DraftSteps:
+    # Composed-tool replay: a callable with relay.run_program's signature, and the
+    # runner argv for a container name. The cycle's constructor sets both; None means
+    # the plugin's relay in Docker (relay.production_argv).
+    run_program: Callable[..., str] | None = None
+    replay_argv: Callable[[str], list[str]] | None = None
+
     # 5-7. budget, detect, draft ----------------------------------------------------------
 
     def _job_cost(self, job_id: str) -> float:
@@ -181,6 +200,15 @@ class DraftSteps:
 
     def _call_shape(self, cand: Candidate) -> list[tuple[str, tuple[str, ...]]]:
         """Tool names and argument KEYS of the candidate's most recent session."""
+        recent = self._recent(cand)
+        return [] if recent is None else [(c.name, c.arg_keys) for c in recent.calls]
+
+    def _turn_layout(self, cand: Candidate) -> list[int]:
+        """Calls per turn of the session _call_shape describes."""
+        recent = self._recent(cand)
+        return [] if recent is None else turn_layout(recent.calls)
+
+    def _recent(self, cand: Candidate) -> Session | None:
         def matches(s: Session) -> bool:
             if cand.job_id is not None:
                 return s.job_id == cand.job_id and bool(s.calls)
@@ -188,9 +216,8 @@ class DraftSteps:
                 return sum(c.name == SCHEMA_TOOL for c in s.calls) >= 2
             name = cand.key.split(":", 1)[1]
             return name in self.skill_names.get(s.id, ())
-        recent = max((s for s in self.window if matches(s)),
-                     key=lambda s: (s.started_at, s.id), default=None)
-        return [] if recent is None else [(c.name, c.arg_keys) for c in recent.calls]
+        return max((s for s in self.window if matches(s)),
+                   key=lambda s: (s.started_at, s.id), default=None)
 
     def _settings(self) -> dict:
         """The settings a config fix may change, read once per cycle. On a bridge
@@ -233,7 +260,8 @@ class DraftSteps:
             skill_text = path.read_text(encoding="utf-8", errors="replace")
         try:
             fix, spend = draft(cand, job, skill_text, {}, self._call_shape(cand),
-                               self.bridge, self.now, self.pricing, settings=self._settings())
+                               self.bridge, self.now, self.pricing, settings=self._settings(),
+                               turn_layout=self._turn_layout(cand))
         except BridgeError as exc:
             # The call may have been billed before it failed (e.g. a timeout), and
             # all spend counts (spec 6): charge the drafting estimate.
@@ -360,8 +388,19 @@ class DraftSteps:
         if reasons:
             self._record(fix, "rejected", spend, "; ".join(reasons)[:1000])
             return spend, False
+        per_run = None
+        if fix.kind == "composed_tool":
+            reason, per_run = self._replay_gate(cand, fix)
+            if reason is not None:  # no shadow: the drafting call was paid
+                self._record(fix, "rejected", spend, reason)
+                return spend, False
         if fix.kind in JOB_KINDS:
-            return spend, self._shadow(fix, job, spend)
+            shadowed = self._shadow(fix, job, spend)
+            rec = self.ledger.get(fix.id)
+            if per_run is not None and rec is not None:
+                rec.est_saving_per_run = per_run
+                self.ledger.save()
+            return spend, shadowed
         if fix.kind in GLOBAL_KINDS:
             rec = self._record(fix, "shadow_pending", spend, "")
             try:
@@ -381,6 +420,39 @@ class DraftSteps:
         self._record(fix, "proposed", spend, "")
         self.report.proposed.append(fix.id)
         return spend, False
+
+    @staticmethod
+    def _turns_usd(cand: Candidate) -> float:
+        """The turns-removed part of a composed tool's monthly estimate: a sequence
+        candidate's own estimate. Any other kind's estimate is carried bytes, which the
+        replay prices itself."""
+        return cand.est_monthly_usd if cand.kind == "sequence" else 0.0
+
+    def _replay_gate(self, cand: Candidate, fix: Fix) -> tuple[str | None, float | None]:
+        """Replay a composed tool on recorded runs of its job. Returns (rejection reason
+        or None, est_saving_per_run or None). Reasons and errors carry counts and
+        exception types only: a message could hold result text."""
+        run_program = self.run_program
+        argv_for = self.replay_argv
+        try:
+            if run_program is None or argv_for is None:
+                relay = load_relay()
+                run_program = run_program or relay.run_program
+                argv_for = argv_for or relay.production_argv
+            runs = self.history.replay_runs(fix.target, self.now - REPLAY_WINDOW_DAYS * DAY)
+            rep = replay_composed(fix.payload, runs, run_program, pricing=self.pricing,
+                                  argv_for=argv_for)
+        except HistoryUnavailable:
+            self.err(f"replay {fix.id}: history unavailable")
+            return "replay: history unavailable", None
+        except Exception as exc:  # noqa: BLE001 - the type only
+            self.err(f"replay {fix.id}: unexpected {type(exc).__name__}")
+            return f"replay: internal error {type(exc).__name__}", None
+        monthly = composed_monthly(rep, self._turns_usd(cand))
+        reason = composed_gate(rep, monthly)
+        if reason is not None or not rep.eligible:
+            return reason, None
+        return None, monthly / (rep.eligible * 30 / REPLAY_WINDOW_DAYS)
 
     def _record(self, fix: Fix, state: str, spend: float, reason: str) -> FixRecord:
         rec = FixRecord(fix.id, fix.kind, fix.target, fix.candidate_key, state,  # type: ignore[arg-type]

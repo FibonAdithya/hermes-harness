@@ -11,24 +11,25 @@ import hashlib
 import json
 import re
 from datetime import datetime, timezone
+from collections.abc import Iterable
 from typing import Any
 
 from . import policy
 from .bridge import Bridge
 from .detect import Candidate
 from .measure import priced_breakdown
-from .model import Fix, Pricing
+from .model import Fix, Pricing, ToolCall
 
 KINDS = ("composed_tool", "job_prompt", "config", "skill", "new_reach")
 JOB_FIELDS = ("id", "name", "schedule", "prompt", "enabled_toolsets")
 CANDIDATE_FIELDS = ("kind", "key", "job_id", "sessions", "occurrences", "result_chars",
                     "est_monthly_usd")
 
-INSTRUCTIONS = f"""You draft one fix that reduces wasted work in a scheduled agent. The user message is a JSON document: statistics for one detected pattern (candidate), the job it occurs in (job), optionally the text of a skill (skill_text), the schemas of tools involved (tool_schemas), the settings a config fix may change with their current values (settings), and call_shape, the sequence of tool calls as [tool name, [argument keys]]. It contains no tool results and no argument values.
+INSTRUCTIONS = f"""You draft one fix that reduces wasted work in a scheduled agent. The user message is a JSON document: statistics for one detected pattern (candidate), the job it occurs in (job), optionally the text of a skill (skill_text), the schemas of tools involved (tool_schemas), the settings a config fix may change with their current values (settings), and call_shape, the sequence of tool calls as [tool name, [argument keys]], and turn_layout. It contains no tool results and no argument values.
 
 Reply with a single JSON object and nothing else: no prose, no code fence. Shape: {{"kind": ..., "target": ..., "payload": {{...}}}}. Choose exactly one kind.
 
-1. "composed_tool": one new tool that runs the observed call sequence in a single step. target is the job id from the request. payload: {{"name": str, "description": str, "parameters": object (JSON schema), "calls": [str], "mutating": bool, "program": str, "job_prompt": str or null}}.
+1. "composed_tool": one new tool that runs the observed call sequence in a single step. target is the job id from the request. payload: {{"name": str, "description": str, "parameters": object (JSON schema), "calls": [str], "mutating": bool, "program": str, "job_prompt": str or null, "replay_inputs": [{{"param": str, "from_call": str, "arg": str, "collect": "list" or "first"}}]}}.
    - name must start with "{policy.TOOL_PREFIX}". The tool is placed in the "{policy.TOOLSET}" toolset.
    - description says what the tool does, derived from its structure (which tools it calls and what it returns), not from any email content.
    - program is Python source defining `def main(args: dict, call) -> object`. `call(name, args)` runs a tool and returns its result parsed from JSON (or the raw string if it is not JSON). The return value must be JSON-serialisable. The program runs in a sandbox with no network, so every external effect goes through call().
@@ -37,6 +38,9 @@ Reply with a single JSON object and nothing else: no prose, no code fence. Shape
    - web_search and web_extract are refused after any other call in the same run, so call them first or not at all.
    - If the program calls a mutating tool ({", ".join(sorted(policy.MUTATING_TOOLS & policy.CALLABLE_TOOLS))}), set mutating to true and add a boolean "dry_run" argument to parameters; the program must not perform effects when it is set (calls are recorded instead).
    - job_prompt is optional new job prompt text telling the agent to use the tool, or null.
+   - The program's JSON output must stay under {policy.MAX_OUTPUT_BYTES} bytes, at most {policy.MAX_CALLS} tool calls and {policy.RUN_TIMEOUT_S} seconds; return only what the job needs, not whole tool results.
+   - turn_layout lists how many of the observed calls the agent already sends per turn; merging calls that already share a turn saves nothing.
+   - replay_inputs says how the tool's arguments are built from the observed calls, so the tool can be tested on recorded runs before it is used. Each entry fills the parameter named param (a key of parameters.properties) from argument arg of the observed calls to from_call (one of calls): "list" collects every value, "first" takes the first. List at least one entry.
 2. "job_prompt": rewrite a job's prompt. target is the job id from the request. payload: {{"prompt": str, "add_toolsets": [str]}}. add_toolsets may only be ["{policy.TOOLSET}"] or [].
 3. "config": change one setting. target is the key. payload: {{"key": str, "value": string, number or boolean}}. The request's "settings" object maps every setting you may change to its current value. key must be one of its keys, copied exactly; any other key is refused. Keep the type of the current value. If "settings" is empty, do not choose this kind.
 4. "skill": shrink a skill that is loaded often and is large. target is the skill path. payload: {{"path": str, "text": str}}. A skill fix may only rewrite an existing SKILL.md that is not bundled with the agent, and must keep its frontmatter block (the leading --- block) byte-identical. Shrink the body, keep the decision guidance, and point at the tool for mechanics.
@@ -54,15 +58,22 @@ def _is_scalar(v: Any) -> bool:
     return isinstance(v, (str, int, float, bool))
 
 
+REPLAY_INPUT_KEYS = ("param", "from_call", "arg", "collect")
+
+
 def _clean_composed(p: dict) -> dict | None:
-    jp = p.get("job_prompt")
+    """replay_inputs must be a list of objects; each keeps only REPLAY_INPUT_KEYS.
+    Their values are checked by limits.check_fix."""
+    jp, ri = p.get("job_prompt"), p.get("replay_inputs")
     if not (isinstance(p.get("name"), str) and isinstance(p.get("description"), str)
             and isinstance(p.get("parameters"), dict) and _is_str_list(p.get("calls"))
             and isinstance(p.get("mutating"), bool) and isinstance(p.get("program"), str)
-            and (jp is None or isinstance(jp, str))):
+            and (jp is None or isinstance(jp, str))
+            and isinstance(ri, list) and all(isinstance(e, dict) for e in ri)):
         return None
     return {k: p[k] for k in ("name", "description", "parameters", "calls", "mutating",
-                              "program")} | {"job_prompt": jp}
+                              "program")} | {"job_prompt": jp, "replay_inputs": [
+        {k: e[k] for k in REPLAY_INPUT_KEYS if k in e} for e in ri]}
 
 
 def _clean_job_prompt(p: dict) -> dict | None:
@@ -117,12 +128,22 @@ def _safe_key(key: str) -> str:
     return kind + sep + ">".join(_safe(n, _NAME) for n in rest.split(">")) if sep else kind
 
 
+def turn_layout(calls: Iterable[ToolCall]) -> list[int]:
+    """Calls per model turn, in turn order (turn 0, unknown, counts as one turn)."""
+    counts: dict[int, int] = {}
+    for c in calls:
+        counts[c.turn] = counts.get(c.turn, 0) + 1
+    return [counts[t] for t in sorted(counts)]
+
+
 def build_request(candidate: Candidate, job: dict | None, skill_text: str | None,
                   tool_schemas: dict[str, dict],
                   call_shape: list[tuple[str, tuple[str, ...]]],
-                  settings: dict[str, Any] | None = None) -> tuple[str, str]:
+                  settings: dict[str, Any] | None = None,
+                  turn_layout: list[int] | None = None) -> tuple[str, str]:
     """`settings`: the changeable settings (limits.changeable_settings), sent so the
-    model names a real key instead of guessing one under an allowed prefix."""
+    model names a real key instead of guessing one under an allowed prefix.
+    `turn_layout`: calls per turn of the call_shape session (positive ints only)."""
     doc: dict[str, Any] = {"candidate": {f: getattr(candidate, f) for f in CANDIDATE_FIELDS}}
     doc["candidate"]["key"] = _safe_key(candidate.key)
     if job is not None:
@@ -133,6 +154,9 @@ def build_request(candidate: Candidate, job: dict | None, skill_text: str | None
     doc["settings"] = dict(settings or {})
     doc["call_shape"] = [[_safe(name, _NAME), [_safe(k, _ARG_KEY) for k in keys]]
                          for name, keys in call_shape[:MAX_SHAPE_CALLS]]
+    doc["turn_layout"] = [n for n in (turn_layout or [])
+                          if isinstance(n, int) and not isinstance(n, bool) and n > 0
+                          ][:MAX_SHAPE_CALLS]
     return INSTRUCTIONS, json.dumps(doc, sort_keys=True)
 
 
@@ -189,10 +213,11 @@ def draft(candidate: Candidate, job: dict | None, skill_text: str | None,
           tool_schemas: dict[str, dict], call_shape: list[tuple[str, tuple[str, ...]]],
           bridge: Bridge, now: float, pricing: Pricing,
           max_tokens: int = 4000,
-          settings: dict[str, Any] | None = None) -> tuple[Fix | None, float]:
+          settings: dict[str, Any] | None = None,
+          turn_layout: list[int] | None = None) -> tuple[Fix | None, float]:
     """One model call. A BridgeError propagates; spend is reported for bad replies too."""
     instructions, user_input = build_request(candidate, job, skill_text, tool_schemas,
-                                             call_shape, settings)
+                                             call_shape, settings, turn_layout)
     reply = bridge.oneshot(instructions, user_input, max_tokens)
     text = reply.get("text")
     fix = parse_draft(text, candidate, now) if isinstance(text, str) else None

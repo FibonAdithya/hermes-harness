@@ -94,13 +94,18 @@ class CycleReport:
 
 
 def run_cycle(cfg: CycleConfig, bridge: Bridge, now: float,
-              clock: Callable[[], float] | None = None) -> CycleReport:
+              clock: Callable[[], float] | None = None,
+              run_program: Callable[..., str] | None = None,
+              replay_argv: Callable[[str], list[str]] | None = None) -> CycleReport:
     """`now` anchors the run's decisions. `clock` reads the time again where a step
     depends on the time it actually happens (the restart, after drafting that can
-    take many minutes); it defaults to `now`."""
+    take many minutes); it defaults to `now`. `run_program` (relay.run_program's
+    signature) and `replay_argv` (container name -> runner argv) run the composed-tool
+    replay; None means the plugin's relay in Docker."""
     report = CycleReport(dry_run=cfg.dry_run)
+    replay = {"run_program": run_program, "replay_argv": replay_argv}
     if cfg.dry_run:
-        _Cycle(cfg, bridge, now, report, clock).run()
+        _Cycle(cfg, bridge, now, report, clock, **replay).run()
         return report
     root = Path(cfg.root)
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -111,7 +116,7 @@ def run_cycle(cfg: CycleConfig, bridge: Bridge, now: float,
         except BlockingIOError:
             report.skipped = "already running"
             return report
-        _Cycle(cfg, bridge, now, report, clock).run()
+        _Cycle(cfg, bridge, now, report, clock, **replay).run()
     finally:
         os.close(fd)  # releases the lock
     return report
@@ -119,8 +124,11 @@ def run_cycle(cfg: CycleConfig, bridge: Bridge, now: float,
 
 class _Cycle(DraftSteps):
     def __init__(self, cfg: CycleConfig, bridge: Bridge, now: float, report: CycleReport,
-                 clock: Callable[[], float] | None = None):
+                 clock: Callable[[], float] | None = None,
+                 run_program: Callable[..., str] | None = None,
+                 replay_argv: Callable[[str], list[str]] | None = None):
         self.cfg, self.bridge, self.now, self.report = cfg, bridge, now, report
+        self.run_program, self.replay_argv = run_program, replay_argv
         self.clock = clock if clock is not None else (lambda: now)
         self.root = Path(cfg.root)
         self.dry = cfg.dry_run
