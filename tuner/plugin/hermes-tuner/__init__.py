@@ -23,8 +23,9 @@ shadow-session guard.
   raw result of its tool. A live file applies only in runs of its spec's job
   (scoped by the session's compression-lineage root); a shadow file only in its
   fix's shadow session. Two matching files: neither applies. Each application
-  appends one line of lengths (never result text) to
-  `$HERMES_HOME/tuner/reducer_events/<fix id>.jsonl`.
+  that changes the result appends one line of lengths (never result text) to
+  `$HERMES_HOME/tuner/reducer_events/<fix id>.jsonl`; a reducer that raises
+  appends its exception type; a no-op appends nothing.
 - `register` writes `$HERMES_HOME/tuner/plugin_heartbeat.json` =
   {"pid", "registered_at"}; the cycle schedules shadows and applies composed
   tools only when it is newer than the last gateway restart.
@@ -467,7 +468,8 @@ def _scoped(entries: list[dict], session_id: str, root_of) -> list[dict]:
 
 def reduce_scoped(tool_name, result, session_id, tool_call_id, status, *, root_of,
                   reducers_dir: Path, events_dir: Path, load, apply) -> str | None:
-    """The reduced result, or None to leave it unchanged. Never raises.
+    """The reduced result, or None to leave it unchanged. Never raises. Logs
+    {before, after} only when the result changed, and {error} when `apply` raised.
 
     `root_of(session_id)` gives the compression-lineage root (may raise
     LineageError), `load(reducers_dir)` the valid reducer files, `apply(spec,
@@ -499,9 +501,16 @@ def reduce_scoped(tool_name, result, session_id, tool_call_id, status, *, root_o
                        type(exc).__name__)
         _reducer_event(events_dir, entry["fix_id"], dict(base, error=type(exc).__name__))
         return None
+    if out == result:  # a no-op is not a reduction: no event, Hermes keeps the original
+        return None
     _reducer_event(events_dir, entry["fix_id"],
                    dict(base, before=len(result), after=len(out)))
     return out
+
+
+def _apply_strict(spec: dict, result: str) -> str:
+    """apply_reducer that raises on an internal error: reduce_scoped logs it."""
+    return reducers.apply_reducer(spec, result, strict=True)
 
 
 def reduce_result(tool_name=None, args=None, result=None, session_id="", tool_call_id="",
@@ -512,7 +521,7 @@ def reduce_result(tool_name=None, args=None, result=None, session_id="", tool_ca
         return reduce_scoped(tool_name, result, session_id, tool_call_id, status,
                              root_of=_root_session, reducers_dir=root / "reducers",
                              events_dir=root / "reducer_events", load=load_reducers,
-                             apply=reducers.apply_reducer)
+                             apply=_apply_strict)
     except Exception:  # noqa: BLE001
         logger.exception("hermes-tuner: reduce_result failed")
         return None

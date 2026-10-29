@@ -210,38 +210,46 @@ def _parse(result: str):
         return False, None
 
 
-def apply_reducer(spec: dict, result: str) -> str:
-    """Apply a reducer spec to a tool result. Never raises."""
+def apply_reducer(spec: dict, result: str, *, strict: bool = False) -> str:
+    """Apply a reducer spec to a tool result. Never raises by default: on an internal
+    exception the result is returned unchanged. With strict=True the exception
+    propagates, so a caller (the plugin hook) can tell a crash from a no-op."""
+    if strict:
+        return _apply(spec, result)
     try:
-        if not isinstance(result, str):
-            return result
-        steps = spec["steps"]
-        ok, obj = _parse(result)
-        if ok:
-            for st in steps:
-                op, params = st["op"], st
-                if op == "drop_fields":
-                    if isinstance(obj, dict):
-                        drop = set(params["fields"])
-                        obj = {k: v for k, v in obj.items() if k not in drop}
-                else:
-                    f = OPS[op]
-                    obj = _walk(obj, lambda s, f=f, p=params: f(s, p))
-            if isinstance(obj, (dict, list)) and not obj:
-                return result
-            out = json.dumps(obj, ensure_ascii=False)
-            if obj == json.loads(result):
-                return result
-        else:
-            out = result
-            for st in steps:
-                if st["op"] != "drop_fields":
-                    out = OPS[st["op"]](out, st)
-        if result and not out:
-            return result
-        return out
+        return _apply(spec, result)
     except Exception:
         return result
+
+
+def _apply(spec: dict, result: str) -> str:
+    if not isinstance(result, str):
+        return result
+    steps = spec["steps"]
+    ok, obj = _parse(result)
+    if ok:
+        for st in steps:
+            op, params = st["op"], st
+            if op == "drop_fields":
+                if isinstance(obj, dict):
+                    drop = set(params["fields"])
+                    obj = {k: v for k, v in obj.items() if k not in drop}
+            else:
+                f = OPS[op]
+                obj = _walk(obj, lambda s, f=f, p=params: f(s, p))
+        if isinstance(obj, (dict, list)) and not obj:
+            return result
+        out = json.dumps(obj, ensure_ascii=False)
+        if obj == json.loads(result):
+            return result
+    else:
+        out = result
+        for st in steps:
+            if st["op"] != "drop_fields":
+                out = OPS[st["op"]](out, st)
+    if result and not out:
+        return result
+    return out
 
 
 def text_view(result: str) -> str:

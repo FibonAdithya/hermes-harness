@@ -660,6 +660,33 @@ def test_hook_fail_open(home):
     assert reduce(plugin, home, CAL_SID) == expected()
 
 
+def test_hook_no_op_reducer_writes_no_event(home):
+    """A reducer that leaves the result as it was logs nothing and returns None
+    (Hermes keeps the original), so "reduced" in the event log means changed."""
+    plugin = load_plugin()
+    write_reducer(home, "r1")
+    assert reduce(plugin, home, CAL_SID, apply=lambda spec, result: str(result)) is None
+    assert reducer_events(home, "r1") == []
+    # Through the hook: collapse_ws on a result with no runs of whitespace is a no-op.
+    plain = json.dumps({"result": "a b"})
+    assert plugin.reduce_result(tool_name=GET, result=plain, session_id=CAL_SID,
+                                tool_call_id="c1", status="success") is None
+    assert reducer_events(home, "r1") == []
+    assert not (home / "tuner" / "reducer_events").exists()
+
+
+def test_hook_logs_a_reducer_crash_as_an_error(home):
+    """The hook applies with strict=True: an exception inside the reducer is logged
+    as its type, not mistaken for a no-op, and the result is left unchanged."""
+    plugin = load_plugin()
+    write_reducer(home, "r1")
+    deep = "[" * 100_000 + "]" * 100_000  # json.loads raises RecursionError
+    assert plugin.reduce_result(tool_name=GET, result=deep, session_id=CAL_SID,
+                                tool_call_id="c3", status="success") is None
+    assert reducer_events(home, "r1") == [
+        {"session_id": CAL_SID, "tool_call_id": "c3", "error": "RecursionError"}]
+
+
 def test_hook_shadow_of_unknown_fix_gets_nothing(home):
     """A shadow whose fix is unknown (no fix_id, no tuner-shadow-<id> job name) is
     still a shadow: no live file applies in it, and no shadow file either."""

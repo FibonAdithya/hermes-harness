@@ -1661,6 +1661,27 @@ def test_reducer_shadow_without_events_fails(env, events):
     assert reducer_files(env) == {}
 
 
+@pytest.mark.parametrize("result, state", [
+    (json.dumps({"result": "a b"}), "shadow_failed"),   # collapse_ws changes nothing
+    (json.dumps({"result": "a    b"}), "trial"),        # control: it reduces
+])
+def test_no_op_reducer_in_its_shadow_fails_never_reduced(env, monkeypatch, result, state):
+    """End to end through the plugin hook: a reducer that changes no result in its
+    shadow run writes no event, so the shadow fails NEVER_REDUCED instead of going to
+    a 5-run trial."""
+    from test_relay import load_plugin
+    fix = reducer_setup(env, events=[])
+    monkeypatch.setenv("HERMES_HOME", str(env.root.parent))
+    plugin = load_plugin()
+    plugin.reduce_result(tool_name=GET, result=result, session_id=sid(SHADOW_JOB, SHADOW_T),
+                         tool_call_id="c0", status="success")
+    run_cycle(env, FakeBridge(jobs=jobs()), NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert rec.state == state, rec.reason
+    if state == "shadow_failed":
+        assert rec.reason == "shadow never reduced a result"
+
+
 def test_reducer_event_in_a_compressed_child_of_the_shadow_counts(env):
     """The hook logs the agent's current session id: after compression, a child id."""
     child = "20261018_064500_abcd12"

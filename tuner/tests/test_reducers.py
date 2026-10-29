@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from hermes_tuner.reducers import OPS, apply_reducer, text_view, validate_spec
 
 T = "mcp__google__get_gmail_message_content"
@@ -80,6 +82,26 @@ def test_apply_reducer_never_raises():
     assert apply_reducer({"steps": [{"op": "cap", "chars": "x"}]}, "abc") == "abc"
     assert apply_reducer(None, "abc") == "abc"
     assert apply_reducer(spec({"op": "bogus"}), "abc") == "abc"
+    assert apply_reducer(spec({"op": "collapse_ws"}), DEEP) == DEEP  # RecursionError inside
+
+
+# Nested past the recursion limit: json.loads raises RecursionError (made-up text).
+DEEP = "[" * 100_000 + "]" * 100_000
+
+
+def test_apply_reducer_strict_raises_what_the_default_swallows():
+    """The plugin hook passes strict=True so it can tell a crash from a no-op."""
+    with pytest.raises(RecursionError):
+        apply_reducer(spec({"op": "collapse_ws"}), DEEP, strict=True)
+    with pytest.raises(TypeError):
+        apply_reducer({"steps": "nope"}, "abc", strict=True)
+    with pytest.raises(KeyError):
+        apply_reducer(spec({"op": "bogus"}), "abc", strict=True)
+    # strict changes nothing where no exception is raised
+    s = spec({"op": "collapse_ws"})
+    for r in ('{"a": "x   y"', "null", "plain   text", '{"a": "x"}', "", "<br>"):
+        assert apply_reducer(s, r, strict=True) == apply_reducer(s, r)
+    assert apply_reducer(spec({"op": "html_to_text"}), "<br>", strict=True) == "<br>"
 
 
 def test_drop_fields_top_level_only():
