@@ -23,6 +23,10 @@ BACKOFF_PARK_AFTER = 3
 
 COPY_TEXT = "contains text copied from untrusted tool results"
 _COPY_ITEM = re.compile(r"payload\.(.+?): " + re.escape(COPY_TEXT))
+# Replay reasons the drafted program did not cause (cycle_draft._replay_gate,
+# replay.composed_gate): class "timeout", which skips but never parks.
+REPLAY_OUTAGES = ("replay: history unavailable", "replay: no time left",
+                  "replay: internal error")
 
 
 def reason_class(rec: FixRecord) -> str:
@@ -33,6 +37,8 @@ def reason_class(rec: FixRecord) -> str:
             return "copy"
         if reason.startswith("replay: limit hit"):
             return "replay_limit"
+        if reason.startswith(REPLAY_OUTAGES):  # outages and budget, not the draft
+            return "timeout"
         if reason.startswith("replay:"):
             return "replay"
         if rec.kind == "bridge_error" or reason.startswith("drafting call failed"):
@@ -61,9 +67,10 @@ def copy_fields(rec: FixRecord) -> list[str]:
 
 def _parkable(rec: FixRecord, cls: str) -> bool:
     """Only outcomes the hashed inputs can cause park. A failed bridge call (credits,
-    timeouts) and a reducer search (its input is the replay window, not the prompt)
-    would otherwise stay parked for good; they only skip."""
-    return cls != "timeout" and rec.kind != "reducer"
+    timeouts) and a reducer search's rejected placeholder (its input is the replay
+    window, not the prompt) would otherwise stay parked for good; they only skip. A
+    reducer that failed its shadow or trial parks: the same search finds it again."""
+    return cls != "timeout" and not (rec.kind == "reducer" and rec.state == "rejected")
 
 
 def input_hash(job: dict | None, skill_text: str | None) -> str:

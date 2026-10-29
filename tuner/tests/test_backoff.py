@@ -37,8 +37,10 @@ def rej(kind, reason, t, ih=h, key=KEY):
     ("composed_tool", "rejected", "replay: program error in 2 of 6 sessions", "replay"),
     ("composed_tool", "rejected", "replay: too few sessions (1 < 3)", "replay"),
     ("composed_tool", "rejected", "replay: saving below floor", "replay"),
-    ("composed_tool", "rejected", "replay: no time left", "replay"),
-    ("composed_tool", "rejected", "replay: internal error ValueError", "replay"),
+    # replay outages and budget effects, not caused by the draft: never park
+    ("composed_tool", "rejected", "replay: no time left", "timeout"),
+    ("composed_tool", "rejected", "replay: internal error ValueError", "timeout"),
+    ("composed_tool", "rejected", "replay: history unavailable", "timeout"),
     ("bridge_error", "rejected", "drafting call failed: oneshot timed out", "timeout"),
     ("unparseable", "rejected", "unparseable draft", "unparseable"),
     ("error", "rejected", "internal error: KeyError", "limits"),
@@ -136,6 +138,28 @@ def test_failures_the_inputs_did_not_cause_never_park(kind, reason):
     assert backoff(recs, KEY, h, DAY * 16 - 1) == "skip"
     assert backoff(recs, KEY, h, DAY * 16) == "ok"
     assert backoff(recs, KEY, h, DAY * 60) == "ok"
+
+
+@pytest.mark.parametrize("state, reason", [
+    ("rolled_back", "trial: not cheaper than baseline"),
+    ("shadow_failed", "shadow never reduced a result"),
+])
+def test_reducer_shadow_and_trial_failures_park(state, reason):
+    """Only a reducer search's rejected placeholders are exempt: a reducer that failed
+    its shadow or trial is found again by the same search, so it parks like any fix."""
+    recs = [rec("reducer", state, reason, DAY * d, rid=f"r{d}") for d in (1, 2, 9)]
+    assert backoff(recs, KEY, h, DAY * 20) == "parked"
+    assert backoff(recs, KEY, "other-hash", DAY * 20) == "ok"   # the job prompt changed
+
+
+def test_replay_outages_never_park():
+    for reason in ("replay: no time left", "replay: history unavailable",
+                   "replay: internal error KeyError"):
+        recs = [rej("composed_tool", reason, DAY * d) for d in (1, 2, 9)]
+        assert backoff(recs, KEY, h, DAY * 9 + 1) == "skip", reason
+        assert backoff(recs, KEY, h, DAY * 20) == "ok", reason
+    recs = [rej("composed_tool", "replay: saving below floor", DAY * d) for d in (1, 2, 9)]
+    assert backoff(recs, KEY, h, DAY * 20) == "parked"   # control: other replay reasons park
 
 
 def test_bridge_error_state_never_parks():
