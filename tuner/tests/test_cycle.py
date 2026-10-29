@@ -1685,12 +1685,12 @@ def small_result(n):
     return json.dumps({"result": text, "structuredContent": {"result": text}})
 
 
-def aliased_runs(direct_result):
+def aliased_runs(direct_result, direct=3):
     """12 runs of calendar sync reading big results through tuned_get (aliased to GET,
-    so the bytes candidate is large) and 3 runs calling GET directly, the only calls
-    the replay search sees."""
+    so the bytes candidate is large; they never call GET directly) and `direct` runs
+    calling GET directly, the only calls the replay search sees."""
     return (bytes_runs(CAL, tool="tuned_get", days=range(1, 13))
-            + bytes_runs(CAL, days=range(13, 16), result=direct_result))
+            + bytes_runs(CAL, days=range(13, 13 + direct), result=direct_result))
 
 
 
@@ -1701,12 +1701,19 @@ def write_alias(cfg):
     (d / "tool.json").write_text(json.dumps({"name": "tuned_get", "calls": [GET]}))
 
 
-@pytest.mark.parametrize("direct_result, floor_ok", [(small_result, False), (big_result, True)])
-def test_reducer_saving_below_the_floor_is_not_shadowed(env, direct_result, floor_ok):
+@pytest.mark.parametrize("direct_result, direct, floor_ok", [
+    (small_result, 3, False),
+    # $0.0132 a run cut on 3 runs: $0.042 a month. Multiplying by all 15 of the
+    # job's runs (12 never call GET directly) would claim $0.21 and pass the floor.
+    (big_result, 3, False),
+    (big_result, 6, True),   # $0.085 a month
+])
+def test_reducer_saving_below_the_floor_is_not_shadowed(env, direct_result, direct, floor_ok):
     """The candidate cleared the floor on all of GET's bytes (most through tuned_get), but
-    the reducer only cuts the 3 direct calls: its own monthly saving must clear it too."""
+    the reducer only cuts the direct calls: its own monthly saving, the per-run saving
+    times the runs that call the tool, must clear it too."""
     write_alias(env)
-    build(env, aliased_runs(direct_result))
+    build(env, aliased_runs(direct_result, direct))
     bridge = FakeBridge(jobs=jobs())
     run_cycle(env, bridge, NOW)
     (rec,) = Ledger.load(env.root).records
@@ -1721,14 +1728,15 @@ def test_reducer_saving_below_the_floor_is_not_shadowed(env, direct_result, floo
 
 
 def test_reducer_saving_at_the_floor_is_shadowed(env, monkeypatch):
-    """A monthly saving equal to MIN_DRAFT_MONTHLY_USD is not below it."""
+    """A monthly saving equal to MIN_DRAFT_MONTHLY_USD is not below it. The search
+    saw the tool in 5 runs: the saving is per_run x 5 x 30/28."""
     from hermes_tuner import cycle_draft
     from hermes_tuner.replay import ReducerResult
     spec = {"tool": GET, "job": CAL, "steps": [{"op": "collapse_ws"}]}
     per_run = 0.0011
     monkeypatch.setattr(cycle_draft, "search_reducer", lambda *a, **k: ReducerResult(
-        spec, "ok", 12, 12, 100, 50, 0, 0, per_run))
-    monkeypatch.setattr(policy, "MIN_DRAFT_MONTHLY_USD", per_run * 12 * 30 / 28)
+        spec, "ok", 5, 5, 100, 50, 0, 0, per_run))
+    monkeypatch.setattr(policy, "MIN_DRAFT_MONTHLY_USD", per_run * 5 * 30 / 28)
     build(env, bytes_runs(CAL))  # 12 runs in the window
     bridge = FakeBridge(jobs=jobs())
     run_cycle(env, bridge, NOW)

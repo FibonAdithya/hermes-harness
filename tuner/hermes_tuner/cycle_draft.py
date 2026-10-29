@@ -311,7 +311,9 @@ class DraftSteps:
             return 0.0, False
         # The candidate cleared the floor on all of the tool's bytes, aliased calls
         # included; the reducer cuts only direct calls, so its own saving must too.
-        monthly = result.est_saving_per_run * len(runs) * 30 / REPLAY_WINDOW_DAYS
+        # est_saving_per_run is averaged over the runs that call the tool: times their
+        # count it is the replayed window's total saving, scaled here to 30 days.
+        monthly = result.est_saving_per_run * result.sessions * 30 / REPLAY_WINDOW_DAYS
         if monthly < policy.MIN_DRAFT_MONTHLY_USD:
             self._spend_record(cand, 0.0, "reducer", "reducer search: saving_below_floor")
             return 0.0, False
