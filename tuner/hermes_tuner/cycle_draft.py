@@ -192,15 +192,17 @@ class DraftSteps:
 
     def _select(self, cands: list[Candidate]) -> list[Candidate]:
         """The first candidate per editable job, and one global one, among those worth
-        at least MIN_DRAFT_MONTHLY_USD a month and not backed off. Backed-off
-        candidates are dropped before the pick, so a job's next candidate is tried."""
+        at least MIN_DRAFT_MONTHLY_USD a month, not backed off and not a reducer route
+        whose (job, tool) already has a reducer. Those are dropped before the pick, so a
+        job's next candidate is tried."""
         cands = [c for c in cands if c.est_monthly_usd >= policy.MIN_DRAFT_MONTHLY_USD]
         picked = []
         for job in sorted(policy.EDITABLE_JOBS):
             if job in policy.NEVER_TOUCH_JOBS or self.ledger.active_for(job) is not None:
                 continue
             ok = self._not_backed_off(
-                [c for c in cands if c.job_id == job and c.kind in JOB_CANDIDATES])
+                [c for c in cands if c.job_id == job and c.kind in JOB_CANDIDATES
+                 and not self._taken_reducer_route(c)])
             if ok:
                 picked.append(ok[0])
         if not self._global_active():
@@ -208,6 +210,13 @@ class DraftSteps:
             if ok:
                 picked.append(ok[0])
         return picked
+
+    def _taken_reducer_route(self, cand: Candidate) -> bool:
+        """A reducer-route candidate whose (job, tool) already has a reducer (see
+        _reducer_taken). _reduce_one would end it with no record, every cycle, so it is
+        dropped before the pick and the job's next candidate is drafted instead."""
+        return (self._reducer_route(cand)
+                and self._reducer_taken(cand.job_id, cand.key.split(":", 1)[1]))
 
     def _cand_records(self, cand: Candidate) -> list[FixRecord]:
         """The candidate's records. Job candidates' keys ("seq:...", "bytes:...") can

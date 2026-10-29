@@ -1556,6 +1556,30 @@ def test_no_second_reducer_for_same_tool(env, kept_tool, blocked):
     assert get_jobs
 
 
+def test_kept_reducer_does_not_block_the_jobs_next_candidate(env):
+    """A kept reducer for (calendar sync, search) leaves search's bytes candidate on top
+    of the job's ranking. It is dropped before the pick, so the job's next candidate
+    (get's bytes) is searched this cycle. Catches: _select picking the taken candidate,
+    which _reduce_one then ends with no record, every cycle."""
+    kept = Fix("20261001-r0000cccc", "reducer", CAL,
+               {"tool": SEARCH, "job": CAL, "steps": [{"op": "collapse_ws"}],
+                "_base": CAL_BASE}, "bytes:" + SEARCH)
+    add_record(env, FixRecord(kept.id, "reducer", CAL, kept.candidate_key, "kept",
+                              NOW - 18 * DAY, applied_at=NOW - 18 * DAY,
+                              live_from=NOW - 18 * DAY, baseline_runs=[]), kept)
+    base = NOW - 3 * 3600 + 6 * 3600
+    build(env, [{"id": sid(CAL, base - d * DAY), "source": "cron", "started_at": base - d * DAY,
+                 "in": tok(0.10) - 500, "out": 500, "final_turns": 3, "final_content": [],
+                 "calls": [(SEARCH, {"query": f"q{d}"}, big_result(d) * 2, 1),
+                           (GET, {"message_id": f"m{d}"}, big_result(d), 2)]}
+                for d in range(1, 13)])
+    report = run_cycle(env, FakeBridge(jobs=jobs()), NOW)
+    led = Ledger.load(env.root)
+    new = [r for r in led.records if r.id != kept.id]
+    assert [r.candidate_key for r in new] == ["bytes:" + GET], [r.reason for r in new]
+    assert new[0].kind == "reducer" and report.errors == []
+
+
 def test_detect_counts_composed_tool_results_under_the_tool_it_calls(env):
     """aliases from tools/*/tool.json: a composed tool calling one tool is counted as
     that tool, so its bytes reach the reducer route (and the search finds no direct
