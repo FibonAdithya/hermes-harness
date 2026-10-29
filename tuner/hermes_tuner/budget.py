@@ -18,6 +18,7 @@ from .trial import baseline_medians
 
 DAY = 86400.0
 BASELINE_DAYS = 28
+ESTIMATE_DAYS = 28  # the weekly line compares estimates with measurements this far back
 JOB_KINDS = frozenset({"job_prompt", "composed_tool", "reducer"})
 SAVING_STATES = frozenset({"trial", "kept"})
 
@@ -84,14 +85,19 @@ def _money(x: float) -> str:
 
 def weekly_line(ledger: Ledger, sessions: list[Session], now: float,
                 pricing: Pricing | None, shadow_ids: Iterable[str] = (), errors: int = 0,
-                since: float | None = None) -> str:
+                since: float | None = None, parked: int = 0) -> str:
     """One line covering (since, now]; `since` defaults to 7 days before `now`. The
     cycle passes the time the previous line was written, so an outcome stamped by
     the run that writes a line is in exactly one line. `errors` is the number of
     failures in the window (the cycle logs each failure once, including those that
     left a bridge_error record, so records are not counted again here). Dollar
     figures name the price list they are estimated at; with no `pricing` there are
-    none ("pricing unavailable")."""
+    none ("pricing unavailable").
+
+    With a price list, fixes kept or rolled back in the 28 days before `now` that
+    carry both an estimated and a measured saving per run add their sums ("estimates:
+    ... vs measured ..."). `parked` is the number of candidates drafting left parked
+    this run (backoff); it is shown when above 0."""
     if since is None:
         since = now - 7 * DAY
 
@@ -111,6 +117,18 @@ def weekly_line(ledger: Ledger, sessions: list[Session], now: float,
         version = pricing.version or pricing.source
         line = (f"Hermes tuner: saved ~{_money(saved)} this week (ESTIMATE at {pricing.model} "
                 f"list prices, {version}), {counts}; tuner spent {_money(spent)}")
+        judged = [r for r in ledger.records
+                  if r.state in ("kept", "rolled_back") and r.decided_at is not None
+                  and now - ESTIMATE_DAYS * DAY < r.decided_at <= now
+                  and r.est_saving_per_run is not None
+                  and r.measured_saving_per_run is not None]
+        if judged:
+            est = sum(r.est_saving_per_run for r in judged)
+            meas = sum(r.measured_saving_per_run for r in judged)
+            line += (f"; estimates: {_money(est)} vs measured {_money(meas)} per run over "
+                     f"{len(judged)} fixes")
+    if parked > 0:
+        line += f"; parked: {parked}"
     if errors:
         line += f"; errors: {errors} (see ~/.hermes/tuner/cycle_state.json and ledger.json)"
     return line

@@ -399,3 +399,42 @@ def trial_verdict(record: FixRecord, stats_now: JobStats | None,
     else:
         better = stats_now.median_priced_cost < base
     return "keep" if better else "rollback"
+
+
+# --- early rollback ------------------------------------------------------------------
+
+# A trial is rolled back at once when its fix's own tool or reducer fails this many
+# times, or on this share of its calls.
+EARLY_FAIL_MIN = 2
+EARLY_FAIL_SHARE = 0.10
+
+def rereads(session: Session, tool: str) -> int:
+    """Re-reads in a run: over each ref read by `tool`, the reads after the first
+    (calls with no ref are not counted)."""
+    counts: dict[str, int] = {}
+    for c in session.calls:
+        if c.name == tool and c.ref is not None:
+            counts[c.ref] = counts.get(c.ref, 0) + 1
+    return sum(n - 1 for n in counts.values())
+
+
+def early_failures(kind: str, own_results: list[str], reduce_errors: int,
+                   trial_rereads: list[int], baseline_rereads: list[int],
+                   reduced: int = 0) -> tuple[int, int]:
+    """(failures, calls) of a fix's own tool or reducer during its trial.
+
+    composed_tool: `own_results` are the texts its own tool returned in the trial runs;
+    failures are those `call_failed` says failed, calls is how many there were.
+    reducer: failures are `reduce_errors` (the hook's error lines for the trial runs)
+    plus the trial runs whose re-reads exceed the mean of `baseline_rereads` (none
+    with no baseline runs); calls is `reduced`, the results it reduced. Other kinds
+    have no tool of their own: (0, 0)."""
+    if kind == "composed_tool":
+        return sum(call_failed(t) for t in own_results), len(own_results)
+    if kind == "reducer":
+        worse = 0
+        if baseline_rereads:
+            mean = sum(baseline_rereads) / len(baseline_rereads)
+            worse = sum(n > mean for n in trial_rereads)
+        return reduce_errors + worse, reduced
+    return 0, 0

@@ -624,3 +624,51 @@ def test_reducer_shadow_without_a_base_prompt_is_refused(tmp_path, base):
     with pytest.raises(ValueError):
         schedule_shadow(reducer_fix(base), live_job(), bridge, tmp_path, NOW)
     assert list(bridge.jobs) == [LIVE]
+
+
+# --- early rollback (Task 11) --------------------------------------------------------
+
+TOOL_OK = json.dumps({"result": {"messages": ["m1", "m2"]}})
+TOOL_ERR = json.dumps({"error": "output exceeds 50000 bytes"})
+
+
+def test_early_failures_batch_tool():
+    """The live calendar batch tool: 14 of 41 calls failed on the output cap."""
+    from hermes_tuner.trial import early_failures
+    own = [TOOL_OK] * 27 + [TOOL_ERR] * 14
+    assert early_failures("composed_tool", own, 0, [], []) == (14, 41)
+    # a reducer's errors and re-reads do not count for a composed tool
+    assert early_failures("composed_tool", own, 5, [9], [0]) == (14, 41)
+
+
+def test_reducer_rereads_vs_baseline():
+    """Baseline [0, 0, 3]: mean 1, median 0, max 3. Only the trial run with 2 re-reads
+    exceeds the mean. `>=` mean gives 2, median gives 2, max gives 0."""
+    from hermes_tuner.trial import early_failures
+    assert early_failures("reducer", [], 0, [1, 2, 0], [0, 0, 3], reduced=7) == (1, 7)
+    # reduce errors add to it; composed-tool results do not count for a reducer
+    assert early_failures("reducer", [TOOL_ERR] * 3, 2, [1, 2, 0], [0, 0, 3],
+                          reduced=7) == (3, 7)
+    # no baseline runs: re-reads have nothing to exceed
+    assert early_failures("reducer", [], 1, [4], [], reduced=0) == (1, 0)
+
+
+def test_early_failures_job_prompt_has_none():
+    from hermes_tuner.trial import early_failures
+    assert early_failures("job_prompt", [TOOL_ERR] * 3, 4, [5], [0], reduced=9) == (0, 0)
+
+
+def test_rereads_counts_repeats_of_the_tool_per_ref():
+    """Sum over refs of (count - 1), for calls to `tool` with a ref."""
+    from hermes_tuner.trial import rereads
+
+    def call(i, name, ref):
+        return ToolCall(f"c{i}", name, ("message_id",), ref, 10)
+    calls = [call(0, GET, "m1"), call(1, GET, "m1"), call(2, GET, "m1"),
+             call(3, GET, "m2"), call(4, GET, "m2"), call(5, GET, "m3"),
+             call(6, GET, None), call(7, GET, None), call(8, MOD, "m1"), call(9, MOD, "m1")]
+    s = Session(id="s", source="cron", job_id=LIVE, started_at=0.0, est_cost=0.0,
+                prompt_tokens=0, output_tokens=0, calls=tuple(calls))
+    assert rereads(s, GET) == 3   # m1: 2, m2: 1, m3: 0; None refs and MOD ignored
+    assert rereads(s, MOD) == 1
+    assert rereads(s, EVT) == 0

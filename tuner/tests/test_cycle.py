@@ -2098,3 +2098,260 @@ def test_global_candidates_back_off_on_their_skill_text(env):
     skill.write_text("---\nname: notes\n---\nbody, edited\n")
     c = _select_cycle(env, FakeBridge(jobs=jobs()))
     assert c._select([cand]) == [cand] and c.report.parked == 0
+
+
+# --- early rollback, trial_runs, estimate vs measured (Task 11) ---------------------------
+
+def composed_trial(env):
+    """A composed batch-tool fix taken to trial by the real cycle, live from NOW."""
+    fix = shadow_setup(env, old_mod=[], new_mod=[], composed=True, tool_results=(TOOL_OK,))
+    restarted_before_shadow(env)
+    bridge = FakeBridge(jobs=jobs())
+    run_cycle(env, bridge, NOW)
+    led = Ledger.load(env.root)
+    rec = led.get(fix.id)
+    assert rec.state == "trial", rec.reason
+    rec.live_from = NOW
+    led.save()
+    return fix, bridge
+
+
+def own_tool_runs(results_per_run, cost=0.04):
+    """Triage runs on the days after NOW, each calling tuned_triage once per result,
+    then reading a message (a result that is not a composed tool's: not its own)."""
+    base = NOW - 3 * 3600 + 7 * 3600
+    return [{"id": sid(TRIAGE, base + (i + 1) * DAY), "source": "cron",
+             "started_at": base + (i + 1) * DAY, "in": tok(cost) - 1000, "out": 1000,
+             "calls": [("tuned_triage", {}, r) for r in results]
+             + [(GET, {"message_id": "m"}, "b")]}
+            for i, results in enumerate(results_per_run)]
+
+
+@pytest.mark.parametrize("errors, calls, rolled", [
+    (14, 41, True),    # the live calendar batch tool
+    (1, 11, False),    # 9%: under 10% and fewer than 2
+    (1, 10, True),     # 10% exactly
+    (2, 30, True),     # 2 failures, under 10%
+])
+def test_batch_tool_rolls_back_early(env, errors, calls, rolled):
+    fix, bridge = composed_trial(env)
+    results = [TOOL_ERR] * errors + [TOOL_OK] * (calls - errors)
+    later = own_tool_runs([results[:calls // 2], results[calls // 2:]])  # 2 runs: short of 5
+    env.db.unlink()
+    build(env, SETUP_SESSIONS[env.root] + later)
+    report = run_cycle(env, bridge, NOW + 3 * DAY)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert rec.trial_runs == 2
+    if not rolled:
+        assert rec.state == "trial" and rec.measured_saving_per_run is None
+        assert bridge.jobs[TRIAGE]["prompt"] == "new prompt"
+        return
+    assert rec.state == "rolled_back" and fix.id in report.rolled_back
+    assert rec.reason == f"trial: {errors} failures in {calls} calls (early)"
+    assert bridge.jobs[TRIAGE]["prompt"] == "Triage the inbox."
+    # baseline runs at $0.10, trial runs at $0.04
+    assert rec.measured_saving_per_run == pytest.approx(0.06, abs=1e-4)
+
+
+def test_early_rollback_runs_without_pricing(env):
+    fix, bridge = composed_trial(env)
+    later = own_tool_runs([[TOOL_ERR] * 7 + [TOOL_OK] * 13, [TOOL_ERR] * 7 + [TOOL_OK] * 14])
+    env.db.unlink()
+    build(env, SETUP_SESSIONS[env.root] + later)
+    bridge.fail = {"pricing"}
+    st = state(env)
+    del st["pricing"]  # no cached list either
+    (env.root / "cycle_state.json").write_text(json.dumps(st))
+    report = run_cycle(env, bridge, NOW + 3 * DAY)
+    assert "no model pricing" in report.errors
+    rec = Ledger.load(env.root).get(fix.id)
+    assert rec.state == "rolled_back", rec.reason
+    assert rec.reason == "trial: 14 failures in 41 calls (early)"
+    assert rec.measured_saving_per_run is None  # no price list to measure with
+
+
+def reducer_trial(env, case):
+    """A calendar reducer on trial, live 5 days: baseline runs (days 6-30) read each
+    message once; 4 trial runs (days 1-4). Events: 20 reductions and 1 error in the
+    trial runs, 1 error in a baseline run (not the trial's), a trial line with neither
+    key, 2 unreadable lines.
+    case "child": a second trial error, logged under a compressed child's id.
+    case "reread": trial run 3 reads m3 twice (1 re-read; the baseline mean is 0)."""
+    base = NOW - 3 * 3600 + 6 * 3600
+    live = NOW - 5 * DAY
+
+    def run(d, calls):
+        return {"id": sid(CAL, base - d * DAY), "source": "cron", "started_at": base - d * DAY,
+                "in": tok(0.10) - 500, "out": 500, "calls": calls}
+    sessions = [run(d, [(GET, {"message_id": f"m{d}"}, "b")]) for d in range(6, 31)]
+    trial_ids = []
+    for d in (4, 3, 2, 1):
+        calls = [(GET, {"message_id": f"m{d}"}, "b")]
+        if case == "reread" and d == 3:
+            calls.append((GET, {"message_id": "m3"}, "b"))
+        sessions.append(run(d, calls))
+        trial_ids.append(sessions[-1]["id"])
+    child = "20261017_064500_abcd12"
+    if case == "child":
+        sessions[-2]["end_reason"] = "compression"
+        sessions.append({"id": child, "source": "cron", "started_at": base - 2 * DAY + 300,
+                         "parent": trial_ids[2], "calls": []})
+    build(env, sessions)
+    payload = {"tool": GET, "job": CAL, "steps": [{"op": "collapse_ws"}], "_base": CAL_BASE}
+    fix = Fix(RFIX, "reducer", CAL, payload, "bytes:" + GET)
+    led = add_record(env, FixRecord(fix.id, "reducer", CAL, fix.candidate_key, "trial",
+                                    live - DAY, applied_at=live, live_from=live,
+                                    baseline_runs=[brk(0.10)] * 10), fix)
+    vdir = led.version_dir(fix.id)
+    (vdir / "before.json").write_text(json.dumps({"tool": None, "job": None}))
+    (vdir / "after.json").write_text(json.dumps(payload))
+    events = [{"session_id": trial_ids[i % 4], "tool_call_id": f"c{i}", "before": 9,
+               "after": 4} for i in range(20)]
+    events.append({"session_id": trial_ids[0], "tool_call_id": "e0", "error": "TypeError"})
+    events.append({"session_id": sid(CAL, base - 10 * DAY), "tool_call_id": "e1",
+                   "error": "ambiguous"})
+    if case == "child":
+        events.append({"session_id": child, "tool_call_id": "e2", "error": "ambiguous"})
+    d = env.root / "reducer_events"
+    d.mkdir()
+    events.append({"session_id": trial_ids[1], "tool_call_id": "x"})  # neither: not a call
+    (d / f"{fix.id}.jsonl").write_text("\n".join(
+        [json.dumps(e) for e in events] + ["{broken", "[1]"]) + "\n")
+    return fix
+
+
+@pytest.mark.parametrize("case", ["none", "child", "reread"])
+def test_reducer_trial_rolls_back_early(env, case):
+    fix = reducer_trial(env, case)
+    report = run_cycle(env, FakeBridge(jobs=jobs()), NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert rec.trial_runs == 4
+    if case == "none":  # 1 failure in 20 calls: 5%
+        assert rec.state == "trial", rec.reason
+        return
+    assert rec.state == "rolled_back" and fix.id in report.rolled_back
+    assert rec.reason == "trial: 2 failures in 20 calls (early)"
+
+
+def test_trial_runs_written(env):
+    """4 runs since live_from (plus an outage run with no calls, and a shadow run):
+    trial_runs is 4, saved although the verdict is continue."""
+    base = NOW - 3 * 3600 + 6 * 3600
+    sessions = cal_runs(range(1, 5), 0.05) + cal_runs(range(6, 30), 0.50)
+    sessions.append({"id": sid(CAL, base - 4.5 * DAY), "source": "cron",
+                     "started_at": base - 4.5 * DAY, "in": 100, "out": 0, "calls": []})
+    sessions.append({"id": sid(SHADOW_JOB, base - 3.5 * DAY), "source": "cron",
+                     "started_at": base - 3.5 * DAY, "in": 100, "out": 0,
+                     "calls": [("mcp__google__get_events", {}, "events")]})
+    build(env, sessions)
+    (env.root / "shadow_jobs.json").write_text(json.dumps({SHADOW_JOB: {
+        "fix_id": "x", "live_job_id": CAL, "run_at": base - 3.5 * DAY,
+        "created_at": base - 4 * DAY, "scheduled_at": base - 4 * DAY,
+        "removed_at": base - 3 * DAY}}))
+    fix = Fix("20261013-cccc0007", "job_prompt", CAL, {"prompt": "p", "add_toolsets": []},
+              "seq:cal")
+    add_record(env, FixRecord(fix.id, fix.kind, CAL, fix.candidate_key, "trial", NOW - 5 * DAY,
+                              applied_at=NOW - 5 * DAY, live_from=NOW - 5 * DAY,
+                              baseline_runs=[brk(0.50, 500)] * 10), fix)
+    run_cycle(env, FakeBridge(jobs=jobs()), NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert rec.state == "trial" and rec.trial_runs == 4
+
+
+@pytest.mark.parametrize("trial_cost, state, measured", [(0.05, "kept", 0.45),
+                                                          (0.60, "rolled_back", -0.10)])
+def test_measured_saving_recorded_on_verdict(env, trial_cost, state, measured):
+    """Baseline median $0.50; 9 trial runs at `trial_cost` (one costlier outlier
+    shows the median, not the mean, is used)."""
+    runs = cal_runs(range(1, 9), trial_cost) + cal_runs([9], 5.0)
+    build(env, runs)
+    fix = Fix("20261009-cccc0002", "job_prompt", CAL, {"prompt": "p", "add_toolsets": []},
+              "seq:cal")
+    led = add_record(env, FixRecord(fix.id, fix.kind, CAL, fix.candidate_key, "trial",
+                                    NOW - 10 * DAY, applied_at=NOW - 10 * DAY,
+                                    live_from=NOW - 10 * DAY,
+                                    baseline_runs=[brk(0.50, 500)] * 9 + [brk(9.0, 500)]), fix)
+    vdir = led.version_dir(fix.id)
+    (vdir / "before.json").write_text(json.dumps(
+        {"prompt": "Sync the calendar.", "enabled_toolsets": ["google"]}))
+    (vdir / "after.json").write_text(json.dumps({"prompt": "p", "enabled_toolsets": ["google"]}))
+    js = jobs()
+    js[CAL]["prompt"] = "p"
+    run_cycle(env, FakeBridge(jobs=js), NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert rec.state == state and rec.trial_runs == 9
+    assert rec.measured_saving_per_run == pytest.approx(measured, abs=1e-4)
+
+
+def test_deadline_rollback_records_no_measured_saving(env):
+    """2 runs since live_from 21 days ago: no verdict, rolled back at the deadline. Both
+    sides have runs and there is a price list, but a deadline measures nothing."""
+    build(env, triage_runs(range(22, 40)) + triage_runs([1, 2]))
+    fix = Fix("20260928-aaaa0009", "job_prompt", TRIAGE, {"prompt": "p", "add_toolsets": []},
+              "seq:x")
+    led = add_record(env, FixRecord(fix.id, fix.kind, TRIAGE, "seq:x", "trial", NOW - 21 * DAY,
+                                    applied_at=NOW - 21 * DAY, baseline_runs=[brk(0.10)] * 10,
+                                    live_from=NOW - 21 * DAY), fix)
+    vdir = led.version_dir(fix.id)
+    (vdir / "before.json").write_text(json.dumps(
+        {"prompt": "Triage the inbox.", "enabled_toolsets": ["google"]}))
+    (vdir / "after.json").write_text(json.dumps({"prompt": "p", "enabled_toolsets": ["google"]}))
+    js = jobs()
+    js[TRIAGE]["prompt"] = "p"
+    run_cycle(env, FakeBridge(jobs=js), NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert rec.state == "rolled_back" and rec.reason == "no verdict in 21 days"
+    assert rec.trial_runs == 2 and rec.measured_saving_per_run is None
+
+
+def decided(led, i, state, days_ago, est, meas):
+    led.records.append(FixRecord(f"20260901-eeee000{i}", "reducer", CAL, f"k{i}", state,
+                                 NOW - 40 * DAY, decided_at=NOW - days_ago * DAY,
+                                 est_saving_per_run=est, measured_saving_per_run=meas))
+
+
+def test_weekly_line_estimates(tmp_path):
+    led = Ledger(tmp_path)
+    decided(led, 1, "kept", 2, 0.02, 0.01)
+    assert weekly_line(led, [], NOW, FLAT).endswith(
+        "; estimates: $0.02 vs measured $0.01 per run over 1 fixes")
+
+
+def test_weekly_line_estimates_sum_decided_fixes_of_28_days(tmp_path):
+    led = Ledger(tmp_path)
+    decided(led, 1, "kept", 2, 0.02, 0.01)
+    decided(led, 2, "rolled_back", 28 - 1 / 24, 0.03, -0.04)   # 27 days 23 h ago: in
+    decided(led, 3, "kept", 28, 1.00, 1.00)                    # 28 days ago: out
+    decided(led, 4, "kept", 3, 1.00, None)                     # no measurement: out
+    decided(led, 5, "rolled_back", 3, None, 1.00)              # no estimate: out
+    decided(led, 6, "trial", 3, 1.00, 1.00)                    # not decided: out
+    line = weekly_line(led, [], NOW, FLAT)
+    assert line.endswith("; estimates: $0.05 vs measured -$0.03 per run over 2 fixes")
+
+
+def test_weekly_line_without_estimates_or_pricing_has_no_clause(tmp_path):
+    led = Ledger(tmp_path)
+    decided(led, 4, "kept", 3, 1.00, None)
+    assert "estimates" not in weekly_line(led, [], NOW, FLAT)
+    decided(led, 1, "kept", 2, 0.02, 0.01)
+    assert "estimates" not in weekly_line(led, [], NOW, None)  # no dollars without a list
+
+
+def test_weekly_line_parked(tmp_path):
+    led = Ledger(tmp_path)
+    decided(led, 1, "kept", 2, 0.02, 0.01)
+    assert weekly_line(led, [], NOW, FLAT, errors=1, parked=3) == (
+        "Hermes tuner: saved ~$0.00 this week (ESTIMATE at fake-model list prices, "
+        "fake-flat), 0 applied, 1 kept, 0 rolled back; tuner spent $0.00"
+        "; estimates: $0.02 vs measured $0.01 per run over 1 fixes; parked: 3"
+        "; errors: 1 (see ~/.hermes/tuner/cycle_state.json and ledger.json)")
+    assert "parked" not in weekly_line(led, [], NOW, FLAT, parked=0)
+
+
+def test_cycle_weekly_line_reports_parked(env):
+    c = _select_cycle(env, FakeBridge(jobs=jobs()))
+    c.sessions, c.pricing, c.shadow_ids = [], FLAT, set()
+    c.report.parked = 2
+    c.weekly()
+    assert c.report.weekly.endswith("; parked: 2")
+    assert (env.root / "outbox" / "weekly-2026-W43.txt").read_text().endswith("; parked: 2\n")
