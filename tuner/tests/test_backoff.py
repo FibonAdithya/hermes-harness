@@ -63,7 +63,7 @@ def test_copy_fields_lists_paths_without_payload_prefix():
     r = rej("reducer", f"payload.steps[0].keep_hosts[1]: {COPY}; payload.program: scanner "
                        f"finding x; payload.program: {COPY}; payload.steps[0].keep_hosts[1]: "
                        f"{COPY}", 1.0)
-    assert copy_fields(r) == ["steps[0].keep_hosts[1]", "program"]
+    assert copy_fields(r) == ["steps", "program"]
 
 
 def test_copy_fields_empty_for_other_rejections():
@@ -72,12 +72,27 @@ def test_copy_fields_empty_for_other_rejections():
     assert copy_fields(rec("job_prompt", "shadow_failed", f"payload.prompt: {COPY}", 1.0)) == []
 
 
-def test_copy_fields_drop_model_written_keys():
-    """A path segment is a payload key the model chose (parameters.properties.<k>), so
-    it could carry copied text. Only identifier-shaped segments are sent."""
+def test_copy_fields_name_only_the_top_level_field():
+    """Deeper path segments are payload keys the model chose (parameters.properties.<k>),
+    and a key flagged as copied is copied text: only the top-level field is named."""
+    r = rej("composed_tool", f"payload.parameters.properties.Receipts.description: {COPY}",
+            1.0)
+    assert copy_fields(r) == ["parameters"]
     r = rej("composed_tool", f"payload.parameters.properties.Bank of X <a@b.c>: {COPY}; "
-                             f"payload.parameters.properties.ids.<key>: {COPY}", 1.0)
-    assert copy_fields(r) == ["?", "parameters.properties.ids.<key>"]
+                             f"payload.parameters.properties.ids.<key>: {COPY}; "
+                             f"payload.replay_inputs[0].arg: {COPY}", 1.0)
+    assert copy_fields(r) == ["parameters", "replay_inputs"]
+
+
+def test_copied_key_never_reaches_the_next_request():
+    from hermes_tuner.detect import Candidate
+    from hermes_tuner.draft import build_request
+    r = rej("composed_tool", f"payload.parameters.properties.Receipts.description: {COPY}",
+            1.0)
+    cand = Candidate("sequence", KEY, "job", 3, 3, 10, 1.0)
+    _i, user = build_request(cand, None, None, {}, [], history=draft_history([r], KEY))
+    assert "Receipts" not in user
+    assert json.loads(user)["history"][0]["fields"] == ["parameters"]
 
 
 def test_input_hash_is_sha256_of_prompt_and_skill_text():
@@ -97,7 +112,7 @@ def test_three_copy_rejections_park():      # acceptance check 5
     assert backoff(recs, KEY, h, DAY * 4) == "parked"
     assert backoff(recs, KEY, "other-hash", DAY * 4) == "skip"   # inputs changed: newest 1 day old
     assert backoff(recs, KEY, "other-hash", DAY * 11) == "ok"    # and 8 days later it may draft
-    assert backoff(recs, KEY, h, DAY * 30) == "parked"           # parking has no end date
+    assert backoff(recs, KEY, h, DAY * 30) == "parked"           # within PARK_MAX_DAYS
 
 
 def test_parking_reads_the_newest_records_hash():
@@ -107,6 +122,40 @@ def test_parking_reads_the_newest_records_hash():
     assert backoff(recs, KEY, h, DAY * 20) == "parked"
     recs[-1].input_hash = "old"
     assert backoff(recs, KEY, h, DAY * 20) == "ok"
+
+
+@pytest.mark.parametrize("kind, reason", [
+    ("bridge_error", "drafting call failed: 402 credits exhausted"),   # class timeout
+    ("reducer", "reducer search: saving_below_floor"),                 # kind reducer
+])
+def test_failures_the_inputs_did_not_cause_never_park(kind, reason):
+    """The review's probes: three identical outcomes on days 1, 2 and 9 skip while the
+    newest is under 7 days old, and are not parked at day 60."""
+    recs = [rej(kind, reason, DAY * d) for d in (1, 2, 9)]
+    assert backoff(recs, KEY, h, DAY * 9 + 1) == "skip"
+    assert backoff(recs, KEY, h, DAY * 16 - 1) == "skip"
+    assert backoff(recs, KEY, h, DAY * 16) == "ok"
+    assert backoff(recs, KEY, h, DAY * 60) == "ok"
+
+
+def test_bridge_error_state_never_parks():
+    recs = [rec("composed_tool", "bridge_error", "scan: timed out", DAY * d) for d in (1, 2, 9)]
+    assert backoff(recs, KEY, h, DAY * 9 + 1) == "skip"
+    assert backoff(recs, KEY, h, DAY * 60) == "ok"
+
+
+def test_copy_rejections_on_days_1_2_9_still_park():
+    """The control for the probes: a copy rejection is caused by the draft's inputs."""
+    recs = [rej("composed_tool", f"payload.program: {COPY}", DAY * d) for d in (1, 2, 9)]
+    assert backoff(recs, KEY, h, DAY * 20) == "parked"
+
+
+def test_parking_ends_28_days_after_the_newest():
+    from hermes_tuner import policy
+    assert policy.PARK_MAX_DAYS == 28
+    recs = [rej("composed_tool", f"payload.program: {COPY}", DAY * d) for d in (1, 2, 3)]
+    assert backoff(recs, KEY, h, DAY * 31 - 1) == "parked"
+    assert backoff(recs, KEY, h, DAY * 31) == "ok"
 
 
 def test_two_same_skip_then_ok_after_7_days():

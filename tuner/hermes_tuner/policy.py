@@ -121,6 +121,10 @@ JOB_MARGIN_MIN = 15
 # Carried-bytes ranking (tuner design 2026-10-28).
 CHARS_PER_TOKEN = 4  # ESTIMATE: messages.token_count is NULL on every tool row
 MIN_DRAFT_MONTHLY_USD = 0.05  # ESTIMATE
+# A parked candidate (backoff) may draft again this many days after its newest
+# outcome: the drafting request's tool schemas are not hashed (it sends {}), so a
+# change there could not unpark it otherwise.
+PARK_MAX_DAYS = 28
 
 # Result reducers (tuner design 2026-10-28). Calendar sync only.
 REDUCER_JOBS = frozenset({"cc68e24f21cd"})

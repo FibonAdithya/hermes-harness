@@ -118,12 +118,11 @@ _CLEANERS = {"composed_tool": _clean_composed, "job_prompt": _clean_job_prompt,
 _NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 _ARG_KEY = re.compile(r"[A-Za-z0-9_]{1,40}")
 MAX_SHAPE_CALLS = 200
-# Drafting history (backoff.draft_history): its reason classes, and its field paths as
-# limits._strings builds them (payload keys joined by ".", list indices as [i], "<key>"
-# for a dict key itself), or "?". Model-chosen keys could hold copied text, so only
-# identifier-shaped segments pass.
-FIELD_RE = re.compile(r"\?|[A-Za-z0-9_]{1,40}(?:\[\d{1,6}\])*"
-                    r"(?:\.(?:[A-Za-z0-9_]{1,40}|<key>)(?:\[\d{1,6}\])*){0,8}")
+# Drafting history (backoff.draft_history): its reason classes, and the top-level
+# payload fields a copy rejection named. Deeper path segments are keys the model chose
+# (parameters.properties.<k>), and one flagged as copied is copied text, so only the
+# first segment is sent; it must be identifier-shaped, else "?".
+_TOP_FIELD = re.compile(r"[A-Za-z0-9_]{1,40}")
 REASON_CLASSES = frozenset({"copy", "replay_limit", "replay", "timeout", "unparseable",
                             "shadow", "limits", "trial", ""})
 HISTORY_LEN = 3
@@ -149,6 +148,25 @@ def turn_layout(calls: Iterable[ToolCall]) -> list[int]:
     return [counts[t] for t in sorted(counts)]
 
 
+def top_field(path: Any) -> str:
+    """The top-level payload field of a path ("steps[0].keep_hosts[1]" -> "steps"),
+    or "?" when it is not identifier-shaped."""
+    if not isinstance(path, str):
+        return "?"
+    head = re.split(r"[.\[]", path, maxsplit=1)[0]
+    return head if _TOP_FIELD.fullmatch(head) else "?"
+
+
+def top_fields(paths: Iterable[Any]) -> list[str]:
+    """top_field of each path, deduplicated, in order."""
+    out: list[str] = []
+    for p in paths:
+        f = top_field(p)
+        if f not in out:
+            out.append(f)
+    return out
+
+
 def _history(history: list[dict] | None) -> list[dict]:
     """At most HISTORY_LEN entries of the four keys, every value identifier-shaped:
     a ledger reason string never reaches the model (backoff.draft_history)."""
@@ -160,7 +178,7 @@ def _history(history: list[dict] | None) -> list[dict]:
         out.append({"kind": _safe(e.get("kind"), _NAME), "state": _safe(e.get("state"), _NAME),
                      "reason_class": e.get("reason_class") if e.get("reason_class") in
                      REASON_CLASSES else "?",
-                     "fields": [_safe(f, FIELD_RE) for f in fields][:MAX_HISTORY_FIELDS]
+                     "fields": top_fields(fields)[:MAX_HISTORY_FIELDS]
                      if isinstance(fields, list) else []})
     return out
 

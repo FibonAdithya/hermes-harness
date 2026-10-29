@@ -403,7 +403,7 @@ def test_request_carries_the_drafting_history():
             {"kind": "unparseable", "state": "rejected", "reason_class": "unparseable",
              "fields": []}]
     instr, user = D.build_request(CAND, None, None, {}, [], history=hist)
-    assert json.loads(user)["history"] == hist
+    assert json.loads(user)["history"] == [dict(hist[0], fields=["program", "steps"]), hist[1]]
     assert HISTORY_SENTENCE in instr and instr == D.INSTRUCTIONS
 
 
@@ -411,15 +411,16 @@ def test_request_history_keeps_only_safe_values():
     """Only the four keys, at most 3 entries, and identifier-shaped values: a reason
     string or a field holding copied text never reaches the model."""
     hist = [{"kind": "composed_tool", "state": "rejected", "reason_class": "copy",
-             "fields": ["program", "Bank of X <a@b.c>"], "reason": "SECRET_reason"},
+             "fields": ["program", "Bank of X <a@b.c>", "parameters.properties.Receipts",
+                        "program"], "reason": "SECRET_reason"},
             {"kind": "SECRET kind!", "state": "rejected", "reason_class": "limits",
              "fields": "program"}] + [{"kind": "job_prompt", "state": "kept",
                                        "reason_class": "", "fields": []}] * 3
     _i, user = D.build_request(CAND, None, None, {}, [], history=hist)
     doc = json.loads(user)["history"]
-    assert "SECRET" not in user and "Bank" not in user
+    assert "SECRET" not in user and "Bank" not in user and "Receipts" not in user
     assert doc[0] == {"kind": "composed_tool", "state": "rejected", "reason_class": "copy",
-                      "fields": ["program", "?"]}
+                      "fields": ["program", "?", "parameters"]}
     assert doc[1] == {"kind": "?", "state": "rejected", "reason_class": "limits", "fields": []}
     assert len(doc) == 3
 
