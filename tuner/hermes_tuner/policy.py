@@ -132,6 +132,13 @@ REDUCER_TOOLS = frozenset({
 # A subdomain matches too: us02web.zoom.us matches zoom.us.
 MEETING_HOSTS = frozenset({"meet.google.com", "zoom.us", "teams.microsoft.com"})
 REDUCER_CAP_LADDER = (16000, 8000, 4000, 2000)
+# A reducer is drafted only if it cuts at least this share of the tool's replayed
+# bytes (ESTIMATE, tunable; below the measured one-third).
+REDUCER_MIN_CUT = 0.15
+# The greedy search stops when the best next step cuts less than this share more.
+REDUCER_STEP_MIN = 0.02
+# Fewer replayed runs with a result for the tool than this: no reducer.
+REPLAY_MIN_SESSIONS = 3
 
 # Replay used-string check (tuner design 2026-10-28). A reducer goes live only if
 # every string the model reused verbatim from a result survives the reduction.

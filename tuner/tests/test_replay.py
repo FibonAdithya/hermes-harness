@@ -2,6 +2,8 @@ import json
 import random
 import time
 
+import pytest
+
 from hermes_tuner import policy
 from hermes_tuner.replay import boilerplate, norm, survives, used_strings
 
@@ -182,3 +184,215 @@ def test_boilerplate_counts_results_not_used_sets():
 def test_boilerplate_reads_normalised_text_view():
     results = [json.dumps({"result": "Weekly\nStandup " + x}) for x in "abc"] + ["d nothing"]
     assert boilerplate([_S], results) == frozenset({_S})
+
+
+# --- Task 6: greedy reducer search on replay -------------------------------------
+# Synthetic text only. Results use the live shape: the same text under `result` and
+# `structuredContent.result`.
+
+from factory import NOUS_V4_PRO  # noqa: E402
+from hermes_tuner.detect import carried_usd  # noqa: E402
+from hermes_tuner.history import ReplayCall, ReplayRun  # noqa: E402
+from hermes_tuner.reducers import apply_reducer, validate_spec  # noqa: E402
+from hermes_tuner.replay import search_reducer  # noqa: E402
+
+GMAIL_GET = "mcp__google__get_gmail_message_content"
+CAL = "cc68e24f21cd"
+_TRACK = "https://click.example-mail.com/ls/click?upn=" + "a1b2c3d4" * 20
+
+
+def _live(text):
+    return json.dumps({"result": text, "structuredContent": {"result": text}}, ensure_ascii=False)
+
+
+def _single(text):
+    # One copy of the text plus a small id, so dropping "result" really cuts bytes.
+    return json.dumps({"result": text, "id": "msg-0001"}, ensure_ascii=False)
+
+
+def _email(i, schemeless=False):
+    subject = f"Board games night number {i} at the Crown"
+    zoom = f"https://us02web.zoom.us/j/88{i:08d}"
+    event = f"https://tickets.example-venue.org/e/{42 + i}"
+    html = (f"<html><head><style>{'.x{color:red} ' * 40}</style></head><body>"
+            f"<h1>{subject}</h1><div><p>Hello, join us this week.</p>"
+            f"<p>Join on Zoom: {zoom}</p><p>Tickets: {event}</p>"
+            + "".join(f"<p>Read more: {_TRACK}{i}{k}</p>" for k in range(5))
+            + "<p>" + "Some news text here. " * 30 + "</p>"
+            "<footer><p>Unsubscribe here</p><p>Privacy policy</p></footer></body></html>")
+    quoted = event.split("://", 1)[1] if schemeless else event
+    return html, (subject, zoom, quoted)
+
+
+def _newsletter(i):
+    return (f"Weekly digest {i}\n" + "".join(f"Story {k}: {_TRACK}n{i}{k}\n" for k in range(4))
+            + "Plain words for the digest. " * 20)
+
+
+def _call(pos, text, name=GMAIL_GET, later_turns=3):
+    return ReplayCall(pos=pos, call_id=f"c{pos}", name=name, args={}, text=text,
+                      chars=len(text), turn=pos, later_turns=later_turns, ref=None)
+
+
+def _run(i, calls, said):
+    return ReplayRun(session_id=f"cron_{CAL}_{i}", started_at=float(i), calls=tuple(calls),
+                     said=tuple(said))
+
+
+def _gmail_runs(n=4, wrap=_live, schemeless=False):
+    runs = []
+    for i in range(n):
+        html, quoted = _email(i, schemeless)
+        calls = [_call(1, wrap(html)), _call(2, wrap(_newsletter(i)))]
+        runs.append(_run(i, calls, [(3, q) for q in quoted]))
+    return runs
+
+
+def _all_calls(runs, tool=GMAIL_GET):
+    return [c for r in runs for c in r.calls if c.name == tool]
+
+
+def test_search_cuts_and_keeps_used():
+    runs = _gmail_runs()
+    r = search_reducer(runs, GMAIL_GET, CAL, exclude=[], pricing=NOUS_V4_PRO)
+    assert r.reason == "ok" and r.used_kept == r.used_total > 0
+    assert r.bytes_after <= 0.5 * r.bytes_before        # the duplicate alone is half
+    steps = r.spec["steps"]
+    assert {"op": "drop_fields", "fields": ["structuredContent"]} in steps
+    ops = [s["op"] for s in steps]
+    assert "html_to_text" in ops and "shorten_urls" in ops
+    keep = next(s for s in steps if s["op"] == "shorten_urls")["keep_hosts"]
+    assert "tickets.example-venue.org" in keep           # a used non-meeting host is kept
+    assert keep == sorted(keep)
+    # drop_footer would cut a little more, but under REDUCER_STEP_MIN: the search stops.
+    more = {**r.spec, "steps": steps + [{"op": "drop_footer"}]}
+    extra = r.bytes_after - sum(len(apply_reducer(more, c.text)) for c in _all_calls(runs))
+    assert 0 < extra < policy.REDUCER_STEP_MIN * r.bytes_before and "drop_footer" not in ops
+    assert r.spec["tool"] == GMAIL_GET and r.spec["job"] == CAL and validate_spec(r.spec) == []
+    calls = _all_calls(runs)
+    assert (r.sessions, r.results) == (4, 8)
+    assert r.bytes_before == sum(len(c.text) for c in calls)
+    assert r.bytes_after == sum(len(apply_reducer(r.spec, c.text)) for c in calls)
+    saving = sum(carried_usd(c.chars, c.later_turns, NOUS_V4_PRO)
+                 - carried_usd(len(apply_reducer(r.spec, c.text)), c.later_turns, NOUS_V4_PRO)
+                 for c in calls)
+    assert r.est_saving_per_run == pytest.approx(saving / 4) and r.est_saving_per_run > 0
+    per = [(c, used_strings(c.text, [t for p, t in run.said if p > c.pos], []))
+           for run in runs for c in run.calls]
+    bp = boilerplate(set().union(*(u for _, u in per)), [c.text for c in calls])
+    assert "https://" in bp                              # in every result: needn't survive
+    need = [(c, u - bp) for c, u in per]
+    assert sum(len(u) for _, u in need) == r.used_total
+    for c, u in need:                                    # every quoted string is still there
+        assert all(survives(s, apply_reducer(r.spec, c.text)) for s in u)
+
+
+def test_search_keeps_host_of_schemeless_used_url():
+    # The model quoted "tickets.example-venue.org/e/42" without its scheme.
+    r = search_reducer(_gmail_runs(schemeless=True), GMAIL_GET, CAL, [], NOUS_V4_PRO)
+    keep = next(s for s in r.spec["steps"] if s["op"] == "shorten_urls")["keep_hosts"]
+    assert "tickets.example-venue.org" in keep
+
+
+def test_search_never_drops_the_only_copy():
+    # results {"result": text, "id": ...}: dropping "result" would lose every used string
+    single_copy_runs = _gmail_runs(wrap=_single)
+    r = search_reducer(single_copy_runs, GMAIL_GET, CAL, [], NOUS_V4_PRO)
+    assert r.reason == "ok"
+    assert all(s["op"] != "drop_fields" for s in r.spec["steps"])
+    assert r.used_kept == r.used_total > 0
+
+
+_FILL = "lorem ipsum dolor sit amet " * 1000
+
+
+def test_search_refuses_cap_that_cuts_used_text():
+    runs = []
+    for i in range(3):
+        quote = f"Quarterly review number {i} with Priya Raman"
+        text = _FILL[:9000] + " " + quote + " " + _FILL[:15000]
+        assert text.index(quote) == 9001
+        runs.append(_run(i, [_call(1, _live(text))], [(2, quote)]))
+    r = search_reducer(runs, GMAIL_GET, CAL, [], NOUS_V4_PRO)
+    assert r.reason == "ok" and r.used_kept == r.used_total == 3
+    caps = [s["chars"] for s in r.spec["steps"] if s["op"] == "cap"]
+    assert caps == [16000]                    # 8000 and below would cut the quote
+
+
+def test_search_no_runs():   # Review Focus 4
+    r = search_reducer([], GMAIL_GET, CAL, [], NOUS_V4_PRO)
+    assert r.reason == "no_runs" and r.spec is None
+    assert (r.sessions, r.results, r.bytes_before, r.bytes_after) == (0, 0, 0, 0)
+    assert r.est_saving_per_run == 0.0
+    other = [_run(0, [_call(1, _live("x" * 500), name="mcp__google__get_events")], [])]
+    assert search_reducer(other, GMAIL_GET, CAL, [], NOUS_V4_PRO).reason == "no_runs"
+
+
+def test_search_too_few_sessions():
+    runs = _gmail_runs(n=2)
+    assert policy.REPLAY_MIN_SESSIONS == 3
+    r = search_reducer(runs, GMAIL_GET, CAL, [], NOUS_V4_PRO)
+    assert r.reason == "too_few_sessions" and r.spec is None
+    assert (r.sessions, r.results) == (2, 4)
+    assert r.bytes_before == sum(len(c.text) for c in _all_calls(runs))
+
+
+def test_search_cut_below_min():
+    # Short plain single-copy text: nothing worth cutting.
+    runs = [_run(i, [_call(1, json.dumps({"result": f"Note {i}: dentist on Friday at noon"}))],
+                 [(2, "dentist on Friday")]) for i in range(3)]
+    r = search_reducer(runs, GMAIL_GET, CAL, [], NOUS_V4_PRO)
+    assert r.reason == "cut_below_min" and r.spec is None
+    assert r.bytes_after == r.bytes_before > 0
+    assert policy.REDUCER_MIN_CUT == 0.15 and policy.REDUCER_STEP_MIN == 0.02
+
+
+def test_search_counts_runs_with_a_result_as_sessions():
+    runs = _gmail_runs(n=3) + [_run(9, [_call(1, "x" * 50, name="mcp__google__get_events")], [])]
+    r = search_reducer(runs, GMAIL_GET, CAL, [], NOUS_V4_PRO)
+    assert (r.sessions, r.results, r.reason) == (3, 6, "ok")
+
+
+def test_search_is_deterministic():
+    runs = _gmail_runs()
+    a = search_reducer(runs, GMAIL_GET, CAL, [], NOUS_V4_PRO)
+    b = search_reducer(runs, GMAIL_GET, CAL, [], NOUS_V4_PRO)
+    c = search_reducer(list(reversed(runs)), GMAIL_GET, CAL, [], NOUS_V4_PRO)
+    assert a == b and a.spec == c.spec
+
+
+def test_search_ignores_text_said_before_the_call():
+    # The quote was said before the call (pos 0 < 1): not a used string, so the
+    # smallest cap is free to cut it.
+    runs = []
+    for i in range(3):
+        quote = f"Quarterly review number {i} with Priya Raman"
+        text = _FILL[:9000] + " " + quote + " " + _FILL[:15000]
+        runs.append(_run(i, [_call(1, _live(text))], [(0, quote)]))
+    r = search_reducer(runs, GMAIL_GET, CAL, [], NOUS_V4_PRO)
+    assert r.used_total == 0
+    assert [s["chars"] for s in r.spec["steps"] if s["op"] == "cap"] == [2000]
+
+
+def test_search_merges_dropped_fields_into_one_step():
+    runs = []
+    for i in range(3):
+        html, quoted = _email(i)
+        text = json.dumps({"result": html, "structuredContent": {"result": html},
+                           "raw": "QUJDRA" * 400}, ensure_ascii=False)
+        runs.append(_run(i, [_call(1, text)], [(2, q) for q in quoted]))
+    r = search_reducer(runs, GMAIL_GET, CAL, [], NOUS_V4_PRO)
+    drops = [s for s in r.spec["steps"] if s["op"] == "drop_fields"]
+    assert drops == [{"op": "drop_fields", "fields": ["raw", "structuredContent"]}]
+    assert validate_spec(r.spec) == []
+
+
+def test_search_tie_goes_to_first_listed_key():
+    # "b" and "a" hold copies of equal length: dropping either cuts the same bytes.
+    runs = []
+    for i in range(3):
+        quote = f"Quarterly review number {i} with Priya Raman"
+        text = quote + " " + _FILL[:3000]
+        runs.append(_run(i, [_call(1, json.dumps({"b": text, "a": text}))], [(2, quote)]))
+    r = search_reducer(runs, GMAIL_GET, CAL, [], NOUS_V4_PRO)
+    assert r.spec["steps"][0] == {"op": "drop_fields", "fields": ["a"]}
