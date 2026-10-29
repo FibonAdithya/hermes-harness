@@ -1528,12 +1528,15 @@ def test_no_second_reducer_for_same_tool(env, kept_tool, blocked):
     report = run_cycle(env, bridge, NOW)
     led = Ledger.load(env.root)
     assert oneshots(bridge) == [] and report.errors == []
+    get_jobs = [c for c in bridge.calls if c[0] == "get_job"]
     if blocked:
         assert [r.id for r in led.records] == [kept.id]
         assert reducer_files(env) == {}
+        assert get_jobs == []  # the local ledger check comes before any bridge call
         return
     (new,) = [r for r in led.records if r.id != kept.id]  # control: another tool is free
     assert new.kind == "reducer" and new.state == "shadow_pending"
+    assert get_jobs
 
 
 def test_detect_counts_composed_tool_results_under_the_tool_it_calls(env):
@@ -1674,3 +1677,75 @@ def test_reducer_search_error_reports_only_its_type(env, monkeypatch):
     assert report.errors == ["reducer search bytes:" + GET + ": unexpected KeyError"]
     assert Ledger.load(env.root).records == []
     assert RESULT_SENTINEL not in (env.root / "cycle_state.json").read_text()
+
+
+def small_result(n):
+    """A result like big_result but ~2k chars: halving it saves little."""
+    text = PICNIC * 14 + f"item {n}"
+    return json.dumps({"result": text, "structuredContent": {"result": text}})
+
+
+def aliased_runs(direct_result):
+    """12 runs of calendar sync reading big results through tuned_get (aliased to GET,
+    so the bytes candidate is large) and 3 runs calling GET directly, the only calls
+    the replay search sees."""
+    return (bytes_runs(CAL, tool="tuned_get", days=range(1, 13))
+            + bytes_runs(CAL, days=range(13, 16), result=direct_result))
+
+
+
+
+def write_alias(cfg):
+    d = cfg.root / "tools" / "tuned_get"
+    d.mkdir(parents=True)
+    (d / "tool.json").write_text(json.dumps({"name": "tuned_get", "calls": [GET]}))
+
+
+@pytest.mark.parametrize("direct_result, floor_ok", [(small_result, False), (big_result, True)])
+def test_reducer_saving_below_the_floor_is_not_shadowed(env, direct_result, floor_ok):
+    """The candidate cleared the floor on all of GET's bytes (most through tuned_get), but
+    the reducer only cuts the 3 direct calls: its own monthly saving must clear it too."""
+    write_alias(env)
+    build(env, aliased_runs(direct_result))
+    bridge = FakeBridge(jobs=jobs())
+    run_cycle(env, bridge, NOW)
+    (rec,) = Ledger.load(env.root).records
+    creates = [c for c in bridge.calls if c[0] == "create_job"]
+    if floor_ok:
+        assert rec.state == "shadow_pending", rec.reason
+        assert creates and list(reducer_files(env)) == [f"{rec.id}.json"]
+        return
+    assert rec.kind == "reducer" and rec.state == "rejected"
+    assert rec.reason == "reducer search: saving_below_floor" and rec.spend_usd == 0.0
+    assert creates == [] and reducer_files(env) == {}
+
+
+def test_reducer_saving_at_the_floor_is_shadowed(env, monkeypatch):
+    """A monthly saving equal to MIN_DRAFT_MONTHLY_USD is not below it."""
+    from hermes_tuner import cycle_draft
+    from hermes_tuner.replay import ReducerResult
+    spec = {"tool": GET, "job": CAL, "steps": [{"op": "collapse_ws"}]}
+    per_run = 0.0011
+    monkeypatch.setattr(cycle_draft, "search_reducer", lambda *a, **k: ReducerResult(
+        spec, "ok", 12, 12, 100, 50, 0, 0, per_run))
+    monkeypatch.setattr(policy, "MIN_DRAFT_MONTHLY_USD", per_run * 12 * 30 / 28)
+    build(env, bytes_runs(CAL))  # 12 runs in the window
+    bridge = FakeBridge(jobs=jobs())
+    run_cycle(env, bridge, NOW)
+    (rec,) = Ledger.load(env.root).records
+    assert rec.state == "shadow_pending", rec.reason
+    assert [c for c in bridge.calls if c[0] == "create_job"]
+
+
+def test_reducer_projection_has_no_drafting_estimate(env):
+    """A reducer makes no model call: the weekly cap counts only its shadow run. Week
+    spend $0.89 + shadow $0.10 fits the $1.00 cap; + DRAFT_EST_USD $0.02 would not."""
+    spent = Fix("20261019-eeee0002", "job_prompt", CAL, {}, "seq:old")
+    add_record(env, FixRecord(spent.id, "job_prompt", CAL, "seq:old", "rejected",
+                              NOW - 3600, spend_usd=0.89), spent)
+    build(env, bytes_runs(CAL))
+    bridge = FakeBridge(jobs=jobs())
+    report = run_cycle(env, bridge, NOW)
+    assert report.budget == ""
+    recs = [r for r in Ledger.load(env.root).records if r.kind == "reducer"]
+    assert [r.state for r in recs] == ["shadow_pending"]

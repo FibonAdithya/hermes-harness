@@ -107,7 +107,8 @@ class DraftSteps:
         cands = detect(window, now, pricing, self.skill_names, aliases=self._aliases())
         for cand in self._select(cands):
             job_cost = self._job_cost(cand.job_id) if cand.job_id else 0.0
-            projected = policy.DRAFT_EST_USD + job_cost
+            reduce = self._reducer_route(cand)  # no model call: only the shadow run costs
+            projected = (0.0 if reduce else policy.DRAFT_EST_USD) + job_cost
             if week + projected > policy.WEEKLY_CAP_USD:
                 self.report.budget = (f"cap: week spend ${week:.2f} + projected "
                                       f"${projected:.2f} > ${policy.WEEKLY_CAP_USD:.2f} "
@@ -116,7 +117,7 @@ class DraftSteps:
             if self.dry:
                 self.plan(f"draft {cand.key}" + (f" for job {cand.job_id}" if cand.job_id else ""))
                 continue
-            if self._reducer_route(cand):
+            if reduce:
                 spend, shadowed = self._reduce_one(cand)
             else:
                 spend, shadowed = self._draft_one(cand)
@@ -289,8 +290,10 @@ class DraftSteps:
         """Search replayed runs for a reducer of the candidate's tool; shadow what it
         finds. No model call: spend is 0. Returns (spend, shadow scheduled)."""
         job_id, tool = cand.job_id, cand.key.split(":", 1)[1]
+        if self._reducer_taken(job_id, tool):  # local check first: no bridge call
+            return 0.0, False
         job = self._get_job(job_id)
-        if job is None or self._reducer_taken(job_id, tool):
+        if job is None:
             return 0.0, False
         prompt = job.get("prompt")
         exclude = [prompt] if isinstance(prompt, str) else []
@@ -305,6 +308,12 @@ class DraftSteps:
             return 0.0, False
         if result.spec is None:
             self._spend_record(cand, 0.0, "reducer", f"reducer search: {result.reason}")
+            return 0.0, False
+        # The candidate cleared the floor on all of the tool's bytes, aliased calls
+        # included; the reducer cuts only direct calls, so its own saving must too.
+        monthly = result.est_saving_per_run * len(runs) * 30 / REPLAY_WINDOW_DAYS
+        if monthly < policy.MIN_DRAFT_MONTHLY_USD:
+            self._spend_record(cand, 0.0, "reducer", "reducer search: saving_below_floor")
             return 0.0, False
         day = datetime.fromtimestamp(self.now, timezone.utc).strftime("%Y%m%d")
         digest = hashlib.sha256(

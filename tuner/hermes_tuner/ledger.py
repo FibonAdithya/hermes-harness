@@ -377,14 +377,6 @@ def write_shadow_reducer(root: Path, payload: dict, fix_id: str) -> None:
     _write_reducer(root, fix_id, reducer_spec(payload), shadow=True)
 
 
-def go_live_reducer(root: Path, fix_id: str) -> None:
-    """Rewrite fix `fix_id`'s reducer file without the shadow flags. Raises OSError if
-    it is missing and ValueError if it no longer holds a valid spec."""
-    data = _read_json(_reducer_path(root, fix_id))
-    _write_reducer(root, fix_id, reducer_spec(data.get("spec") if isinstance(data, dict)
-                                              else None), shadow=False)
-
-
 def remove_reducer(root: Path, fix_id: str) -> None:
     """Delete fix `fix_id`'s reducer file, if there is one."""
     _reducer_path(root, fix_id).unlink(missing_ok=True)

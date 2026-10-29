@@ -1173,17 +1173,13 @@ def test_apply_reducer_rejects_bad_spec_before_writing(tmp_path):
     assert ledger.records == []
 
 
-def test_shadow_reducer_go_live_and_remove(tmp_path):
-    from hermes_tuner.ledger import go_live_reducer, remove_reducer, write_shadow_reducer
+def test_shadow_reducer_write_and_remove(tmp_path):
+    from hermes_tuner.ledger import remove_reducer, write_shadow_reducer
     root = tmp_path / "tuner"
     write_shadow_reducer(root, dict(reducer_payload(), _base=BASE), "r1")
     path = root / "reducers" / "r1.json"
     assert reducer_file(root, "r1") == {"spec": reducer_payload(), "fix_id": "r1",
                                         "shadow_only": True, "shadow_fix": "r1"}
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    go_live_reducer(root, "r1")
-    assert reducer_file(root, "r1") == {"spec": reducer_payload(), "fix_id": "r1",
-                                        "shadow_only": False, "shadow_fix": None}
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     remove_reducer(root, "r1")
     assert not path.exists()
