@@ -668,6 +668,8 @@ def state(cfg):
 
 
 COMPOSED_REPLY = {"kind": "composed_tool", "target": TRIAGE, "payload": dict(TOOL) | {
+    "program": (f"def main(args, call):\n"
+                f"    return len([call({GET!r}, {{'message_id': m}}) for m in args['ids']])\n"),
     "parameters": {"type": "object", "properties": {"ids": {"type": "array"}}},
     "replay_inputs": [{"param": "ids", "from_call": GET, "arg": "message_id",
                        "collect": "list"}]}}
@@ -1837,8 +1839,59 @@ def test_composed_draft_that_fits_reaches_shadow_with_an_estimate(env):
     (rec,) = Ledger.load(env.root).records
     assert rec.state == "shadow_pending", rec.reason
     assert len(calls) == policy.REPLAY_MAX_SESSIONS
-    assert rec.est_saving_per_run is not None and rec.est_saving_per_run > 0
+    # Recompute independently: the same replay on the same history, plus the turns part.
+    from hermes_tuner.history import History
+    from hermes_tuner.replay import composed_monthly, replay_composed
+    (_m, (_i, user, _mt)), = oneshots(bridge)
+    cand = json.loads(user)["candidate"]
+    turns = cand["est_monthly_usd"] if cand["kind"] == "sequence" else 0.0
+    runs = History.open(env.db).replay_runs(TRIAGE, NOW - 28 * DAY)
+    rep = replay_composed(BATCH_REPLY["payload"], runs, real, pricing=FLAT,
+                          argv_for=replay_kw()["replay_argv"])
+    assert rep.eligible == 12 and turns > 0   # BATCH echoes bodies: the turns part pays
+    want = composed_monthly(rep, turns) / (rep.eligible * 30 / 28)
+    assert rec.est_saving_per_run == pytest.approx(want)
     assert rec.id in report.shadowed
+
+
+def test_composed_estimate_not_stored_when_shadow_not_scheduled(env):
+    """est_saving_per_run is set only on a draft whose shadow was scheduled."""
+    build(env, mail_runs(n=2, chars=300))
+    payload = dict(BATCH_REPLY["payload"], job_prompt=None)  # no prompt: shadow refused
+    bridge = FakeBridge(jobs=jobs(), oneshot_script=[reply(dict(BATCH_REPLY, payload=payload))])
+    run_cycle(env, bridge, NOW, **replay_kw())
+    (rec,) = Ledger.load(env.root).records
+    assert rec.state == "rejected" and rec.reason.startswith("shadow not scheduled")
+    assert rec.est_saving_per_run is None
+
+
+def test_replay_budget_is_shared_across_drafts_in_a_cycle(env):
+    """With an injected clock, the first draft's replay uses most of
+    REPLAY_CYCLE_BUDGET_S; the second draft's replay gets no run and is rejected with
+    "replay: no time left". The first is unaffected."""
+    from hermes_tuner.cycle import CycleReport, _Cycle
+    from hermes_tuner.detect import Candidate
+    from hermes_tuner.history import History
+    from hermes_tuner.model import Fix
+    build(env, mail_runs(n=2, chars=300))
+    t = [NOW]
+    real = _relay_mod().run_program
+
+    def slow(*a, **kw):
+        t[0] += 70
+        return real(*a, **kw)
+    c = _Cycle(env, FakeBridge(jobs=jobs()), NOW, CycleReport(), clock=lambda: t[0],
+               run_program=slow, replay_argv=replay_kw()["replay_argv"])
+    c.history, c.pricing = History.open(env.db), FLAT
+    cand = Candidate("sequence", f"seq:{SEARCH}>{GET}", TRIAGE, 12, 12, 1000, 1.0)
+    fix = Fix("f-one", "composed_tool", TRIAGE, BATCH_REPLY["payload"], cand.key)
+    assert c._replay_gate(cand, fix)[0] is None          # 4 runs fit (360 -> 80 left)
+    assert t[0] == NOW + 4 * 70
+    reason, per_run = c._replay_gate(cand, Fix("f-two", "composed_tool", TRIAGE,
+                                               BATCH_REPLY["payload"], cand.key))
+    assert (reason, per_run) == ("replay: no time left", None)
+    assert t[0] == NOW + 4 * 70                          # no run started
+
 
 
 def test_composed_replay_failure_rejects_with_the_type_only(env):

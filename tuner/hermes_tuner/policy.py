@@ -142,10 +142,15 @@ REPLAY_MIN_SESSIONS = 3
 # Days of recorded history replayed and priced.
 REPLAY_WINDOW_DAYS = 28
 # Composed-tool replay (tuner design 2026-10-28): the newest this-many replayable runs,
-# each under this sandbox timeout. 6 x 60 s fits the service's TimeoutStartSec=1800
-# alongside 3 drafts at 360 s.
+# each under this sandbox timeout, all composed replays of one cycle sharing
+# REPLAY_CYCLE_BUDGET_S. A run starts only while REPLAY_TIMEOUT_S + 30 s of the budget
+# is left, so replay ends within 360 s + 60 s + relay's reap/docker-rm slack. Worst
+# case per cycle: 3 drafts x 360 s + ~420 s of replay = ~1500 s (ESTIMATE), inside
+# the service's TimeoutStartSec=1800. Without the shared budget, 2 composed drafts
+# (one per editable job) x 6 x ~65 s took the total to ~1860 s.
 REPLAY_MAX_SESSIONS = 6
 REPLAY_TIMEOUT_S = 60
+REPLAY_CYCLE_BUDGET_S = 360
 
 # Replay used-string check (tuner design 2026-10-28). A reducer goes live only if
 # every string the model reused verbatim from a result survives the reduction.

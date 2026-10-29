@@ -441,6 +441,7 @@ RI = {"param": "ids", "from_call": GET, "arg": "message_id", "collect": "list"}
     ([{**RI, "collect": "all"}], "collect not list/first"),
     ([{k: v for k, v in RI.items() if k != "collect"}], "collect missing"),
     ([RI, {**RI, "collect": "every"}], "second entry bad"),
+    ([RI, {**RI, "arg": "thread_id", "collect": "first"}], "param repeated"),
 ])
 def test_composed_tool_needs_valid_replay_inputs(tmp_path, entries, why):
     """Catches: a composed tool that cannot be replayed reaching the replay gate."""
@@ -453,8 +454,9 @@ def test_composed_tool_needs_valid_replay_inputs(tmp_path, entries, why):
 
 
 def test_valid_replay_inputs_pass(tmp_path):
-    first = {"param": "ids", "from_call": GET, "arg": "thread_id", "collect": "first"}
-    assert check_fix(composed(replay_inputs=[RI, first]), ctx(tmp_path)) == []
+    first = {"param": "t", "from_call": GET, "arg": "thread_id", "collect": "first"}
+    params = {"type": "object", "properties": {"ids": {"type": "array"}, "t": {"type": "string"}}}
+    assert check_fix(composed(parameters=params, replay_inputs=[RI, first]), ctx(tmp_path)) == []
 
 
 def test_replay_inputs_need_parameter_properties(tmp_path):

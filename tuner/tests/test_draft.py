@@ -368,6 +368,13 @@ def test_turn_layout_orders_by_turn_not_by_call_order():
     assert D.turn_layout([]) == []
 
 
+def test_turn_layout_leaves_out_unknown_turns():
+    """Turn 0 means unknown; those calls do not share one turn."""
+    from hermes_tuner.model import ToolCall
+    calls = [ToolCall(str(i), "x", (), None, 1, turn=t) for i, t in enumerate([0, 0, 1, 2, 2, 0])]
+    assert D.turn_layout(calls) == [1, 2]
+
+
 def test_build_request_without_layout_sends_an_empty_list():
     _i, user = D.build_request(CAND, None, None, {}, [])
     assert json.loads(user)["turn_layout"] == []

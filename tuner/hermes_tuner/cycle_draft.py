@@ -95,6 +95,8 @@ class DraftSteps:
     # the plugin's relay in Docker (relay.production_argv).
     run_program: Callable[..., str] | None = None
     replay_argv: Callable[[str], list[str]] | None = None
+    # Seconds of composed replay this cycle has used (self.clock), of REPLAY_CYCLE_BUDGET_S.
+    replay_spent_s: float = 0.0
 
     # 5-7. budget, detect, draft ----------------------------------------------------------
 
@@ -397,7 +399,7 @@ class DraftSteps:
         if fix.kind in JOB_KINDS:
             shadowed = self._shadow(fix, job, spend)
             rec = self.ledger.get(fix.id)
-            if per_run is not None and rec is not None:
+            if shadowed and per_run is not None and rec is not None:
                 rec.est_saving_per_run = per_run
                 self.ledger.save()
             return spend, shadowed
@@ -440,8 +442,10 @@ class DraftSteps:
                 run_program = run_program or relay.run_program
                 argv_for = argv_for or relay.production_argv
             runs = self.history.replay_runs(fix.target, self.now - REPLAY_WINDOW_DAYS * DAY)
+            left = policy.REPLAY_CYCLE_BUDGET_S - self.replay_spent_s
             rep = replay_composed(fix.payload, runs, run_program, pricing=self.pricing,
-                                  argv_for=argv_for)
+                                  argv_for=argv_for, clock=self.clock, budget_s=left)
+            self.replay_spent_s += rep.elapsed_s
         except HistoryUnavailable:
             self.err(f"replay {fix.id}: history unavailable")
             return "replay: history unavailable", None

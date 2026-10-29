@@ -129,10 +129,11 @@ def _safe_key(key: str) -> str:
 
 
 def turn_layout(calls: Iterable[ToolCall]) -> list[int]:
-    """Calls per model turn, in turn order (turn 0, unknown, counts as one turn)."""
+    """Calls per model turn, in turn order. Calls whose turn is unknown (0) are left out."""
     counts: dict[int, int] = {}
     for c in calls:
-        counts[c.turn] = counts.get(c.turn, 0) + 1
+        if c.turn > 0:
+            counts[c.turn] = counts.get(c.turn, 0) + 1
     return [counts[t] for t in sorted(counts)]
 
 

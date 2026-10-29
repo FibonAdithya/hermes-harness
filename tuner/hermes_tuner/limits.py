@@ -127,6 +127,7 @@ def _check_replay_inputs(p: dict, calls: list[str]) -> list[str]:
     props = params.get("properties") if isinstance(params, dict) else None
     props = props if isinstance(props, dict) else {}
     reasons = []
+    params_seen: set[str] = set()
     for i, e in enumerate(entries):
         where = f"replay_inputs[{i}]"
         if not isinstance(e, dict):
@@ -135,6 +136,10 @@ def _check_replay_inputs(p: dict, calls: list[str]) -> list[str]:
         param, src, arg = e.get("param"), e.get("from_call"), e.get("arg")
         if not isinstance(param, str) or param not in props:
             reasons.append(f"{where}.param must name a property of parameters")
+        elif param in params_seen:
+            reasons.append(f"{where}.param repeats an earlier entry's param")
+        else:
+            params_seen.add(param)
         if not isinstance(src, str) or src not in calls:
             reasons.append(f"{where}.from_call must be one of calls")
         if not isinstance(arg, str) or not _IDENT.fullmatch(arg):
