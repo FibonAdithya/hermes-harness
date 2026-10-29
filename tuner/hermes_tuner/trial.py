@@ -27,7 +27,7 @@ from typing import Literal
 
 from . import policy
 from .bridge import CREATE_JOB_EXTRA_KEYS, Bridge, BridgeError
-from .ledger import FixRecord, atomic_write, job_after_for
+from .ledger import BASE_KEY, FixRecord, atomic_write, job_after_for
 from collections.abc import Callable
 from statistics import median
 
@@ -95,6 +95,9 @@ def _shadow_prompt(fix: Fix) -> str:
         prompt = p.get("prompt")
     elif fix.kind == "composed_tool":
         prompt = p.get("job_prompt")
+    elif fix.kind == "reducer":  # the job as drafted against (cycle's _shadow sets it)
+        base = p.get(BASE_KEY)
+        prompt = base.get("prompt") if isinstance(base, dict) else None
     else:
         raise ValueError(f"no shadow run for {fix.kind!r} fixes")
     if not isinstance(prompt, str) or not prompt:

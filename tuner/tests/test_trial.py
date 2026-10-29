@@ -593,3 +593,34 @@ def test_tool_check_names_every_foreign_tool_once_sorted():
     results = [("tuned_c", OK), ("tuned_b", OK), ("tuned_c", OK)]
     assert tool_check(results, None, frozenset()) == \
         "shadow used tuned_b, tuned_c, which are not live and not this fix's tool"
+
+
+# --- reducer shadows (Task 8) -------------------------------------------------------
+
+def reducer_fix(base=None):
+    p = {"tool": "mcp__google__get_gmail_message_content", "job": "cc68e24f21cd",
+         "steps": [{"op": "collapse_ws"}]}
+    if base is not None:
+        p["_base"] = base
+    return Fix("r1", "reducer", "cc68e24f21cd", p, "bytes:x")
+
+
+@pytest.mark.parametrize("toolsets", [("web",), None])
+def test_reducer_shadow_runs_the_live_prompt_and_toolsets(tmp_path, toolsets):
+    """The reducer changes results, not the job: the shadow runs the job as drafted
+    against (the payload's _base, which _shadow sets) with the live toolsets."""
+    job = live_job(toolsets)
+    bridge = FakeBridge(jobs={LIVE: job})
+    sid = schedule_shadow(reducer_fix({"prompt": "old", "enabled_toolsets": job["enabled_toolsets"]}),
+                          job, bridge, tmp_path, NOW)
+    assert bridge.jobs[sid]["prompt"] == "old"
+    assert bridge.jobs[sid]["enabled_toolsets"] == job["enabled_toolsets"]
+    assert [c for c in bridge.calls if c[0] == "update_job"] == []
+
+
+@pytest.mark.parametrize("base", [None, {}, {"prompt": ""}, {"prompt": 5}])
+def test_reducer_shadow_without_a_base_prompt_is_refused(tmp_path, base):
+    bridge = FakeBridge(jobs={LIVE: live_job()})
+    with pytest.raises(ValueError):
+        schedule_shadow(reducer_fix(base), live_job(), bridge, tmp_path, NOW)
+    assert list(bridge.jobs) == [LIVE]

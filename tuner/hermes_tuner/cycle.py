@@ -36,11 +36,11 @@ from statistics import median
 from . import policy, trial
 from .bridge import Bridge, BridgeError
 from .budget import DAY, JOB_KINDS, weekly_line
-from .cycle_draft import BASE_KEY, GLOBAL_KINDS, DraftSteps
+from .cycle_draft import GLOBAL_KINDS, DraftSteps
 from .fingerprint import CopyIndex
 from .history import History, HistoryUnavailable
-from .ledger import (ACTIVE_STATES, APPLIED_STATES, FixRecord, Ledger, _tool_files, apply,
-                     atomic_write, is_shadow_tool, rollback)
+from .ledger import (ACTIVE_STATES, APPLIED_STATES, BASE_KEY, FixRecord, Ledger, _tool_files,
+                     apply, atomic_write, is_shadow_tool, remove_reducer, rollback)
 from .measure import priced_cost
 from .model import Fix, Pricing, Session
 from .proposals import apply_approved, approved, dropped
@@ -54,6 +54,8 @@ NO_LIVE_RUN_S = 3 * DAY    # a shadow with no live run to compare 3 days after r
 ERROR_KEEP_S = 28 * DAY
 RESTART_KEEP_S = 28 * DAY
 STATE_FILE = "cycle_state.json"
+REDUCER_EVENTS_DIR = "reducer_events"   # the plugin's hook logs each reduction here
+NEVER_REDUCED = "shadow never reduced a result"
 HEARTBEAT_FILE = "plugin_heartbeat.json"   # written by the plugin at register()
 PLUGIN_NAME = "hermes-tuner"
 
@@ -369,12 +371,33 @@ class _Cycle(DraftSteps):
             fix = self.ledger.fix(rec.id)
         except (OSError, ValueError, TypeError) as exc:
             return f"fix unreadable: {type(exc).__name__}"
+        if fix.kind == "reducer" and not self._reduced_in(fix.id, shadow):
+            return NEVER_REDUCED
         if fix.kind == "composed_tool":
             files = self._shadow_tool(fix)
             if files is None:
                 return "fix has no valid composed tool"
             own = files[0]["name"]
         return trial.tool_check(self.history.call_results(shadow.id), own, self._live_tools())
+
+    def _reduced_in(self, fix_id: str, shadow: Session) -> bool:
+        """True when the plugin logged a reduction (a line with "after") by fix
+        `fix_id` in the shadow run or one of its compression continuations: the hook
+        logs the agent's current session id. Malformed lines are skipped."""
+        path = self.root / REDUCER_EVENTS_DIR / f"{fix_id}.jsonl"
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return False
+        chain = set(self.history.chain_ids(shadow.id))
+        for line in lines:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(e, dict) and "after" in e and e.get("session_id") in chain:
+                return True
+        return False
 
     def _live_tools(self) -> frozenset[str]:
         """Names of the composed tools of applied, trial and kept fixes."""
@@ -423,7 +446,13 @@ class _Cycle(DraftSteps):
 
     def _remove_shadow_tool(self, rec: FixRecord) -> None:
         """Remove the shadow-only tool dir written for a composed_tool shadow, if it
-        is still exactly ours."""
+        is still exactly ours, or a reducer fix's shadow file (named by its fix id)."""
+        if rec.kind == "reducer":
+            try:
+                remove_reducer(self.root, rec.id)
+            except (OSError, ValueError) as exc:
+                self.err(f"remove reducer {rec.id}: {type(exc).__name__}")
+            return
         try:
             fix = self.ledger.fix(rec.id)
         except (OSError, ValueError, TypeError):
@@ -455,7 +484,7 @@ class _Cycle(DraftSteps):
             self.plan(f"apply {rec.id}")
             return
         fix = self.ledger.fix(rec.id)
-        if fix.kind == "composed_tool" and not self.plugin_loaded():
+        if fix.kind in ("composed_tool", "reducer") and not self.plugin_loaded():
             self.err(f"plugin not loaded; {rec.id} not applied")
             return  # stays shadow_pending; retried next cycle
         changed = self._owner_changed_job(fix)

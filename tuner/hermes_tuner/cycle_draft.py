@@ -18,18 +18,24 @@ from .budget import DAY, JOB_KINDS, iso_week_start, job_runs, savings, tuner_spe
 from .detect import SCHEMA_TOOL, SKILL_TOOL, Candidate, detect
 from .draft import draft
 from .fingerprint import CopyIndex
-from .ledger import FixRecord, _Failed, apply, needs_restart, write_shadow_tool
+from .history import HistoryUnavailable
+from .ledger import (ACTIVE_STATES, APPLIED_STATES, BASE_KEY, FixRecord, _Failed, apply,
+                     needs_restart, write_shadow_reducer, write_shadow_tool)
 from .limits import LimitContext, changeable_settings, check_fix
 from .measure import priced_cost
 from .model import Fix, Session
 from .proposals import approved_callables, write_proposal
+from .replay import search_reducer
 
 COPY_INDEX_DAYS = 14
-BASE_KEY = "_base"  # Fix payload key: the job as drafted against; never sent to Hermes
+REPLAY_WINDOW_DAYS = 28
 PLUGIN_NOT_LOADED = "plugin not loaded; shadow not scheduled"
 GLOBAL_KINDS = frozenset({"config", "skill"})
 GLOBAL_CANDIDATES = ("schema_lookup", "skill_load")
-JOB_CANDIDATES = ("sequence", "reread")
+JOB_CANDIDATES = ("sequence", "reread", "bytes")
+# A reducer blocks a second search for its (job, tool) from shadow until rolled back:
+# once one is live, history holds reduced text and a new search would stack on it.
+REDUCER_BLOCKING = ACTIVE_STATES | APPLIED_STATES
 
 
 def _skill_file(skills_root: Path, name: str) -> Path | None:
@@ -98,7 +104,7 @@ class DraftSteps:
         window = [s for s in self.sessions if s.started_at >= now - 28 * DAY]
         self.skill_names = self._skill_names(window)
         self.window = window
-        cands = detect(window, now, pricing, self.skill_names)
+        cands = detect(window, now, pricing, self.skill_names, aliases=self._aliases())
         for cand in self._select(cands):
             job_cost = self._job_cost(cand.job_id) if cand.job_id else 0.0
             projected = policy.DRAFT_EST_USD + job_cost
@@ -110,8 +116,38 @@ class DraftSteps:
             if self.dry:
                 self.plan(f"draft {cand.key}" + (f" for job {cand.job_id}" if cand.job_id else ""))
                 continue
-            spend, shadowed = self._draft_one(cand)
+            if self._reducer_route(cand):
+                spend, shadowed = self._reduce_one(cand)
+            else:
+                spend, shadowed = self._draft_one(cand)
             week += spend + (job_cost if shadowed else 0.0)
+
+    def _aliases(self) -> dict[str, str]:
+        """Composed tool name -> the one tool it calls, from tools/*/tool.json whose
+        `calls` has length 1. Unreadable or malformed files are skipped."""
+        out: dict[str, str] = {}
+        try:
+            paths = sorted((self.root / "tools").glob("*/tool.json"))
+        except OSError:
+            return out
+        for path in paths:
+            try:
+                spec = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            name = spec.get("name") if isinstance(spec, dict) else None
+            calls = spec.get("calls") if isinstance(spec, dict) else None
+            if (isinstance(name, str) and isinstance(calls, list) and len(calls) == 1
+                    and isinstance(calls[0], str)):
+                out[name] = calls[0]
+        return out
+
+    @staticmethod
+    def _reducer_route(cand: Candidate) -> bool:
+        """A bytes candidate of a reducer job for an allowlisted tool goes to the
+        deterministic replay search instead of a model draft."""
+        return (cand.kind == "bytes" and cand.job_id in policy.REDUCER_JOBS
+                and cand.key.split(":", 1)[1] in policy.REDUCER_TOOLS)
 
     def _skill_names(self, window: list[Session]) -> dict[str, list[str]]:
         out: dict[str, list[str]] = {}
@@ -126,6 +162,9 @@ class DraftSteps:
         return out
 
     def _select(self, cands: list[Candidate]) -> list[Candidate]:
+        """The first candidate per editable job, and one global one, among those worth
+        at least MIN_DRAFT_MONTHLY_USD a month."""
+        cands = [c for c in cands if c.est_monthly_usd >= policy.MIN_DRAFT_MONTHLY_USD]
         picked = []
         for job in sorted(policy.EDITABLE_JOBS):
             if job in policy.NEVER_TOUCH_JOBS or self.ledger.active_for(job) is not None:
@@ -177,16 +216,8 @@ class DraftSteps:
         """Draft, check and act on one candidate. Returns (spend, shadow scheduled)."""
         job = None
         if cand.job_id is not None:
-            if not self.plugin_loaded():  # a job fix needs a guarded shadow run (F4)
-                self.err(PLUGIN_NOT_LOADED)
-                return 0.0, False
-            try:
-                job = self.bridge.get_job(cand.job_id)
-            except BridgeError as exc:
-                self.err(f"get_job {cand.job_id}: {exc}")
-                return 0.0, False
+            job = self._get_job(cand.job_id)
             if job is None:
-                self.err(f"job {cand.job_id} not found")
                 return 0.0, False
         bundled = self._bundled()
         skill_text = None
@@ -224,6 +255,78 @@ class DraftSteps:
             elif rec.state == "shadow_pending" and rec.applied_at is None:
                 self._close(rec, "rejected", f"internal error: {type(exc).__name__}")
             return spend, False
+
+    def _get_job(self, job_id: str) -> dict | None:
+        """The live job, or None after reporting why (plugin not loaded, bridge
+        failure, missing job). A job fix needs a guarded shadow run (F4)."""
+        if not self.plugin_loaded():
+            self.err(PLUGIN_NOT_LOADED)
+            return None
+        try:
+            job = self.bridge.get_job(job_id)
+        except BridgeError as exc:
+            self.err(f"get_job {job_id}: {exc}")
+            return None
+        if job is None:
+            self.err(f"job {job_id} not found")
+        return job
+
+    def _reducer_taken(self, job_id: str, tool: str) -> bool:
+        """True when a reducer for (job, tool) is shadow-pending, applied, on trial or
+        kept. The tool comes from the stored fix; an unreadable one counts as taken."""
+        for r in self.ledger.records:
+            if r.kind != "reducer" or r.target != job_id or r.state not in REDUCER_BLOCKING:
+                continue
+            try:
+                payload = self.ledger.fix(r.id).payload
+            except (OSError, ValueError, TypeError):
+                return True
+            if not isinstance(payload, dict) or payload.get("tool") == tool:
+                return True
+        return False
+
+    def _reduce_one(self, cand: Candidate) -> tuple[float, bool]:
+        """Search replayed runs for a reducer of the candidate's tool; shadow what it
+        finds. No model call: spend is 0. Returns (spend, shadow scheduled)."""
+        job_id, tool = cand.job_id, cand.key.split(":", 1)[1]
+        job = self._get_job(job_id)
+        if job is None or self._reducer_taken(job_id, tool):
+            return 0.0, False
+        prompt = job.get("prompt")
+        exclude = [prompt] if isinstance(prompt, str) else []
+        try:
+            runs = self.history.replay_runs(job_id, self.now - REPLAY_WINDOW_DAYS * DAY)
+            result = search_reducer(runs, tool, job_id, exclude, self.pricing)
+        except HistoryUnavailable as exc:
+            self.err(f"replay {cand.key}: {exc}")
+            return 0.0, False
+        except Exception as exc:  # noqa: BLE001 - the type only: a message could hold result text
+            self.err(f"reducer search {cand.key}: unexpected {type(exc).__name__}")
+            return 0.0, False
+        if result.spec is None:
+            self._spend_record(cand, 0.0, "reducer", f"reducer search: {result.reason}")
+            return 0.0, False
+        day = datetime.fromtimestamp(self.now, timezone.utc).strftime("%Y%m%d")
+        digest = hashlib.sha256(
+            (cand.key + json.dumps(result.spec, sort_keys=True)).encode()).hexdigest()[:8]
+        fix = Fix(f"{day}-r{digest}", "reducer", job_id, result.spec, cand.key)
+        fresh = self.ledger.get(fix.id) is None
+        try:
+            out = self._act(cand, job, fix, 0.0, None)
+        except Exception as exc:  # noqa: BLE001 - report, go on
+            self.err(f"reduce {cand.key}: unexpected {type(exc).__name__}")
+            rec = self.ledger.get(fix.id)
+            if rec is None:
+                self._spend_record(cand, 0.0, "reducer", f"internal error: {type(exc).__name__}")
+            elif rec.state == "shadow_pending" and rec.applied_at is None:
+                self._remove_shadow_tool(rec)
+                self._close(rec, "rejected", f"internal error: {type(exc).__name__}")
+            return 0.0, False
+        rec = self.ledger.get(fix.id)
+        if fresh and rec is not None:
+            rec.est_saving_per_run = result.est_saving_per_run
+            self.ledger.save()
+        return out
 
     def _spend_record(self, cand: Candidate, spend: float, tag: str, reason: str) -> None:
         """A rejected placeholder record that carries drafting spend with no usable fix."""
@@ -313,6 +416,8 @@ class DraftSteps:
         try:
             if files is not None:  # the shadow run needs the tool; shadow-only until go-live
                 write_shadow_tool(self.root / "tools", fix.payload, fix.id)
+            if fix.kind == "reducer":  # applies only in this fix's shadow until go-live
+                write_shadow_reducer(self.root, fix.payload, fix.id)
             trial.schedule_shadow(fix, job, self.bridge, self.root, self.now)
         except (ValueError, OSError) as exc:
             self._remove_shadow_tool(rec)

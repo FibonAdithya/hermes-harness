@@ -1202,3 +1202,25 @@ def test_apply_reducer_after_shadow_goes_live(tmp_path):
     do_apply(reducer_fix(), ledger, FakeBridge(), root, skills)
     assert reducer_file(root, "r1")["shadow_only"] is False
     assert reducer_file(root, "r1")["shadow_fix"] is None
+
+
+def test_job_after_for_reducer_is_the_live_job_unchanged():
+    from hermes_tuner.ledger import job_after_for
+    for toolsets in (["google"], None):
+        live = {"id": CAL, "prompt": OLD, "enabled_toolsets": toolsets, "name": "x"}
+        assert job_after_for(reducer_fix(), live) == {"prompt": OLD,
+                                                      "enabled_toolsets": toolsets}
+
+
+def test_fix_record_est_saving_defaults_and_old_ledgers_load(tmp_path):
+    rec = FixRecord("r1", "reducer", CAL, "k", "shadow_pending", 1.0)
+    assert rec.est_saving_per_run is None
+    root = tmp_path / "tuner"
+    root.mkdir()
+    old = {k: v for k, v in rec.__dict__.items() if k != "est_saving_per_run"}
+    (root / "ledger.json").write_text(json.dumps({"records": [old]}))
+    assert Ledger.load(root).records[0].est_saving_per_run is None
+    rec.est_saving_per_run = 0.0123
+    led = Ledger(root, [rec])
+    led.save()
+    assert Ledger.load(root).records[0].est_saving_per_run == 0.0123

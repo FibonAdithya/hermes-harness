@@ -67,6 +67,9 @@ class FixRecord:
     # lists. None on records saved before it existed: judged "continue" until the
     # trial deadline, no saving. baseline_cost is the display value at go-live.
     baseline_runs: list[list[int]] | None = None
+    # A reducer fix: the replay search's estimated saving per run (USD, ESTIMATE).
+    # None for other kinds and for records saved before it existed.
+    est_saving_per_run: float | None = None
 
 
 # --- atomic file helpers ------------------------------------------------------
@@ -238,10 +241,13 @@ def job_after_for(fix: Fix, live: dict) -> dict | None:
 
     The one place that decides this; `apply` and the shadow run both use it.
     Returns None for a composed_tool fix without a job_prompt (the job is not
-    touched). Raises ValueError for a fix kind with no job change, a bad prompt
-    or a bad add_toolsets.
+    touched). A reducer changes tool results, not the job: its shadow runs the live
+    prompt and toolsets unchanged. Raises ValueError for a fix kind with no job
+    change, a bad prompt or a bad add_toolsets.
     """
     p = fix.payload if isinstance(fix.payload, dict) else {}
+    if fix.kind == "reducer":
+        return {"prompt": live.get("prompt"), "enabled_toolsets": live.get("enabled_toolsets")}
     if fix.kind == "job_prompt":
         prompt, add = p.get("prompt"), None
         if not isinstance(prompt, str):

@@ -254,11 +254,12 @@ def test_pause_allowance_matches_the_weekly_cap():
 # --- real setting names ------------------------------------------------------------------
 
 def chat_schema_sessions():
-    """21 chat sessions with two tool_describe calls each: a schema_lookup candidate."""
+    """21 chat sessions with two tool_describe calls each: a schema_lookup candidate
+    worth more than MIN_DRAFT_MONTHLY_USD."""
     out = []
     for d in range(1, 22):
         out.append({"id": f"2026{d:04d}_000000_ab12cd", "source": "telegram",
-                    "started_at": NOW - d * DAY, "cost": 0.05, "in": 1000, "out": 10,
+                    "started_at": NOW - d * DAY, "cost": 0.05, "in": 10_000, "out": 10,
                     "calls": [("tool_describe", {"name": "a"}, "s" * 300),
                               ("tool_describe", {"name": "b"}, "s" * 300)]})
     return out
@@ -346,14 +347,7 @@ def test_bridge_failure_applies_nothing_and_reports(env):
 
 def test_bridge_failure_mid_apply_records_bridge_error(env):
     """A drafted config fix whose apply fails: bridge_error, never trial."""
-    sessions = []
-    for d in range(1, 22):  # 21 chat sessions with two tool_describe calls each
-        t = NOW - d * DAY
-        sessions.append({"id": f"2026{d:04d}_000000_ab12cd", "source": "telegram",
-                         "started_at": t, "cost": 0.05, "in": 1000, "out": 10,
-                         "calls": [("tool_describe", {"name": "a"}, "s" * 300),
-                                   ("tool_describe", {"name": "b"}, "s" * 300)]})
-    build(env, sessions)
+    build(env, chat_schema_sessions())
     cfg_reply = {"kind": "config", "target": CFG_KEY, "payload": {"key": CFG_KEY, "value": 0.7}}
     bridge = FakeBridge(jobs=jobs(), config={CFG_KEY: 0.5}, oneshot_script=[reply(cfg_reply)],
                         fail={"config_set"})
@@ -1297,9 +1291,10 @@ def test_global_fix_stores_baseline_runs_at_go_live(env):
     before it as token counts (what its verdict is priced from); other jobs' runs and
     runs without tool calls are not in it."""
     sessions = []
-    for d in range(1, 22):  # 21 chat sessions with two tool_describe calls each
+    for d in range(1, 22):  # 21 chat sessions with two tool_describe calls each, a
+        # schema_lookup candidate above MIN_DRAFT_MONTHLY_USD
         sessions.append({"id": f"2026{d:04d}_000000_ab12cd", "source": "telegram",
-                         "started_at": NOW - d * DAY, "cost": 0.05, "in": 1000 + d,
+                         "started_at": NOW - d * DAY, "cost": 0.05, "in": 10_000 + d,
                          "cache": 7, "cw": 3, "out": 10,
                          "calls": [("tool_describe", {"name": "a"}, "s" * 300),
                                    ("tool_describe", {"name": "b"}, "s" * 300)]})
@@ -1315,7 +1310,7 @@ def test_global_fix_stores_baseline_runs_at_go_live(env):
     run_cycle(env, bridge, NOW)
     (rec,) = [r for r in Ledger.load(env.root).records if r.kind == "config"]
     assert rec.state == "trial"
-    chats = sorted([1000 + d, 7, 3, 10] for d in range(1, 22))
+    chats = sorted([10_000 + d, 7, 3, 10] for d in range(1, 22))
     assert sorted(rec.baseline_runs) == sorted(chats + [[tok(0.05) - 500, 0, 0, 500]])
 
 
@@ -1402,3 +1397,280 @@ def test_shadow_with_an_unreadable_fix_fails_without_stopping_the_step(env, comp
     rec = Ledger.load(env.root).get(fix.id)
     assert rec.state == "shadow_failed" and rec.reason.startswith("fix unreadable")
     assert not [e for e in report.errors if "evaluate_shadows" in e]
+
+
+# --- reducers: calendar sync bytes candidates go to the replay search (Task 8) -------------
+
+GET_EVENTS = "mcp__google__get_events"
+# Synthetic text only: no real mail enters the repository.
+PICNIC = "Synthetic newsletter paragraph about the team picnic and its sandwiches. "
+CAL_BASE = {"prompt": "Sync the calendar.", "enabled_toolsets": ["google"]}
+RFIX = "20261018-r0000aaaa"
+
+
+def big_result(n):
+    """A result shaped like the live MCP ones: the text twice (~43k chars)."""
+    text = PICNIC * 300 + f"item {n}"
+    return json.dumps({"result": text, "structuredContent": {"result": text}})
+
+
+def plain_result(n):
+    """Plain text (~22k chars) whose only reused string is its last line."""
+    return PICNIC * 300 + f"\nClosing reference QZ-{n:04d}-tail-of-message"
+
+
+def bytes_runs(job, tool=GET, days=range(1, 13), result=big_result, said=lambda d: []):
+    """Runs of `job` at 06:00 UTC that each read one big result, then take 3 more
+    turns (`said(d)` their texts): one bytes candidate for (job, tool), well above
+    MIN_DRAFT_MONTHLY_USD."""
+    base = NOW - 3 * 3600 + 6 * 3600
+    return [{"id": sid(job, base - d * DAY), "source": "cron", "started_at": base - d * DAY,
+             "in": tok(0.10) - 500, "out": 500, "final_turns": 3, "final_content": said(d),
+             "calls": [(tool, {"message_id": f"m{d}"}, result(d), 1)]} for d in days]
+
+
+def reducer_files(cfg):
+    d = cfg.root / "reducers"
+    return {p.name: json.loads(p.read_text()) for p in d.glob("*.json")} if d.is_dir() else {}
+
+
+def test_cycle_shadows_reducer_for_calendar_sync(env):
+    build(env, bytes_runs(CAL))
+    bridge = FakeBridge(jobs=jobs())
+    report = run_cycle(env, bridge, NOW)
+    led = Ledger.load(env.root)
+    (rec,) = led.records
+    assert rec.kind == "reducer" and rec.state == "shadow_pending", rec.reason
+    assert rec.target == CAL and rec.candidate_key == "bytes:" + GET
+    assert rec.id.startswith("20261019-r") and rec.spend_usd == 0.0
+    assert rec.est_saving_per_run is not None and rec.est_saving_per_run > 0
+    files = reducer_files(env)
+    assert list(files) == [f"{rec.id}.json"]
+    assert files[f"{rec.id}.json"]["shadow_only"] is True
+    assert files[f"{rec.id}.json"]["spec"]["tool"] == GET
+    assert "_base" not in files[f"{rec.id}.json"]["spec"]
+    assert oneshots(bridge) == []
+    assert report.shadowed == [rec.id] and report.errors == []
+
+
+def test_shadow_schedules_reducer_with_live_prompt(env):
+    """Catches: _shadow_prompt or job_after_for still raising for a reducer (the record
+    goes to rejected, "shadow not scheduled")."""
+    build(env, bytes_runs(CAL))
+    bridge = FakeBridge(jobs=jobs())
+    run_cycle(env, bridge, NOW)
+    (rec,) = Ledger.load(env.root).records
+    assert rec.state == "shadow_pending", rec.reason
+    (create,) = [c for c in bridge.calls if c[0] == "create_job"]
+    prompt, _schedule, name, _deliver, toolsets, _extra = create[1]
+    assert prompt == "Sync the calendar." and toolsets == ["google"]
+    assert name == policy.SHADOW_PREFIX + rec.id
+    assert [c for c in bridge.calls if c[0] == "update_job"] == []
+    assert bridge.jobs[CAL]["prompt"] == "Sync the calendar."
+
+
+def test_reducer_search_failure_records_a_placeholder(env):
+    """Every result's last line is reused later, so no cap keeps it and nothing else
+    cuts 15%: no reducer, a rejected placeholder carrying the reason code, no spend."""
+    build(env, bytes_runs(CAL, result=plain_result,
+                          said=lambda d: [f"Filed under QZ-{d:04d}-tail-of-message."]))
+    bridge = FakeBridge(jobs=jobs())
+    run_cycle(env, bridge, NOW)
+    led = Ledger.load(env.root)
+    (rec,) = led.records
+    assert rec.state == "rejected" and rec.kind == "reducer"
+    assert rec.reason == "reducer search: cut_below_min" and rec.spend_usd == 0.0
+    assert reducer_files(env) == {} and oneshots(bridge) == []
+
+
+@pytest.mark.parametrize("job, tool", [(TRIAGE, GET), (CAL, "mcp__google__list_calendars")])
+def test_morning_briefing_bytes_goes_to_model(env, monkeypatch, job, tool):
+    """A bytes candidate outside REDUCER_JOBS, or for a tool outside REDUCER_TOOLS, is
+    drafted by the model as before and never searched."""
+    from hermes_tuner import cycle_draft
+    searched = []
+    monkeypatch.setattr(cycle_draft, "search_reducer",
+                        lambda *a, **k: searched.append(a) or None)
+    build(env, bytes_runs(job, tool))
+    reply_obj = dict(JOB_PROMPT_REPLY, target=job)
+    bridge = FakeBridge(jobs=jobs(), oneshot_script=[reply(reply_obj)])
+    run_cycle(env, bridge, NOW)
+    (call,) = oneshots(bridge)
+    assert "bytes:" in json.dumps(call)
+    assert searched == []
+    assert reducer_files(env) == {}
+
+
+def test_select_skips_cheap_candidates(env):
+    from hermes_tuner.cycle import CycleReport, _Cycle
+    from hermes_tuner.detect import Candidate
+
+    def cand(usd, key):
+        return Candidate(kind="bytes", key=key, job_id=CAL, sessions=10, occurrences=10,
+                         result_chars=1000, est_monthly_usd=usd)
+    c = _Cycle(env, FakeBridge(jobs=jobs()), NOW, CycleReport())
+    c.ledger = Ledger.load(env.root)
+    assert c._select([cand(0.04, "bytes:a"), cand(0.06, "bytes:b")]) == [cand(0.06, "bytes:b")]
+    assert c._select([cand(0.05, "bytes:c")]) == [cand(0.05, "bytes:c")]  # at the floor: kept
+    assert c._select([cand(0.04, "bytes:a")]) == []
+
+
+@pytest.mark.parametrize("kept_tool, blocked", [(GET, True), (SEARCH, False)])
+def test_no_second_reducer_for_same_tool(env, kept_tool, blocked):
+    kept = Fix("20261001-r0000bbbb", "reducer", CAL,
+               {"tool": kept_tool, "job": CAL, "steps": [{"op": "collapse_ws"}],
+                "_base": CAL_BASE}, "bytes:" + kept_tool)
+    add_record(env, FixRecord(kept.id, "reducer", CAL, kept.candidate_key, "kept",
+                              NOW - 18 * DAY, applied_at=NOW - 18 * DAY,
+                              live_from=NOW - 18 * DAY, baseline_runs=[]), kept)
+    build(env, bytes_runs(CAL))
+    bridge = FakeBridge(jobs=jobs())
+    report = run_cycle(env, bridge, NOW)
+    led = Ledger.load(env.root)
+    assert oneshots(bridge) == [] and report.errors == []
+    if blocked:
+        assert [r.id for r in led.records] == [kept.id]
+        assert reducer_files(env) == {}
+        return
+    (new,) = [r for r in led.records if r.id != kept.id]  # control: another tool is free
+    assert new.kind == "reducer" and new.state == "shadow_pending"
+
+
+def test_detect_counts_composed_tool_results_under_the_tool_it_calls(env):
+    """aliases from tools/*/tool.json: a composed tool calling one tool is counted as
+    that tool, so its bytes reach the reducer route (and the search finds no direct
+    calls to replay). Unreadable tool.json files are skipped."""
+    tools = env.root / "tools"
+    (tools / "tuned_get").mkdir(parents=True)
+    (tools / "tuned_get" / "tool.json").write_text(json.dumps({"name": "tuned_get",
+                                                               "calls": [GET]}))
+    (tools / "broken").mkdir()
+    (tools / "broken" / "tool.json").write_text("{not json")
+    build(env, bytes_runs(CAL, tool="tuned_get"))
+    bridge = FakeBridge(jobs=jobs())
+    run_cycle(env, bridge, NOW)
+    (rec,) = Ledger.load(env.root).records
+    assert rec.candidate_key == "bytes:" + GET and rec.kind == "reducer"
+    assert rec.reason == "reducer search: no_runs"
+    assert oneshots(bridge) == []
+
+
+def reducer_setup(env, events=None, live=True):
+    """A shadow-pending calendar reducer whose shadow ran at 06:40 yesterday, with its
+    shadow-only reducer file, and (if `live`) a live run at 07:00. `events`: lines for
+    reducer_events/<fix id>.jsonl (default: one reduction in the shadow session)."""
+    shadow_sid = sid(SHADOW_JOB, SHADOW_T)
+    sessions = cal_runs(range(2, 30), 0.10)
+    sessions.append({"id": shadow_sid, "source": "cron", "started_at": SHADOW_T,
+                     "in": 80_000, "out": 800, "calls": [(GET, {"message_id": "m1"}, "b")]})
+    if live:
+        live_t = SHADOW_T + 20 * 60
+        sessions.append({"id": sid(CAL, live_t), "source": "cron", "started_at": live_t,
+                         "in": 100_000, "out": 1000,
+                         "calls": [(GET, {"message_id": "m1"}, "b")]})
+    build(env, sessions)
+    payload = {"tool": GET, "job": CAL, "steps": [{"op": "collapse_ws"}], "_base": CAL_BASE}
+    fix = Fix(RFIX, "reducer", CAL, payload, "bytes:" + GET)
+    from hermes_tuner.ledger import write_shadow_reducer
+    write_shadow_reducer(env.root, payload, fix.id)
+    add_record(env, FixRecord(fix.id, "reducer", CAL, fix.candidate_key, "shadow_pending",
+                              NOW - DAY - 3600), fix)
+    (env.root / "shadow_jobs.json").write_text(json.dumps({SHADOW_JOB: {
+        "fix_id": fix.id, "live_job_id": CAL, "run_at": SHADOW_T,
+        "created_at": NOW - DAY - 3600, "scheduled_at": SCHEDULED_AT}}))
+    if events is None:
+        events = [{"session_id": shadow_sid, "tool_call_id": "c0", "before": 900, "after": 400}]
+    if events:
+        d = env.root / "reducer_events"
+        d.mkdir()
+        (d / f"{fix.id}.jsonl").write_text("\n".join(
+            e if isinstance(e, str) else json.dumps(e) for e in events) + "\n")
+    return fix
+
+
+def test_reducer_goes_live_after_good_shadow(env):
+    fix = reducer_setup(env)
+    bridge = FakeBridge(jobs=jobs())
+    report = run_cycle(env, bridge, NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert rec.state == "trial" and rec.applied_at == NOW, rec.reason
+    assert rec.baseline_runs  # stored at go-live, as for other job fixes
+    assert reducer_files(env)[f"{fix.id}.json"]["shadow_only"] is False
+    assert [c for c in bridge.calls if c[0] == "update_job"] == []
+    assert fix.id in report.applied
+
+
+LIVE_SID = sid(CAL, SHADOW_T + 20 * 60)
+
+
+@pytest.mark.parametrize("events", [
+    [],                                                                    # no event file
+    [{"session_id": LIVE_SID, "tool_call_id": "c0", "before": 9, "after": 4}],  # other session
+    [{"session_id": sid(SHADOW_JOB, SHADOW_T), "tool_call_id": "c0", "error": "TypeError"}],
+    ["{broken", "[1]"],
+])
+def test_reducer_shadow_without_events_fails(env, events):
+    fix = reducer_setup(env, events=events)
+    run_cycle(env, FakeBridge(jobs=jobs()), NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert rec.state == "shadow_failed" and rec.reason == "shadow never reduced a result"
+    assert reducer_files(env) == {}
+
+
+def test_reducer_event_in_a_compressed_child_of_the_shadow_counts(env):
+    """The hook logs the agent's current session id: after compression, a child id."""
+    child = "20261018_064500_abcd12"
+    fix = reducer_setup(env, events=[{"session_id": child, "tool_call_id": "c0",
+                                      "before": 900, "after": 400}])
+    import sqlite3
+    conn = sqlite3.connect(env.db)
+    conn.execute("update sessions set end_reason = 'compression' where id = ?",
+                 (sid(SHADOW_JOB, SHADOW_T),))
+    conn.execute("insert into sessions values (?,?,?,?,?,?,?,?,?,?,?)",
+                 (child, "cron", SHADOW_T + 300, 0, 0, 0, 0, 0.0, "m",
+                  sid(SHADOW_JOB, SHADOW_T), None))
+    conn.commit()
+    conn.close()
+    run_cycle(env, FakeBridge(jobs=jobs()), NOW)
+    assert Ledger.load(env.root).get(fix.id).state == "trial"
+
+
+def test_reducer_go_live_needs_plugin(env):
+    fix = reducer_setup(env)
+    (env.root / "cycle_state.json").write_text(json.dumps({"restart_times": [SHADOW_T - 3600]}))
+    heartbeat(env, SHADOW_T - 7200)  # from before that restart: plugin not reloaded
+    bridge = FakeBridge(jobs=jobs())
+    report = run_cycle(env, bridge, NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert rec.state == "shadow_pending" and rec.applied_at is None
+    assert f"plugin not loaded; {fix.id} not applied" in report.errors
+    assert reducer_files(env)[f"{fix.id}.json"]["shadow_only"] is True
+
+
+def test_reducer_shadow_not_scheduled_removes_its_file(env):
+    """The live job has no next run: the shadow cannot be scheduled, the record is
+    rejected and the shadow-only reducer file written for it is removed."""
+    build(env, bytes_runs(CAL))
+    js = jobs()
+    js[CAL]["next_run_at"] = None
+    bridge = FakeBridge(jobs=js)
+    run_cycle(env, bridge, NOW)
+    (rec,) = Ledger.load(env.root).records
+    assert rec.kind == "reducer" and rec.state == "rejected"
+    assert rec.reason.startswith("shadow not scheduled")
+    assert reducer_files(env) == {}
+
+
+def test_reducer_search_error_reports_only_its_type(env, monkeypatch):
+    """An unexpected error inside the search is reported by type: its message could
+    hold result text, which never leaves the tuner process."""
+    from hermes_tuner import cycle_draft
+
+    def boom(*a, **k):
+        raise KeyError(RESULT_SENTINEL)
+    monkeypatch.setattr(cycle_draft, "search_reducer", boom)
+    build(env, bytes_runs(CAL))
+    report = run_cycle(env, FakeBridge(jobs=jobs()), NOW)
+    assert report.errors == ["reducer search bytes:" + GET + ": unexpected KeyError"]
+    assert Ledger.load(env.root).records == []
+    assert RESULT_SENTINEL not in (env.root / "cycle_state.json").read_text()
