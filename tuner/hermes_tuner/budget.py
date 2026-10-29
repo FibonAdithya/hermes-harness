@@ -95,9 +95,10 @@ def weekly_line(ledger: Ledger, sessions: list[Session], now: float,
     none ("pricing unavailable").
 
     With a price list, fixes kept or rolled back in the 28 days before `now` that
-    carry both an estimated and a measured saving per run add their sums ("estimates:
-    ... vs measured ..."). `parked` is the number of candidates drafting left parked
-    this run (backoff); it is shown when above 0."""
+    carry both an estimated and a measured saving per run add the means of each over
+    those fixes ("estimates: ... vs measured ... per run (mean of n fixes)").
+    `parked` is the number of candidates drafting left parked this run (backoff); it
+    is shown when above 0."""
     if since is None:
         since = now - 7 * DAY
 
@@ -123,10 +124,11 @@ def weekly_line(ledger: Ledger, sessions: list[Session], now: float,
                   and r.est_saving_per_run is not None
                   and r.measured_saving_per_run is not None]
         if judged:
-            est = sum(r.est_saving_per_run for r in judged)
-            meas = sum(r.measured_saving_per_run for r in judged)
-            line += (f"; estimates: {_money(est)} vs measured {_money(meas)} per run over "
-                     f"{len(judged)} fixes")
+            n = len(judged)
+            est_mean = sum(r.est_saving_per_run for r in judged) / n
+            meas_mean = sum(r.measured_saving_per_run for r in judged) / n
+            line += (f"; estimates: {_money(est_mean)} vs measured {_money(meas_mean)} per run "
+                     f"(mean of {n} fixes)")
     if parked > 0:
         line += f"; parked: {parked}"
     if errors:

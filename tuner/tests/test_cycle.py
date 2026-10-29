@@ -14,6 +14,7 @@ from hermes_tuner import policy
 from hermes_tuner.__main__ import main
 from hermes_tuner.bridge import FakeBridge as _FakeBridge
 from hermes_tuner.cycle import CycleConfig, run_cycle, weekly_line
+from hermes_tuner.history import History, HistoryUnavailable
 from hermes_tuner.ledger import FixRecord, Ledger, _tool_files, write_shadow_tool
 from hermes_tuner.model import Fix, Session, ToolCall
 from hermes_tuner.proposals import change_hash
@@ -2173,10 +2174,15 @@ def test_early_rollback_runs_without_pricing(env):
 def reducer_trial(env, case):
     """A calendar reducer on trial, live 5 days: baseline runs (days 6-30) read each
     message once; 4 trial runs (days 1-4). Events: 20 reductions and 1 error in the
-    trial runs, 1 error in a baseline run (not the trial's), a trial line with neither
-    key, 2 unreadable lines.
+    trial runs, 1 error in a baseline run (not the trial's), a reduction and an error
+    in a shadow run of the job (neither the trial's), a trial line with neither key,
+    2 unreadable lines.
     case "child": a second trial error, logged under a compressed child's id.
-    case "reread": trial run 3 reads m3 twice (1 re-read; the baseline mean is 0)."""
+    case "reread": trial run 3 reads m3 twice (1 re-read; the baseline mean is 0).
+    case "window": trial re-reads [1, 30, 0, 0] against 25 baseline runs with 0, and
+    2 runs (days 34-35) more than 28 days before live_from with 50 re-reads each. Right:
+    2 runs exceed the mean 0. Trial runs leaking into the baseline (mean 31/29): 1.
+    The older runs counted (mean 100/27): 1."""
     base = NOW - 3 * 3600 + 6 * 3600
     live = NOW - 5 * DAY
 
@@ -2184,11 +2190,19 @@ def reducer_trial(env, case):
         return {"id": sid(CAL, base - d * DAY), "source": "cron", "started_at": base - d * DAY,
                 "in": tok(0.10) - 500, "out": 500, "calls": calls}
     sessions = [run(d, [(GET, {"message_id": f"m{d}"}, "b")]) for d in range(6, 31)]
+    if case == "window":
+        sessions += [run(d, [(GET, {"message_id": f"m{d}"}, "b")] * 51) for d in (34, 35)]
+    shadow_sid = sid(SHADOW_JOB, base - 3 * DAY - 1200)
+    sessions.append({"id": shadow_sid, "source": "cron", "started_at": base - 3 * DAY - 1200,
+                     "in": 100, "out": 10, "calls": [(GET, {"message_id": "m3"}, "b")]})
     trial_ids = []
+    window = {4: 1, 3: 30, 2: 0, 1: 0}
     for d in (4, 3, 2, 1):
         calls = [(GET, {"message_id": f"m{d}"}, "b")]
         if case == "reread" and d == 3:
             calls.append((GET, {"message_id": "m3"}, "b"))
+        if case == "window":
+            calls += [(GET, {"message_id": f"m{d}"}, "b")] * window[d]
         sessions.append(run(d, calls))
         trial_ids.append(sessions[-1]["id"])
     child = "20261017_064500_abcd12"
@@ -2210,6 +2224,8 @@ def reducer_trial(env, case):
     events.append({"session_id": trial_ids[0], "tool_call_id": "e0", "error": "TypeError"})
     events.append({"session_id": sid(CAL, base - 10 * DAY), "tool_call_id": "e1",
                    "error": "ambiguous"})
+    events.append({"session_id": shadow_sid, "tool_call_id": "s0", "before": 9, "after": 4})
+    events.append({"session_id": shadow_sid, "tool_call_id": "s1", "error": "ambiguous"})
     if case == "child":
         events.append({"session_id": child, "tool_call_id": "e2", "error": "ambiguous"})
     d = env.root / "reducer_events"
@@ -2220,17 +2236,70 @@ def reducer_trial(env, case):
     return fix
 
 
-@pytest.mark.parametrize("case", ["none", "child", "reread"])
-def test_reducer_trial_rolls_back_early(env, case):
+@pytest.mark.parametrize("case, failures", [("none", 1), ("child", 2), ("reread", 2),
+                                            ("window", 3)])
+def test_reducer_trial_rolls_back_early(env, case, failures):
+    """The shadow run's reduction and error count as neither a call nor a failure:
+    calls stay 20, and "none" stays at 1 failure (5%)."""
     fix = reducer_trial(env, case)
+    (env.root / "shadow_jobs.json").write_text(json.dumps({SHADOW_JOB: {
+        "fix_id": "20261012-r0000bbbb", "live_job_id": CAL, "run_at": NOW - 3 * DAY,
+        "created_at": NOW - 4 * DAY, "scheduled_at": NOW - 4 * DAY,
+        "removed_at": NOW - 2 * DAY}}))
     report = run_cycle(env, FakeBridge(jobs=jobs()), NOW)
     rec = Ledger.load(env.root).get(fix.id)
     assert rec.trial_runs == 4
-    if case == "none":  # 1 failure in 20 calls: 5%
+    if case == "none":
         assert rec.state == "trial", rec.reason
         return
     assert rec.state == "rolled_back" and fix.id in report.rolled_back
-    assert rec.reason == "trial: 2 failures in 20 calls (early)"
+    assert rec.reason == f"trial: {failures} failures in 20 calls (early)"
+
+
+class LockedHistory(History):
+    """A state.db whose message reads fail as sqlite does when locked past its timeout."""
+
+    def call_results(self, session_id):
+        raise HistoryUnavailable("database is locked")
+
+    def chain_ids(self, root_id):
+        raise HistoryUnavailable("database is locked")
+
+
+@pytest.mark.parametrize("kind", ["composed_tool", "reducer"])
+def test_history_failure_in_early_check_does_not_stop_judging(env, kind):
+    """A locked state.db during one record's early check is logged (type and message
+    only) and that record waits; a later record 30 days past live_from is still rolled
+    back at the deadline."""
+    from hermes_tuner.cycle import CycleReport, _Cycle
+    if kind == "composed_tool":
+        fix, bridge = composed_trial(env)
+        env.db.unlink()
+        build(env, SETUP_SESSIONS[env.root] + own_tool_runs([[TOOL_ERR] * 5]))
+        now, other, prompt = NOW + 3 * DAY, CAL, "Sync the calendar."
+    else:
+        fix, bridge = reducer_trial(env, "child"), FakeBridge(jobs=jobs())
+        now, other, prompt = NOW, TRIAGE, "Triage the inbox."
+    old = Fix("20260920-aaaa0010", "job_prompt", other, {"prompt": "p", "add_toolsets": []},
+              "seq:old")
+    led = add_record(env, FixRecord(old.id, old.kind, other, "seq:old", "trial", now - 31 * DAY,
+                                    applied_at=now - 30 * DAY, live_from=now - 30 * DAY,
+                                    baseline_runs=[brk(0.10)] * 10), old)
+    vdir = led.version_dir(old.id)
+    (vdir / "before.json").write_text(json.dumps({"prompt": prompt,
+                                                  "enabled_toolsets": ["google"]}))
+    (vdir / "after.json").write_text(json.dumps({"prompt": "p", "enabled_toolsets": ["google"]}))
+    bridge.jobs[other]["prompt"] = "p"
+    c = _Cycle(env, bridge, now, CycleReport())
+    c.ledger, c.state, c.pricing, c.shadow_ids = Ledger.load(env.root), {}, FLAT, set()
+    c.history = LockedHistory.open(env.db)
+    c.sessions = c.history.sessions(now - 60 * DAY)
+    c.judge_trials()
+    led = Ledger.load(env.root)
+    assert led.get(fix.id).state == "trial"
+    assert led.get(old.id).state == "rolled_back"
+    assert led.get(old.id).reason == "no verdict in 21 days"
+    assert c.report.errors == [f"early check {fix.id}: HistoryUnavailable: database is locked"]
 
 
 def test_trial_runs_written(env):
@@ -2314,19 +2383,19 @@ def test_weekly_line_estimates(tmp_path):
     led = Ledger(tmp_path)
     decided(led, 1, "kept", 2, 0.02, 0.01)
     assert weekly_line(led, [], NOW, FLAT).endswith(
-        "; estimates: $0.02 vs measured $0.01 per run over 1 fixes")
+        "; estimates: $0.02 vs measured $0.01 per run (mean of 1 fixes)")
 
 
 def test_weekly_line_estimates_sum_decided_fixes_of_28_days(tmp_path):
     led = Ledger(tmp_path)
     decided(led, 1, "kept", 2, 0.02, 0.01)
-    decided(led, 2, "rolled_back", 28 - 1 / 24, 0.03, -0.04)   # 27 days 23 h ago: in
+    decided(led, 2, "rolled_back", 28 - 1 / 24, 0.04, -0.05)   # 27 days 23 h ago: in
     decided(led, 3, "kept", 28, 1.00, 1.00)                    # 28 days ago: out
     decided(led, 4, "kept", 3, 1.00, None)                     # no measurement: out
     decided(led, 5, "rolled_back", 3, None, 1.00)              # no estimate: out
     decided(led, 6, "trial", 3, 1.00, 1.00)                    # not decided: out
     line = weekly_line(led, [], NOW, FLAT)
-    assert line.endswith("; estimates: $0.05 vs measured -$0.03 per run over 2 fixes")
+    assert line.endswith("; estimates: $0.03 vs measured -$0.02 per run (mean of 2 fixes)")
 
 
 def test_weekly_line_without_estimates_or_pricing_has_no_clause(tmp_path):
@@ -2343,7 +2412,7 @@ def test_weekly_line_parked(tmp_path):
     assert weekly_line(led, [], NOW, FLAT, errors=1, parked=3) == (
         "Hermes tuner: saved ~$0.00 this week (ESTIMATE at fake-model list prices, "
         "fake-flat), 0 applied, 1 kept, 0 rolled back; tuner spent $0.00"
-        "; estimates: $0.02 vs measured $0.01 per run over 1 fixes; parked: 3"
+        "; estimates: $0.02 vs measured $0.01 per run (mean of 1 fixes); parked: 3"
         "; errors: 1 (see ~/.hermes/tuner/cycle_state.json and ledger.json)")
     assert "parked" not in weekly_line(led, [], NOW, FLAT, parked=0)
 

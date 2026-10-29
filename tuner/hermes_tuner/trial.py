@@ -428,7 +428,11 @@ def early_failures(kind: str, own_results: list[str], reduce_errors: int,
     reducer: failures are `reduce_errors` (the hook's error lines for the trial runs)
     plus the trial runs whose re-reads exceed the mean of `baseline_rereads` (none
     with no baseline runs); calls is `reduced`, the results it reduced. Other kinds
-    have no tool of their own: (0, 0)."""
+    have no tool of their own: (0, 0).
+
+    So the denominator of the EARLY_FAIL_SHARE test differs by kind: for a composed
+    tool it is every call, failures included; for a reducer only the results it
+    reduced (its errors and re-read runs are not in it)."""
     if kind == "composed_tool":
         return sum(call_failed(t) for t in own_results), len(own_results)
     if kind == "reducer":

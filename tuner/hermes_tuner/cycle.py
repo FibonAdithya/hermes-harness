@@ -585,9 +585,17 @@ class _Cycle(DraftSteps):
 
     def _early_failures(self, rec: FixRecord, runs: list[Session]) -> tuple[int, int]:
         """trial.early_failures for a job fix's trial `runs`. A fix that cannot be read
-        has nothing to count: (0, 0)."""
+        has nothing to count: (0, 0). So does a state.db read that fails (locked past
+        its timeout): logged, and the record's verdict and deadline still run."""
         if rec.kind not in ("composed_tool", "reducer"):
             return 0, 0
+        try:
+            return self._count_early_failures(rec, runs)
+        except HistoryUnavailable as exc:
+            self.err(f"early check {rec.id}: {type(exc).__name__}: {exc}")
+            return 0, 0
+
+    def _count_early_failures(self, rec: FixRecord, runs: list[Session]) -> tuple[int, int]:
         try:
             fix = self.ledger.fix(rec.id)
         except (OSError, ValueError, TypeError):
