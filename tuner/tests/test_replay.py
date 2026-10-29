@@ -319,6 +319,50 @@ def test_search_refuses_cap_that_cuts_used_text():
     assert caps == [16000]                    # 8000 and below would cut the quote
 
 
+_CODE = "Room booking code QX-7781-ALPHA for the offsite"
+
+
+def _survival_runs():
+    """Three runs. X's result ends with _CODE, which its run quotes later; Y's and Z's
+    results are short and also contain _CODE, but their runs quote nothing. Each result
+    holds two copies of its text, so dropping "s" halves the bytes."""
+    runs = []
+    for i, body in enumerate([_FILL[:6000], _FILL[:200], _FILL[:210]]):
+        text = body + " " + _CODE
+        said = [(2, _CODE)] if i == 0 else []
+        runs.append(_run(i, [_call(1, json.dumps({"a": text, "s": text}))], said))
+    return runs
+
+
+def test_search_checks_survival_in_each_result_not_the_union():
+    """A cap that cuts X's used string would pass if survival were checked against all
+    reduced texts at once (Y and Z still hold the string). It must be rejected: each
+    result's used strings must survive in that same result."""
+    runs = _survival_runs()
+    r = search_reducer(runs, GMAIL_GET, CAL, [], NOUS_V4_PRO)
+    assert r.reason == "ok" and r.used_total == 1 and r.used_kept == 1
+    assert [st["op"] for st in r.spec["steps"]] == ["drop_fields"]
+    x = runs[0].calls[0].text
+    assert survives(norm(_CODE), apply_reducer(r.spec, x))
+    # The control: the 2,000-char cap does cut X's string, and leaves Y's.
+    cap = {**r.spec, "steps": r.spec["steps"] + [{"op": "cap", "chars": 2000}]}
+    assert not survives(norm(_CODE), apply_reducer(cap, x))
+    assert survives(norm(_CODE), apply_reducer(cap, runs[1].calls[0].text))
+
+
+def test_used_kept_is_recounted_on_the_final_spec():
+    """used_kept is counted by re-applying the final steps to each result, not copied
+    from used_total. The test-only `final_steps` seam makes the stored steps lose X's
+    used string: used_kept < used_total and no spec."""
+    runs = _survival_runs()
+    r = search_reducer(runs, GMAIL_GET, CAL, [], NOUS_V4_PRO,
+                       final_steps=lambda steps: steps + [{"op": "cap", "chars": 2000}])
+    assert (r.used_total, r.used_kept) == (1, 0)
+    assert r.spec is None and r.reason == "used_lost"
+    same = search_reducer(runs, GMAIL_GET, CAL, [], NOUS_V4_PRO, final_steps=list)
+    assert same == search_reducer(runs, GMAIL_GET, CAL, [], NOUS_V4_PRO)
+
+
 def test_search_no_runs():   # Review Focus 4
     r = search_reducer([], GMAIL_GET, CAL, [], NOUS_V4_PRO)
     assert r.reason == "no_runs" and r.spec is None

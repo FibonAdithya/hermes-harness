@@ -124,13 +124,13 @@ def boilerplate(used: Iterable[str], results: Sequence[str]) -> frozenset[str]:
 @dataclass(frozen=True)
 class ReducerResult:
     spec: dict | None
-    reason: str          # "ok" | "no_runs" | "too_few_sessions" | "cut_below_min"
+    reason: str          # "ok" | "no_runs" | "too_few_sessions" | "cut_below_min" | "used_lost"
     sessions: int        # runs with at least one result for the tool
     results: int
     bytes_before: int
     bytes_after: int
     used_total: int      # (result, used string) pairs that must survive
-    used_kept: int
+    used_kept: int       # of used_total, still in the same result under the final steps
     est_saving_per_run: float   # carried_usd(before) - carried_usd(after), summed, / sessions
 
 
@@ -197,12 +197,17 @@ def _evaluate(steps: list[dict], texts: Sequence[str], used: Sequence[frozenset[
 
 
 def search_reducer(runs: Sequence[ReplayRun], tool: str, job: str, exclude: Sequence[str],
-                   pricing: Pricing) -> ReducerResult:
+                   pricing: Pricing, *,
+                   final_steps: Callable[[list[dict]], list[dict]] | None = None
+                   ) -> ReducerResult:
     """Greedy search for the reducer that cuts most bytes of `tool`'s results.
 
     Every used string (minus boilerplate) of every replayed result must survive.
-    Reads text in-process only; the result holds a spec of op names, field names
-    and hosts, plus counts.
+    After the search, the final steps are applied again to each result and the used
+    strings still in that same result are counted (used_kept); the spec is kept only
+    when that is every one (else reason "used_lost"). `final_steps` (tests only) maps
+    the searched steps to the stored ones. Reads text in-process only; the result
+    holds a spec of op names, field names and hosts, plus counts.
     """
     calls: list[ReplayCall] = []
     used: list[frozenset[str]] = []
@@ -247,17 +252,26 @@ def search_reducer(runs: Sequence[ReplayRun], tool: str, job: str, exclude: Sequ
         else:
             cands = [c for c in cands if c["op"] != cand["op"]]
 
+    if final_steps is not None:
+        steps = final_steps(list(steps))
+    # Recount on the stored steps, independently of the search's own checks.
+    reduced = [apply_reducer({"steps": steps}, t) for t in texts]
+    total = sum(len(r) for r in reduced)
+    used_kept = sum(sum(1 for u in need if survives(u, red))
+                    for need, red in zip(used, reduced))
     saving = sum(carried_usd(c.chars, c.later_turns, pricing)
                  - carried_usd(len(r), c.later_turns, pricing) for c, r in zip(calls, reduced))
     if sessions < policy.REPLAY_MIN_SESSIONS:
         reason = "too_few_sessions"
     elif before == 0 or (before - total) < policy.REDUCER_MIN_CUT * before:
         reason = "cut_below_min"
+    elif used_kept != used_total:
+        reason = "used_lost"
     else:
         reason = "ok"
     spec = {"tool": tool, "job": job, "steps": steps} if reason == "ok" else None
     return ReducerResult(spec, reason, sessions, len(calls), before, total,
-                         used_total, used_total, saving / sessions)
+                         used_total, used_kept, saving / sessions)
 
 
 # --- composed-tool replay ------------------------------------------------------------
