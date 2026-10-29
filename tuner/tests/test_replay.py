@@ -461,6 +461,59 @@ def test_replay_composed_under_the_cap_replays_every_run_by_ref():
     assert rep.eligible == 3
 
 
+LABELS = "mcp__google__modify_gmail_message_labels"
+LABEL_BATCH = {
+    "name": "tuned_label", "description": "label messages", "mutating": True,
+    "parameters": {"type": "object", "properties": {"message_ids": {"type": "array"}}},
+    "calls": [LABELS], "job_prompt": None,
+    "replay_inputs": [{"param": "message_ids", "from_call": LABELS, "arg": "message_id",
+                       "collect": "list"}],
+    "program": (f"def main(args, call):\n"
+                f"    return len([call({LABELS!r}, {{'message_id': m, 'add_label_ids': ['STARRED']}})\n"
+                f"                for m in args['message_ids']])\n"),
+}
+
+
+def _label_run(i, n=5, chars=300):
+    """A run of `n` recorded label calls (made-up text), one per later turn."""
+    calls = tuple(
+        ReplayCall(pos=k + 1, call_id=f"l{i}-{k}", name=LABELS,
+                   args={"message_id": f"m{i}-{k}", "add_label_ids": ["STARRED"],
+                         "user_google_email": EMAIL},
+                   text=(f"labelled {i}-{k} " + "q" * chars)[:chars], chars=chars, turn=k + 1,
+                   later_turns=3, ref=f"m{i}-{k}")
+        for k in range(n))
+    return ReplayRun(f"cron_x_{i}", 1000.0 * i, calls, ())
+
+
+def test_replay_composed_counts_mutating_calls_by_their_dry_run_intents():
+    """A tool that only calls a mutating tool: the relay records each call as a dry-run
+    intent and never asks the stub. An intent for the same tool and ref as a replaced
+    call serves it, so the runs count and the saving gate is reached. Catches: replay
+    ignoring intents (sessions 0, "too few sessions")."""
+    runs = [_label_run(i) for i in range(4)]
+    rep = replay_composed(LABEL_BATCH, runs, relay().run_program, pricing=FLAT,
+                          argv_for=_argv)
+    assert (rep.sessions, rep.limit_hits, rep.errors, rep.reason) == (4, 0, 0, "ok")
+    assert rep.in_bytes == 4 * 5 * 300
+    out = json.dumps({"result": 5})
+    assert rep.out_bytes == 4 * len(out)
+    want = carried_usd(5 * 300, 3, FLAT) - carried_usd(len(out), 3, FLAT)
+    assert rep.saving_per_run == pytest.approx(want)
+    assert composed_gate(rep, composed_monthly(rep, 1.0)) is None
+    assert composed_gate(rep, 0.0) == "replay: saving below floor"
+
+
+def test_replay_intent_for_an_unrecorded_ref_serves_nothing():
+    """An intent whose ref matches no replaced call of that tool serves nothing."""
+    prog = (f"def main(args, call):\n"
+            f"    return call({LABELS!r}, {{'message_id': 'never-recorded'}})\n")
+    runs = [_label_run(i, n=2) for i in range(3)]
+    rep = replay_composed({**LABEL_BATCH, "program": prog}, runs, relay().run_program,
+                          pricing=FLAT, argv_for=_argv)
+    assert (rep.sessions, rep.reason) == (0, "too_few_sessions")
+
+
 def _fake(out):
     seen = []
 

@@ -347,6 +347,25 @@ def _replay_args(payload: dict, calls: Sequence[ReplayCall]) -> dict | None:
     return out
 
 
+def _intent_served(replaced: Sequence[ReplayCall], intents: list) -> dict[int, ReplayCall]:
+    """Replaced calls a dry-run intent stands for: the relay records a mutating call as
+    an intent and never forwards it to the stub. An intent serves the first replaced
+    call of the same tool and the same ref (message_id, else query), by position."""
+    by_ref: dict[tuple[str, str], ReplayCall] = {}
+    for c in replaced:
+        if c.ref is not None:
+            by_ref.setdefault((c.name, c.ref), c)
+    out: dict[int, ReplayCall] = {}
+    for it in intents:
+        tool = it.get("tool") if isinstance(it, dict) else None
+        args = it.get("args") if isinstance(it, dict) else None
+        ref = _key_ref(args) if isinstance(args, dict) else None
+        hit = by_ref.get((tool, ref)) if isinstance(tool, str) and ref is not None else None
+        if hit is not None:
+            out.setdefault(hit.pos, hit)
+    return out
+
+
 def replay_composed(payload: dict, runs: Sequence[ReplayRun],
                     run_program: Callable[..., str], *, pricing: Pricing,
                     argv_for: Callable[[str], list[str]],
@@ -358,7 +377,8 @@ def replay_composed(payload: dict, runs: Sequence[ReplayRun],
     relay.run_program's signature; `argv_for(container_name)` gives the runner argv.
     A run starts only while REPLAY_TIMEOUT_S + 30 s fit in `budget_s` (seconds left,
     measured by `clock`; no limit when either is None). A run counts as a session only
-    if the stub served a call and no lookup missed, unless it hit a limit. Its saving
+    if a call was served and no lookup missed, unless it hit a limit. A mutating call
+    is served by a dry-run intent for the same tool and ref (_intent_served). Its saving
     credits only the served calls. Result text stays in this process and the sandbox;
     the result holds counts."""
     tools = frozenset(payload["calls"])
@@ -381,15 +401,17 @@ def replay_composed(payload: dict, runs: Sequence[ReplayRun],
             out_of_time = True
             break
         stub = _Stub(replaced)
+        intents: list[dict] = []
         name = f"tuner-replay-{uuid.uuid4().hex[:8]}"
         out = run_program(payload["program"], args, call=stub, runner_argv=argv_for(name),
-                          dry_run=True, intents=[], timeout_s=policy.REPLAY_TIMEOUT_S,
+                          dry_run=True, intents=intents, timeout_s=policy.REPLAY_TIMEOUT_S,
                           max_calls=policy.MAX_CALLS, max_output=policy.MAX_OUTPUT_BYTES,
                           allowed=tools, container_name=name)
+        by_pos = dict(stub.served) | _intent_served(replaced, intents)
         hit = limit_hit(out)
-        if not hit and (stub.missed or not stub.served):
+        if not hit and (stub.missed or not by_pos):
             continue
-        served = [stub.served[p] for p in sorted(stub.served)]
+        served = [by_pos[p] for p in sorted(by_pos)]
         first = served[0] if served else replaced[0]
         sessions += 1
         in_bytes += sum(len(c.text.encode()) for c in served)
