@@ -302,3 +302,44 @@ def test_scrub_until_is_exclusive(tmp_path):
     assert [s.id for s in scrub.load(out)] == [_sid("2026-10-28")]
     assert main(["scrub", "--db", str(db), "--out", str(out)]) == 0
     assert [s.id for s in scrub.load(out)] == [_sid(d) for d in days]
+
+
+# --- replay-check: exception paths print the type only ---------------------------------
+
+def _leaks(secret: str, printed: str) -> set[str]:
+    return {secret[j:j + 20] for j in range(len(secret) - 19) if secret[j:j + 20] in printed}
+
+
+def test_replay_check_reducer_error_prints_type_only(tmp_path, capsys):
+    """A search that raises with recorded text in its message: the line says
+    error:ValueError and the message is not printed. Catches: str(exc) in the line."""
+    db, _ = _db(tmp_path)
+    secret = _email(0, 0)[0][:120]
+
+    def search(runs, tool, job, exclude, pricing):
+        raise ValueError(secret)
+
+    assert main(["replay-check", "--job", CAL, "--db", str(db), "--now", "2026-10-29",
+                 "--tool", GET, "--pricing", str(_pricing(tmp_path))],
+                bridge=_bridge(), search=search) == 0
+    cap = capsys.readouterr()
+    (line,) = _lines(cap.out)
+    assert line == {"tool": GET, "reason": "error:ValueError"}
+    assert _leaks(secret, cap.out + cap.err) == set()
+
+
+def test_replay_check_composed_error_prints_type_only(tmp_path, capsys):
+    db, _ = _db(tmp_path)
+    secret = _email(1, 1)[0][:120]
+
+    def run_program(*a, **kw):
+        raise ValueError(secret)
+
+    assert main(["replay-check", "--job", CAL, "--db", str(db), "--now", "2026-10-29",
+                 "--pricing", str(_pricing(tmp_path)), "--composed", str(_tool_dir(tmp_path)),
+                 "--replay-input", REPLAY_INPUT],
+                bridge=_bridge(), run_program=run_program, replay_argv=lambda n: RUNNER) == 0
+    cap = capsys.readouterr()
+    (line,) = _lines(cap.out)
+    assert line == {"tool": TOOL_NAME, "reason": "error:ValueError"}
+    assert _leaks(secret, cap.out + cap.err) == set()

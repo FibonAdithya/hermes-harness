@@ -18,7 +18,8 @@ from .detect import DAY, detect
 from .history import History, HistoryUnavailable
 from .model import Pricing
 from . import limits, policy, scrub
-from .replay import composed_gate, composed_monthly, replay_composed, search_reducer
+from .replay import (ReducerResult, composed_gate, composed_monthly, replay_composed,
+                     search_reducer)
 
 DEFAULT_HOME = "/home/hermes/.hermes"
 
@@ -91,10 +92,11 @@ def _load_tool(parser: argparse.ArgumentParser, d: Path, inputs: list[dict]) -> 
     return payload
 
 
-def _reducer_line(tool: str, job: str, runs, exclude: list[str], pricing: Pricing) -> dict:
+def _reducer_line(tool: str, job: str, runs, exclude: list[str], pricing: Pricing,
+                  search: Callable[..., ReducerResult]) -> dict:
     """One tool's search as counts: no spec params, field names, hosts or text."""
     try:
-        r = search_reducer(runs, tool, job, exclude, pricing)
+        r = search(runs, tool, job, exclude, pricing)
     except Exception as exc:  # noqa: BLE001 - the type only: a message could hold text
         return {"tool": tool, "reason": f"error:{type(exc).__name__}"}
     return {"tool": tool, "reason": r.reason, "sessions": r.sessions, "results": r.results,
@@ -130,7 +132,8 @@ def _composed_line(payload: dict, runs, pricing: Pricing,
 def _replay_check(parser: argparse.ArgumentParser, args: argparse.Namespace,
                   bridge: Bridge | None, now: float | None,
                   run_program: Callable[..., str] | None,
-                  replay_argv: Callable[[str], list[str]] | None) -> int:
+                  replay_argv: Callable[[str], list[str]] | None,
+                  search: Callable[..., ReducerResult]) -> int:
     """Counts and pass/fail only: result text, argument values, field names and
     hosts never reach stdout or stderr."""
     if args.days < 1:
@@ -166,20 +169,23 @@ def _replay_check(parser: argparse.ArgumentParser, args: argparse.Namespace,
     prompt = job.get("prompt") if isinstance(job, dict) else None
     exclude = [prompt] if isinstance(prompt, str) else []
     for tool in [args.tool] if args.tool else sorted(policy.REDUCER_TOOLS):
-        print(json.dumps(_reducer_line(tool, args.job, runs, exclude, pricing), sort_keys=True))
+        print(json.dumps(_reducer_line(tool, args.job, runs, exclude, pricing, search), sort_keys=True))
     return 0
 
 
 def main(argv: list[str] | None = None, bridge: Bridge | None = None,
          now: float | None = None, run_program: Callable[..., str] | None = None,
-         replay_argv: Callable[[str], list[str]] | None = None) -> int:
+         replay_argv: Callable[[str], list[str]] | None = None,
+         search: Callable[..., ReducerResult] | None = None) -> int:
     """`run_program` and `replay_argv` (relay.run_program's signature, and the runner
     argv for a container name) are for composed replay-check; None means the plugin's
-    relay in Docker, as the cycle uses."""
+    relay in Docker, as the cycle uses. `search` (replay.search_reducer's signature)
+    is the reducer search; None means search_reducer."""
     parser = _parser()
     args = parser.parse_args(argv)
     if args.cmd == "replay-check":
-        return _replay_check(parser, args, bridge, now, run_program, replay_argv)
+        return _replay_check(parser, args, bridge, now, run_program, replay_argv,
+                             search if search is not None else search_reducer)
     if args.cmd == "pricing":
         b = bridge if bridge is not None else HermesBridge()
         print(json.dumps(Pricing.from_dict(b.pricing()).to_dict(), indent=2, sort_keys=True))
