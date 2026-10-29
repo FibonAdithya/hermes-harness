@@ -389,3 +389,24 @@ def test_skill_fix_must_rewrite_the_candidates_skill(tmp_path):
     assert check_fix(not_skill, c)
     right = Fix("f", "skill", bar, {"path": bar, "text": "new"}, "skill_load:bar")
     assert check_fix(right, c) == []
+
+
+def reducer(target="cc68e24f21cd", **over):
+    p = {"tool": GET, "job": "cc68e24f21cd", "steps": [{"op": "collapse_ws"}],
+         "_base": {"prompt": "do the thing", "enabled_toolsets": None}}
+    p.update(over)
+    return Fix("f5", "reducer", target, p, "k")
+
+
+def test_reducer_limits(tmp_path):
+    c = ctx(tmp_path)
+    assert check_fix(reducer(), c) == []
+    assert any("unknown op" in r for r in check_fix(reducer(steps=[{"op": "eval"}]), c))
+    reasons = check_fix(reducer(target="3bc4e11d29b1", job="3bc4e11d29b1"), c)
+    assert "job not a reducer job" in reasons
+    assert "tool not allowed" in check_fix(reducer(tool=LABEL), c)
+    # The spec's job is the fix's target: the hook scopes by spec["job"].
+    assert "reducer job must be the fix's target" in check_fix(
+        reducer(target="3bc4e11d29b1"), c)
+    assert "job 8da9a6857256 is never edited" in check_fix(
+        reducer(target="8da9a6857256", job="8da9a6857256"), c)

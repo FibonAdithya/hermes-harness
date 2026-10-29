@@ -18,7 +18,7 @@ from .trial import baseline_medians
 
 DAY = 86400.0
 BASELINE_DAYS = 28
-JOB_KINDS = frozenset({"job_prompt", "composed_tool"})
+JOB_KINDS = frozenset({"job_prompt", "composed_tool", "reducer"})
 SAVING_STATES = frozenset({"trial", "kept"})
 
 

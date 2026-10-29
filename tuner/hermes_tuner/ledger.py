@@ -7,6 +7,8 @@ Layout under `root` (the tuner directory):
     versions/<id>/before.json        the live values before apply
     versions/<id>/after.json         the values as written
     tools/<name>/{tool.json,program.py}   composed tools (read by the plugin)
+    reducers/<id>.json               result reducers (read by the plugin's
+                                     transform_tool_result hook)
 Every write is atomic (temp file in the same directory + os.replace), files 0600,
 directories 0700.
 """
@@ -25,6 +27,7 @@ from typing import Any, Literal
 from . import policy
 from .bridge import Bridge, BridgeError, encode_config_value, hermes_coerce
 from .model import Fix
+from .reducers import validate_spec
 
 State = Literal["rejected", "shadow_pending", "shadow_failed", "trial", "kept",
                 "rolled_back", "owner_changed", "proposed", "approved", "applied",
@@ -35,6 +38,9 @@ ACTIVE_STATES = frozenset({"shadow_pending", "trial", "applied", "rollback_pendi
 APPLIED_STATES = frozenset({"trial", "applied", "kept"})
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,100}")
 _TOOL_NAME = policy.TOOL_NAME_RE
+# The fix payload key holding the job as drafted against (cycle_draft.BASE_KEY, which
+# imports this module). Never part of what a fix writes.
+BASE_KEY = "_base"
 
 
 @dataclass
@@ -333,6 +339,51 @@ def _tool_matches(tools: Path, after: dict) -> bool:
         return False
 
 
+def reducer_spec(payload: Any) -> dict:
+    """The reducer spec in a reducer fix payload: the payload without BASE_KEY.
+    Raises ValueError if it fails validate_spec."""
+    if not isinstance(payload, dict):
+        raise ValueError("reducer payload must be an object")
+    spec = {k: v for k, v in payload.items() if k != BASE_KEY}
+    errs = validate_spec(spec)
+    if errs:
+        raise ValueError("invalid reducer spec: " + "; ".join(errs))
+    return spec
+
+
+def _reducer_path(root: Path, fix_id: str) -> Path:
+    _check_id(fix_id)
+    return Path(root) / "reducers" / f"{fix_id}.json"
+
+
+def _write_reducer(root: Path, fix_id: str, spec: dict, shadow: bool) -> None:
+    """reducers/<fix id>.json. A shadow file applies only in fix `fix_id`'s shadow
+    session; a live one only in the runs of spec["job"]."""
+    data = {"spec": spec, "fix_id": fix_id, "shadow_only": shadow,
+            "shadow_fix": fix_id if shadow else None}
+    atomic_write(_reducer_path(root, fix_id),
+                 json.dumps(data, indent=2, sort_keys=True).encode("utf-8"))
+
+
+def write_shadow_reducer(root: Path, payload: dict, fix_id: str) -> None:
+    """Write fix `fix_id`'s reducer file for its shadow run, flagged shadow_only.
+    `root` is the tuner directory. Raises ValueError for a bad payload or id."""
+    _write_reducer(root, fix_id, reducer_spec(payload), shadow=True)
+
+
+def go_live_reducer(root: Path, fix_id: str) -> None:
+    """Rewrite fix `fix_id`'s reducer file without the shadow flags. Raises OSError if
+    it is missing and ValueError if it no longer holds a valid spec."""
+    data = _read_json(_reducer_path(root, fix_id))
+    _write_reducer(root, fix_id, reducer_spec(data.get("spec") if isinstance(data, dict)
+                                              else None), shadow=False)
+
+
+def remove_reducer(root: Path, fix_id: str) -> None:
+    """Delete fix `fix_id`'s reducer file, if there is one."""
+    _reducer_path(root, fix_id).unlink(missing_ok=True)
+
+
 def _set_state(ledger: Ledger, rec: FixRecord, state: State, reason: str = "") -> FixRecord:
     rec.state, rec.reason = state, reason
     ledger.save()
@@ -348,7 +399,7 @@ def apply(fix: Fix, ledger: Ledger, bridge: Bridge, root: Path, now: float,
     `root.parent / "skills"`. `new_reach` is applied elsewhere and raises ValueError."""
     root = Path(root)
     skills_root = Path(skills_root) if skills_root is not None else root.parent / "skills"
-    if fix.kind not in ("job_prompt", "config", "skill", "composed_tool"):
+    if fix.kind not in ("job_prompt", "config", "skill", "composed_tool", "reducer"):
         raise ValueError(f"apply does not handle {fix.kind!r} fixes")
     if not isinstance(fix.payload, dict):
         raise ValueError("payload must be an object")
@@ -377,6 +428,11 @@ def apply(fix: Fix, ledger: Ledger, bridge: Bridge, root: Path, now: float,
         if job_prompt is not None and not isinstance(job_prompt, str):
             raise ValueError("job_prompt must be a string or null")
         job_after_for(fix, {})
+    elif fix.kind == "reducer":
+        rspec = reducer_spec(p)
+        if rspec["job"] != fix.target:
+            raise ValueError("reducer job must be the fix's target")
+        _reducer_path(root, fix.id)  # ValueError for an unsafe id
     rec = ledger.get(fix.id)
     if rec is None:
         rec = FixRecord(fix.id, fix.kind, fix.target, fix.candidate_key,
@@ -425,6 +481,12 @@ def apply(fix: Fix, ledger: Ledger, bridge: Bridge, root: Path, now: float,
                 "file": str(path), "b64": base64.b64encode(old_bytes).decode(), "mode": mode})
             _write_json(after_path, {"file": str(path), "text": text})
             atomic_write(path, text.encode("utf-8"), mode)
+        elif fix.kind == "reducer":
+            # Never touches Hermes: the plugin's hook reads the file on each call.
+            _write_json(vdir / "before.json", {"reducer": None})
+            _write_json(after_path, {"file": f"reducers/{fix.id}.json", "spec": rspec})
+            undo = lambda: remove_reducer(root, fix.id)  # noqa: E731
+            _write_reducer(root, fix.id, rspec, shadow=False)
         else:
             tools = root / "tools"
             before: dict = {"tool": None, "job": None}
@@ -550,6 +612,8 @@ def rollback(record: FixRecord, ledger: Ledger, bridge: Bridge, root: Path, now:
                 shutil.rmtree(d)
             else:
                 changed.append("tool dir")
+        elif record.kind == "reducer":
+            remove_reducer(root, record.id)
         else:
             raise ValueError(f"cannot roll back {record.kind!r}")
     except (BridgeError, _Failed, OSError) as exc:

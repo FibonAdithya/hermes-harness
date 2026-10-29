@@ -126,3 +126,11 @@ def test_html_to_text_keeps_angle_addresses_and_urls():
 def test_html_to_text_plain_text_unchanged():
     t = "  line one\n\n\n    indented <a@b.co>\n\nend  "
     assert OPS["html_to_text"](t, {}) == t
+
+
+def test_validate_spec_ignores_top_level_base():
+    """Fix payloads carry `_base` (the job as drafted against) next to the spec."""
+    spec = {"tool": "mcp__google__get_events", "job": "cc68e24f21cd",
+            "steps": [{"op": "collapse_ws"}],
+            "_base": {"prompt": "p", "enabled_toolsets": None}}
+    assert validate_spec(spec) == []

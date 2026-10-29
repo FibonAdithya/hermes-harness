@@ -41,7 +41,7 @@ class Session:
 @dataclass(frozen=True)
 class Fix:
     id: str
-    kind: Literal["composed_tool", "job_prompt", "config", "skill", "new_reach"]
+    kind: Literal["composed_tool", "job_prompt", "config", "skill", "new_reach", "reducer"]
     target: str
     payload: dict
     candidate_key: str
