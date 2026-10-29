@@ -390,3 +390,49 @@ def test_draft_forwards_turn_layout():
     D.draft(CAND, None, None, {}, [], b, NOW, FLAT, turn_layout=[1, 2])
     (_m, (_instr, user, _mt)), = b.calls
     assert json.loads(user)["turn_layout"] == [1, 2]
+
+
+HISTORY_SENTENCE = ("history lists earlier drafts for this candidate and why they failed; "
+                    "fields named for a copy rejection must not contain literal text from "
+                    "tool results (no label names, addresses or subjects).")
+
+
+def test_request_carries_the_drafting_history():
+    hist = [{"kind": "composed_tool", "state": "rejected", "reason_class": "copy",
+             "fields": ["program", "steps[0].keep_hosts[1]"]},
+            {"kind": "unparseable", "state": "rejected", "reason_class": "unparseable",
+             "fields": []}]
+    instr, user = D.build_request(CAND, None, None, {}, [], history=hist)
+    assert json.loads(user)["history"] == hist
+    assert HISTORY_SENTENCE in instr and instr == D.INSTRUCTIONS
+
+
+def test_request_history_keeps_only_safe_values():
+    """Only the four keys, at most 3 entries, and identifier-shaped values: a reason
+    string or a field holding copied text never reaches the model."""
+    hist = [{"kind": "composed_tool", "state": "rejected", "reason_class": "copy",
+             "fields": ["program", "Bank of X <a@b.c>"], "reason": "SECRET_reason"},
+            {"kind": "SECRET kind!", "state": "rejected", "reason_class": "limits",
+             "fields": "program"}] + [{"kind": "job_prompt", "state": "kept",
+                                       "reason_class": "", "fields": []}] * 3
+    _i, user = D.build_request(CAND, None, None, {}, [], history=hist)
+    doc = json.loads(user)["history"]
+    assert "SECRET" not in user and "Bank" not in user
+    assert doc[0] == {"kind": "composed_tool", "state": "rejected", "reason_class": "copy",
+                      "fields": ["program", "?"]}
+    assert doc[1] == {"kind": "?", "state": "rejected", "reason_class": "limits", "fields": []}
+    assert len(doc) == 3
+
+
+def test_request_without_history_sends_an_empty_list():
+    _i, user = D.build_request(CAND, None, None, {}, [])
+    assert json.loads(user)["history"] == []
+
+
+def test_draft_passes_history_to_the_request():
+    b = FakeBridge(oneshot_script=[script(reply())])
+    hist = [{"kind": "job_prompt", "state": "rejected", "reason_class": "copy",
+             "fields": ["prompt"]}]
+    D.draft(CAND, {"id": "j"}, None, {}, [], b, NOW, FLAT, history=hist)
+    (_m, (_instr, user, _mt)), = b.calls
+    assert json.loads(user)["history"] == hist

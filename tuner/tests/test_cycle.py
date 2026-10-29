@@ -1936,3 +1936,165 @@ def test_default_replay_runner_is_the_plugin_relay_in_docker():
     assert argv[:len(policy.SANDBOX_ARGV)] == list(policy.SANDBOX_ARGV)
     assert argv[argv.index("--name") + 1] == "tuner-replay-abcd1234"
     assert relay.run_program.__name__ == "run_program"
+
+
+# --- back-off (Task 10) ----------------------------------------------------------------
+
+COPY_TEXT = f"{RESULT_SENTINEL} body " + "y" * 800  # what every triage GET returned
+COPY = "payload.prompt: contains text copied from untrusted tool results"
+COPY_REPLY = {"kind": "job_prompt", "target": TRIAGE,
+              "payload": {"prompt": "Triage the inbox. " + COPY_TEXT, "add_toolsets": []}}
+
+
+def request_key(call):
+    (_m, (_instr, user, _mt)) = call
+    return json.loads(user)["candidate"]["key"]
+
+
+@pytest.mark.parametrize("prompt_changes, last_drafts", [(False, 0), (True, 1)])
+def test_cycle_sends_no_draft_when_parked(env, prompt_changes, last_drafts):
+    """Acceptance check 5. Cycles on days 1, 2, 10 and 19, each drafting a copy-check
+    rejection for one candidate. Day 10 drafts because the 7-day skip after day 2 has
+    ended. On day 19 the newest rejection is 9 days old, so "skip" cannot be the reason
+    for no draft; only parking is. The control: the job's prompt changed before day 19,
+    so the candidate is no longer parked and is drafted again.
+    Catches: the skip measured from the oldest record (day 10 would not draft); parking
+    without the input_hash check (the control would not draft)."""
+    build(env, triage_runs(days=range(-19, 13)))  # runs before every cycle's 28 days
+    drafts, keys = {}, []
+    the_jobs = jobs()
+    for day in (1, 2, 10, 19):
+        if day == 19 and prompt_changes:
+            the_jobs[TRIAGE]["prompt"] = "Triage the inbox. Be brief."
+        bridge = FakeBridge(jobs=the_jobs, oneshot_script=[reply(COPY_REPLY)])
+        heartbeat(env, NOW + (day - 1) * DAY - 60)
+        report = run_cycle(env, bridge, NOW + (day - 1) * DAY)
+        calls = oneshots(bridge)
+        keys += [request_key(c) for c in calls]
+        drafts[day] = len(calls)
+        assert report.errors == [], report.errors
+        assert report.parked == (1 if day == 19 and not prompt_changes else 0)
+    assert drafts == {1: 1, 2: 1, 10: 1, 19: last_drafts}
+    assert len(set(keys)) == 1  # every draft was for the same candidate
+    recs = Ledger.load(env.root).records
+    assert len(recs) == 3 + last_drafts
+    from hermes_tuner.backoff import input_hash, reason_class
+    assert [reason_class(r) for r in recs] == ["copy"] * len(recs)
+    assert [r.input_hash for r in recs[:3]] == [input_hash(jobs()[TRIAGE], None)] * 3
+
+
+
+def test_cycle_drafting_history_reaches_the_request(env):
+    """The second draft's request names the first one's copy rejection by class and
+    field only; the reason text and the copied text never reach the model."""
+    build(env, triage_runs(days=range(-3, 13)))
+    calls = []
+    for day in (1, 2):
+        bridge = FakeBridge(jobs=jobs(), oneshot_script=[reply(COPY_REPLY)])
+        heartbeat(env, NOW + (day - 1) * DAY - 60)
+        run_cycle(env, bridge, NOW + (day - 1) * DAY)
+        calls += oneshots(bridge)
+    first, second = (json.loads(c[1][1]) for c in calls)
+    assert first["history"] == []
+    assert second["history"] == [{"kind": "job_prompt", "state": "rejected",
+                                  "reason_class": "copy", "fields": ["prompt"]}]
+    assert "copied from" not in calls[1][1][1] and RESULT_SENTINEL not in calls[1][1][1]
+
+
+def _cands(*keys):
+    from hermes_tuner.detect import Candidate
+    return [Candidate(kind="sequence", key=k, job_id=TRIAGE, sessions=10, occurrences=10,
+                      result_chars=1000, est_monthly_usd=1.0 - i / 10)
+            for i, k in enumerate(keys)]
+
+
+def _parked_records(env, key, prompt="Triage the inbox.", target=TRIAGE):
+    from hermes_tuner.backoff import input_hash
+    h = input_hash({"prompt": prompt}, None)
+    for d in (30, 20, 10):
+        fix = Fix(f"2026-p{d}-{len(key)}", "job_prompt", target, {}, key)
+        add_record(env, FixRecord(fix.id, fix.kind, target, key, "rejected", NOW - d * DAY,
+                                  reason=COPY, input_hash=h), fix)
+
+
+def _select_cycle(env, bridge):
+    from hermes_tuner.cycle import CycleReport, _Cycle
+    c = _Cycle(env, bridge, NOW, CycleReport())
+    c.ledger, c.state = Ledger.load(env.root), {}
+    return c
+
+
+def test_parked_candidate_lets_next_candidate_draft(env):
+    """The job's top candidate is parked; its second candidate is picked. Catches: the
+    back-off check placed after the per-job pick (the job would get no candidate)."""
+    _parked_records(env, "seq:top")
+    c = _select_cycle(env, FakeBridge(jobs=jobs()))
+    top, second = _cands("seq:top", "seq:second")
+    assert c._select([top, second]) == [second]
+    assert c.report.parked == 1
+    assert c.report.errors == []
+
+
+def test_parking_is_per_job(env):
+    """The same candidate key under another job is not parked: records are matched on
+    the candidate's job too."""
+    _parked_records(env, "seq:top", target=CAL)
+    c = _select_cycle(env, FakeBridge(jobs=jobs()))
+    top, second = _cands("seq:top", "seq:second")
+    assert c._select([top, second]) == [top]
+    assert c.report.parked == 0
+
+
+def test_select_fetches_each_job_once_and_drafting_reuses_it(env):
+    """With records to check, _select reads the live job once; the draft reuses it.
+    Two different failed outcomes: enough to need the job's hash, not backed off."""
+    build(env, triage_runs())
+    key = f"seq:{SEARCH}>{GET}>{MOD}"
+    for i, (tag, reason) in enumerate((("unparseable", "unparseable draft"),
+                                       ("bridge_error", "drafting call failed: x"))):
+        fix = Fix(f"20261010-uu00000{i}", tag, TRIAGE, {}, key)
+        add_record(env, FixRecord(fix.id, fix.kind, TRIAGE, key, "rejected",
+                                  NOW - (2 - i) * DAY, reason=reason), fix)
+    bridge = FakeBridge(jobs=jobs(), oneshot_script=[reply(JOB_PROMPT_REPLY)])
+    run_cycle(env, bridge, NOW)
+    (call,) = oneshots(bridge)
+    assert request_key(call) == key
+    assert [c for c in bridge.calls if c[0] == "get_job"] == [("get_job", (TRIAGE,))]
+    assert len(json.loads(call[1][1])["history"]) == 2
+    (new,) = [r for r in Ledger.load(env.root).records if not r.id.startswith("20261010-uu")]
+    from hermes_tuner.backoff import input_hash
+    assert new.input_hash == input_hash(jobs()[TRIAGE], None)
+
+
+def test_select_skips_a_job_whose_fetch_fails(env):
+    """A bridge error reading the job: its candidates are skipped this cycle, with one
+    error, and nothing is drafted."""
+    _parked_records(env, "seq:top")
+    c = _select_cycle(env, FakeBridge(jobs=jobs(), fail={"get_job"}))
+    assert c._select(_cands("seq:top", "seq:second", "seq:third")) == []
+    assert len(c.report.errors) == 1 and "get_job" in c.report.errors[0]
+
+
+def test_global_candidates_back_off_on_their_skill_text(env):
+    """A skill_load candidate is parked on the hash of its job (none) and its skill
+    text; editing the skill unparks it. Catches: global candidates not filtered, or
+    the skill text left out of the hash."""
+    from hermes_tuner.backoff import input_hash
+    from hermes_tuner.detect import Candidate
+    skill = env.skills_root / "notes" / "SKILL.md"
+    skill.parent.mkdir()
+    skill.write_text("---\nname: notes\n---\nbody\n")
+    key = "skill_load:notes"
+    h = input_hash(None, skill.read_text())
+    for d in (30, 20, 10):
+        fix = Fix(f"2026-s{d}", "skill", str(skill), {}, key)
+        add_record(env, FixRecord(fix.id, "skill", "notes/SKILL.md", key, "rejected",
+                                  NOW - d * DAY, reason="skill fixes must leave the "
+                                  "frontmatter byte-identical", input_hash=h), fix)
+    cand = Candidate(kind="skill_load", key=key, job_id=None, sessions=10, occurrences=10,
+                     result_chars=1000, est_monthly_usd=1.0)
+    c = _select_cycle(env, FakeBridge(jobs=jobs()))
+    assert c._select([cand]) == [] and c.report.parked == 1
+    skill.write_text("---\nname: notes\n---\nbody, edited\n")
+    c = _select_cycle(env, FakeBridge(jobs=jobs()))
+    assert c._select([cand]) == [cand] and c.report.parked == 0

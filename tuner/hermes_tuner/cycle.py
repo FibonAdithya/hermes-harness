@@ -91,6 +91,7 @@ class CycleReport:
     skipped: str = ""
     dry_run: bool = False
     pricing: dict | None = None   # the price list this run used (Pricing.to_dict)
+    parked: int = 0               # candidates not drafted until their inputs change (backoff)
 
 
 def run_cycle(cfg: CycleConfig, bridge: Bridge, now: float,

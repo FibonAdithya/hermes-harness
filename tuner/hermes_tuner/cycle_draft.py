@@ -16,6 +16,7 @@ from pathlib import Path
 from statistics import median
 
 from . import policy, trial
+from .backoff import BACKOFF_SKIP_AFTER, backoff, draft_history, input_hash, reason_class
 from .bridge import BridgeError
 from .budget import DAY, JOB_KINDS, iso_week_start, job_runs, savings, tuner_spend
 from .detect import SCHEMA_TOOL, SKILL_TOOL, Candidate, detect
@@ -97,6 +98,11 @@ class DraftSteps:
     replay_argv: Callable[[str], list[str]] | None = None
     # Seconds of composed replay this cycle has used (self.clock), of REPLAY_CYCLE_BUDGET_S.
     replay_spent_s: float = 0.0
+    # Live jobs read this drafting step (job id -> job, or None when it could not be
+    # read), so _select, _draft_one and _reduce_one read each job once.
+    _job_cache: dict[str, dict | None] | None = None
+    # backoff.input_hash of the candidate being drafted; every record it writes carries it.
+    _cur_input_hash: str | None = None
 
     # 5-7. budget, detect, draft ----------------------------------------------------------
 
@@ -126,6 +132,7 @@ class DraftSteps:
         self.skill_names = self._skill_names(window)
         self.window = window
         cands = detect(window, now, pricing, self.skill_names, aliases=self._aliases())
+        self._job_cache = {}
         for cand in self._select(cands):
             job_cost = self._job_cost(cand.job_id) if cand.job_id else 0.0
             reduce = self._reducer_route(cand)  # no model call: only the shadow run costs
@@ -185,20 +192,72 @@ class DraftSteps:
 
     def _select(self, cands: list[Candidate]) -> list[Candidate]:
         """The first candidate per editable job, and one global one, among those worth
-        at least MIN_DRAFT_MONTHLY_USD a month."""
+        at least MIN_DRAFT_MONTHLY_USD a month and not backed off. Backed-off
+        candidates are dropped before the pick, so a job's next candidate is tried."""
         cands = [c for c in cands if c.est_monthly_usd >= policy.MIN_DRAFT_MONTHLY_USD]
         picked = []
         for job in sorted(policy.EDITABLE_JOBS):
             if job in policy.NEVER_TOUCH_JOBS or self.ledger.active_for(job) is not None:
                 continue
-            c = next((c for c in cands if c.job_id == job and c.kind in JOB_CANDIDATES), None)
-            if c is not None:
-                picked.append(c)
+            ok = self._not_backed_off(
+                [c for c in cands if c.job_id == job and c.kind in JOB_CANDIDATES])
+            if ok:
+                picked.append(ok[0])
         if not self._global_active():
-            c = next((c for c in cands if c.kind in GLOBAL_CANDIDATES), None)
-            if c is not None:
-                picked.append(c)
+            ok = self._not_backed_off([c for c in cands if c.kind in GLOBAL_CANDIDATES])
+            if ok:
+                picked.append(ok[0])
         return picked
+
+    def _cand_records(self, cand: Candidate) -> list[FixRecord]:
+        """The candidate's records. Job candidates' keys ("seq:...", "bytes:...") can
+        recur in another job, so records that target another job are left out."""
+        return [r for r in self.ledger.records if r.candidate_key == cand.key
+                and not (cand.job_id is not None and r.target != cand.job_id
+                         and r.target in policy.EDITABLE_JOBS)]
+
+    def _cand_input_hash(self, cand: Candidate) -> str | None:
+        """What a draft of `cand` would be made from now, or None when its job cannot
+        be read (reported by _get_job)."""
+        job = None
+        if cand.job_id is not None:
+            job = self._get_job(cand.job_id)
+            if job is None:
+                return None
+        return input_hash(job, self._skill_text(cand))
+
+    def _skill_text(self, cand: Candidate) -> str | None:
+        """A skill_load candidate's SKILL.md text; None for other kinds or when unread."""
+        if cand.kind != "skill_load":
+            return None
+        path = _skill_file(self.cfg.skills_root, cand.key.split(":", 1)[1])
+        if path is None:
+            return None
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+
+    def _not_backed_off(self, cands: list[Candidate]) -> list[Candidate]:
+        """`cands` without those backoff() skips or parks; parked ones are counted in
+        the report. A job is read only when a candidate has enough failed outcomes to
+        be skipped or parked. When its job cannot be read, no candidate of it is
+        drafted this cycle (_get_job reported the error once)."""
+        out = []
+        for c in cands:
+            recs = self._cand_records(c)
+            if sum(1 for r in recs if reason_class(r)) < BACKOFF_SKIP_AFTER:
+                out.append(c)  # too few failed outcomes to skip or park: no job read
+                continue
+            h = self._cand_input_hash(c)
+            if h is None:
+                return []
+            verdict = backoff(recs, c.key, h, self.now)
+            if verdict == "parked":
+                self.report.parked += 1
+            elif verdict == "ok":
+                out.append(c)
+        return out
 
     def _call_shape(self, cand: Candidate) -> list[tuple[str, tuple[str, ...]]]:
         """Tool names and argument KEYS of the candidate's most recent session."""
@@ -244,6 +303,7 @@ class DraftSteps:
 
     def _draft_one(self, cand: Candidate) -> tuple[float, bool]:
         """Draft, check and act on one candidate. Returns (spend, shadow scheduled)."""
+        self._cur_input_hash = None
         job = None
         if cand.job_id is not None:
             job = self._get_job(cand.job_id)
@@ -260,10 +320,12 @@ class DraftSteps:
             if any(p in bundled for p in rel[:-1]):
                 return 0.0, False
             skill_text = path.read_text(encoding="utf-8", errors="replace")
+        self._cur_input_hash = input_hash(job, skill_text)
         try:
             fix, spend = draft(cand, job, skill_text, {}, self._call_shape(cand),
                                self.bridge, self.now, self.pricing, settings=self._settings(),
-                               turn_layout=self._turn_layout(cand))
+                               turn_layout=self._turn_layout(cand),
+                               history=draft_history(self._cand_records(cand), cand.key))
         except BridgeError as exc:
             # The call may have been billed before it failed (e.g. a timeout), and
             # all spend counts (spec 6): charge the drafting estimate.
@@ -289,7 +351,16 @@ class DraftSteps:
 
     def _get_job(self, job_id: str) -> dict | None:
         """The live job, or None after reporting why (plugin not loaded, bridge
-        failure, missing job). A job fix needs a guarded shadow run (F4)."""
+        failure, missing job). A job fix needs a guarded shadow run (F4). Read once
+        per drafting step: a second call returns the first answer, unreported."""
+        if self._job_cache is None:
+            self._job_cache = {}
+        if job_id in self._job_cache:
+            return self._job_cache[job_id]
+        self._job_cache[job_id] = job = self._read_job(job_id)
+        return job
+
+    def _read_job(self, job_id: str) -> dict | None:
         if not self.plugin_loaded():
             self.err(PLUGIN_NOT_LOADED)
             return None
@@ -319,12 +390,14 @@ class DraftSteps:
     def _reduce_one(self, cand: Candidate) -> tuple[float, bool]:
         """Search replayed runs for a reducer of the candidate's tool; shadow what it
         finds. No model call: spend is 0. Returns (spend, shadow scheduled)."""
+        self._cur_input_hash = None
         job_id, tool = cand.job_id, cand.key.split(":", 1)[1]
         if self._reducer_taken(job_id, tool):  # local check first: no bridge call
             return 0.0, False
         job = self._get_job(job_id)
         if job is None:
             return 0.0, False
+        self._cur_input_hash = input_hash(job, None)
         prompt = job.get("prompt")
         exclude = [prompt] if isinstance(prompt, str) else []
         try:
@@ -461,7 +534,7 @@ class DraftSteps:
     def _record(self, fix: Fix, state: str, spend: float, reason: str) -> FixRecord:
         rec = FixRecord(fix.id, fix.kind, fix.target, fix.candidate_key, state,  # type: ignore[arg-type]
                         self.now, reason=reason, spend_usd=spend,
-                        needs_restart=needs_restart(fix))
+                        needs_restart=needs_restart(fix), input_hash=self._cur_input_hash)
         self.ledger.add(rec, fix)
         if state == "rejected":
             self.report.rejected.append(fix.id)

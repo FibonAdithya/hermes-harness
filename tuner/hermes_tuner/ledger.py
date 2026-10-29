@@ -70,6 +70,9 @@ class FixRecord:
     # A reducer fix: the replay search's estimated saving per run (USD, ESTIMATE).
     # None for other kinds and for records saved before it existed.
     est_saving_per_run: float | None = None
+    # backoff.input_hash of what the draft was made from (job prompt, skill text).
+    # None for records saved before it existed and for records not from a draft.
+    input_hash: str | None = None
 
 
 # --- atomic file helpers ------------------------------------------------------

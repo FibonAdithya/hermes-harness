@@ -46,6 +46,8 @@ Reply with a single JSON object and nothing else: no prose, no code fence. Shape
 4. "skill": shrink a skill that is loaded often and is large. target is the skill path. payload: {{"path": str, "text": str}}. A skill fix may only rewrite an existing SKILL.md that is not bundled with the agent, and must keep its frontmatter block (the leading --- block) byte-identical. Shrink the body, keep the decision guidance, and point at the tool for mechanics.
 5. "new_reach": use only when the fix truly needs a tool outside the allowed list. payload: {{"change": {{"type": "mcp_include_add", "server": str, "tool": str}} or {{"type": "callable_add", "tool": str}}, "why": str}}. target is the tool name. The owner must approve it.
 
+history lists earlier drafts for this candidate and why they failed; fields named for a copy rejection must not contain literal text from tool results (no label names, addresses or subjects).
+
 job_prompt and composed_tool fixes target only the job in the request. Do not include keys that are not listed. Do not include secrets, message ids or any text other than your own design.
 """
 
@@ -116,6 +118,16 @@ _CLEANERS = {"composed_tool": _clean_composed, "job_prompt": _clean_job_prompt,
 _NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 _ARG_KEY = re.compile(r"[A-Za-z0-9_]{1,40}")
 MAX_SHAPE_CALLS = 200
+# Drafting history (backoff.draft_history): its reason classes, and its field paths as
+# limits._strings builds them (payload keys joined by ".", list indices as [i], "<key>"
+# for a dict key itself), or "?". Model-chosen keys could hold copied text, so only
+# identifier-shaped segments pass.
+FIELD_RE = re.compile(r"\?|[A-Za-z0-9_]{1,40}(?:\[\d{1,6}\])*"
+                    r"(?:\.(?:[A-Za-z0-9_]{1,40}|<key>)(?:\[\d{1,6}\])*){0,8}")
+REASON_CLASSES = frozenset({"copy", "replay_limit", "replay", "timeout", "unparseable",
+                            "shadow", "limits", "trial", ""})
+HISTORY_LEN = 3
+MAX_HISTORY_FIELDS = 20
 
 
 def _safe(value: Any, pattern: re.Pattern) -> str:
@@ -137,14 +149,33 @@ def turn_layout(calls: Iterable[ToolCall]) -> list[int]:
     return [counts[t] for t in sorted(counts)]
 
 
+def _history(history: list[dict] | None) -> list[dict]:
+    """At most HISTORY_LEN entries of the four keys, every value identifier-shaped:
+    a ledger reason string never reaches the model (backoff.draft_history)."""
+    out = []
+    for e in (history or [])[:HISTORY_LEN]:
+        if not isinstance(e, dict):
+            continue
+        fields = e.get("fields")
+        out.append({"kind": _safe(e.get("kind"), _NAME), "state": _safe(e.get("state"), _NAME),
+                     "reason_class": e.get("reason_class") if e.get("reason_class") in
+                     REASON_CLASSES else "?",
+                     "fields": [_safe(f, FIELD_RE) for f in fields][:MAX_HISTORY_FIELDS]
+                     if isinstance(fields, list) else []})
+    return out
+
+
 def build_request(candidate: Candidate, job: dict | None, skill_text: str | None,
                   tool_schemas: dict[str, dict],
                   call_shape: list[tuple[str, tuple[str, ...]]],
                   settings: dict[str, Any] | None = None,
-                  turn_layout: list[int] | None = None) -> tuple[str, str]:
+                  turn_layout: list[int] | None = None,
+                  history: list[dict] | None = None) -> tuple[str, str]:
     """`settings`: the changeable settings (limits.changeable_settings), sent so the
     model names a real key instead of guessing one under an allowed prefix.
-    `turn_layout`: calls per turn of the call_shape session (positive ints only)."""
+    `turn_layout`: calls per turn of the call_shape session (positive ints only).
+    `history`: up to 3 earlier outcomes for this candidate, newest first, each
+    {"kind", "state", "reason_class", "fields"} (backoff.draft_history)."""
     doc: dict[str, Any] = {"candidate": {f: getattr(candidate, f) for f in CANDIDATE_FIELDS}}
     doc["candidate"]["key"] = _safe_key(candidate.key)
     if job is not None:
@@ -158,6 +189,7 @@ def build_request(candidate: Candidate, job: dict | None, skill_text: str | None
     doc["turn_layout"] = [n for n in (turn_layout or [])
                           if isinstance(n, int) and not isinstance(n, bool) and n > 0
                           ][:MAX_SHAPE_CALLS]
+    doc["history"] = _history(history)
     return INSTRUCTIONS, json.dumps(doc, sort_keys=True)
 
 
@@ -215,10 +247,11 @@ def draft(candidate: Candidate, job: dict | None, skill_text: str | None,
           bridge: Bridge, now: float, pricing: Pricing,
           max_tokens: int = 4000,
           settings: dict[str, Any] | None = None,
-          turn_layout: list[int] | None = None) -> tuple[Fix | None, float]:
+          turn_layout: list[int] | None = None,
+          history: list[dict] | None = None) -> tuple[Fix | None, float]:
     """One model call. A BridgeError propagates; spend is reported for bad replies too."""
     instructions, user_input = build_request(candidate, job, skill_text, tool_schemas,
-                                             call_shape, settings, turn_layout)
+                                             call_shape, settings, turn_layout, history)
     reply = bridge.oneshot(instructions, user_input, max_tokens)
     text = reply.get("text")
     fix = parse_draft(text, candidate, now) if isinstance(text, str) else None
