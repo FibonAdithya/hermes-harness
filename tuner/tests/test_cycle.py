@@ -2218,16 +2218,17 @@ def test_early_rollback_runs_without_pricing(env):
 
 def reducer_trial(env, case):
     """A calendar reducer on trial, live 5 days: baseline runs (days 6-30) read each
-    message once; 4 trial runs (days 1-4). Events: 20 reductions and 1 error in the
+    message once; 5 trial runs (days 1-5). Events: 20 reductions and 1 error in the
     trial runs, 1 error in a baseline run (not the trial's), a reduction and an error
     in a shadow run of the job (neither the trial's), a trial line with neither key,
     2 unreadable lines.
     case "child": a second trial error, logged under a compressed child's id.
-    case "reread": trial run 3 reads m3 twice (1 re-read; the baseline mean is 0).
-    case "window": trial re-reads [1, 30, 0, 0] against 25 baseline runs with 0, and
-    2 runs (days 34-35) more than 28 days before live_from with 50 re-reads each. Right:
-    2 runs exceed the mean 0. Trial runs leaking into the baseline (mean 31/29): 1.
-    The older runs counted (mean 100/27): 1."""
+    case "reread": trial run 3 reads m3 twice: 1 re-read in 5 runs, a mean of 0.2,
+    under 2 x 0 + 0.5. (The per-run rule this replaced rolled it back.)
+    case "window": trial re-reads [1, 1, 1, 0, 0] (mean 0.6) against 25 baseline runs
+    with 0, and 2 runs (days 34-35) more than 28 days before live_from with 50
+    re-reads each. Right: 0.6 > 0.5, rolled back. Trial runs leaking into the baseline
+    (mean 3/30, bar 0.7): kept on trial. The older runs counted (mean 100/27): kept."""
     base = NOW - 3 * 3600 + 6 * 3600
     live = NOW - 5 * DAY
 
@@ -2241,8 +2242,8 @@ def reducer_trial(env, case):
     sessions.append({"id": shadow_sid, "source": "cron", "started_at": base - 3 * DAY - 1200,
                      "in": 100, "out": 10, "calls": [(GET, {"message_id": "m3"}, "b")]})
     trial_ids = []
-    window = {4: 1, 3: 30, 2: 0, 1: 0}
-    for d in (4, 3, 2, 1):
+    window = {5: 1, 4: 1, 3: 1, 2: 0, 1: 0}
+    for d in (5, 4, 3, 2, 1):
         calls = [(GET, {"message_id": f"m{d}"}, "b")]
         if case == "reread" and d == 3:
             calls.append((GET, {"message_id": "m3"}, "b"))
@@ -2254,17 +2255,19 @@ def reducer_trial(env, case):
     if case == "child":
         sessions[-2]["end_reason"] = "compression"
         sessions.append({"id": child, "source": "cron", "started_at": base - 2 * DAY + 300,
-                         "parent": trial_ids[2], "calls": []})
+                         "parent": trial_ids[3], "calls": []})
     build(env, sessions)
     payload = {"tool": GET, "job": CAL, "steps": [{"op": "collapse_ws"}], "_base": CAL_BASE}
     fix = Fix(RFIX, "reducer", CAL, payload, "bytes:" + GET)
+    # No stored baseline: the cost verdict says "continue" (5 trial runs would reach
+    # JOB_TRIAL_RUNS), so only early rollback can end the trial here.
     led = add_record(env, FixRecord(fix.id, "reducer", CAL, fix.candidate_key, "trial",
                                     live - DAY, applied_at=live, live_from=live,
-                                    baseline_runs=[brk(0.10)] * 10), fix)
+                                    baseline_runs=None), fix)
     vdir = led.version_dir(fix.id)
     (vdir / "before.json").write_text(json.dumps({"tool": None, "job": None}))
     (vdir / "after.json").write_text(json.dumps(payload))
-    events = [{"session_id": trial_ids[i % 4], "tool_call_id": f"c{i}", "before": 9,
+    events = [{"session_id": trial_ids[i % 5], "tool_call_id": f"c{i}", "before": 9,
                "after": 4} for i in range(20)]
     events.append({"session_id": trial_ids[0], "tool_call_id": "e0", "error": "TypeError"})
     events.append({"session_id": sid(CAL, base - 10 * DAY), "tool_call_id": "e1",
@@ -2281,9 +2284,11 @@ def reducer_trial(env, case):
     return fix
 
 
-@pytest.mark.parametrize("case, failures", [("none", 1), ("child", 2), ("reread", 2),
-                                            ("window", 3)])
-def test_reducer_trial_rolls_back_early(env, case, failures):
+@pytest.mark.parametrize("case, reason", [
+    ("none", None), ("reread", None),
+    ("child", "trial: 2 failures in 20 calls (early)"),
+    ("window", "trial: re-reads 0.60 per run vs baseline 0.00 (early)")])
+def test_reducer_trial_rolls_back_early(env, case, reason):
     """The shadow run's reduction and error count as neither a call nor a failure:
     calls stay 20, and "none" stays at 1 failure (5%)."""
     fix = reducer_trial(env, case)
@@ -2293,12 +2298,12 @@ def test_reducer_trial_rolls_back_early(env, case, failures):
         "removed_at": NOW - 2 * DAY}}))
     report = run_cycle(env, FakeBridge(jobs=jobs()), NOW)
     rec = Ledger.load(env.root).get(fix.id)
-    assert rec.trial_runs == 4
-    if case == "none":
+    assert rec.trial_runs == 5
+    if reason is None:
         assert rec.state == "trial", rec.reason
         return
     assert rec.state == "rolled_back" and fix.id in report.rolled_back
-    assert rec.reason == f"trial: {failures} failures in 20 calls (early)"
+    assert rec.reason == reason
 
 
 class LockedHistory(History):

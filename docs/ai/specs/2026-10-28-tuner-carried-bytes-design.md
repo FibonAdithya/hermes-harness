@@ -355,12 +355,19 @@ During a trial, each cycle counts the fix's own failures in the runs since
 - **reducer:** the hook raised an exception, or the job re-reads more than it
   did before. A re-read is the same tool called again in one session with the
   same key argument (`message_id` for message reads, the query for searches).
-  It counts as a failure only when the trial's re-read rate per run exceeds the
-  baseline runs' rate. A search followed by reading the ids it found is the
-  normal flow and is not a re-read. Claude's call.
+  A search followed by reading the ids it found is the normal flow and is not
+  a re-read. Claude's call.
 
 Two failures, or 10% of the fix's calls (whichever comes first), roll the fix
 back at that cycle, with the reason. Builder may tune both numbers.
+
+Amended 2026-10-30 (PR #35 review): re-reads are judged as a rate, not as
+failures. A reducer is rolled back when, over at least 5 trial runs, its mean
+re-reads per run exceed 2 x the baseline mean + 0.5. The per-run rule first
+built (each trial run above the baseline mean is a failure) rolled back an
+unchanged search reducer on 20 of 24 go-live dates replayed from the 10-28
+fixture; this rule on 0. For message reads it fires on 3 of 24, all from one
+burst of re-reads on 09-22..09-24 with no reducer live.
 
 `trial_runs` is written each cycle with the run count the verdict used.
 

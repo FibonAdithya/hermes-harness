@@ -549,11 +549,15 @@ class _Cycle(DraftSteps):
                 rec.trial_runs = len(runs)
                 self.ledger.save()
             if rec.live_from is not None and rec.kind in JOB_KINDS:
-                failures, calls = self._early_failures(rec, runs)
+                failures, calls, worse = self._early_failures(rec, runs)
                 if failures >= trial.EARLY_FAIL_MIN or (
                         calls > 0 and failures / calls >= trial.EARLY_FAIL_SHARE):
                     self._rollback(rec, f"trial: {failures} failures in {calls} calls (early)",
                                    runs)
+                    continue
+                if worse is not None:
+                    self._rollback(rec, f"trial: re-reads {worse[0]:.2f} per run vs "
+                                        f"baseline {worse[1]:.2f} (early)", runs)
                     continue
             if rec.live_from is None or self.pricing is None:
                 pass  # waiting for the restart (spec 4.7), or no price list: deadline only
@@ -583,41 +587,44 @@ class _Cycle(DraftSteps):
         return [s for s in self.sessions if s.started_at > rec.live_from and s.calls
                 and s.job_id not in self.shadow_ids and keep(s)]
 
-    def _early_failures(self, rec: FixRecord, runs: list[Session]) -> tuple[int, int]:
-        """trial.early_failures for a job fix's trial `runs`. A fix that cannot be read
-        has nothing to count: (0, 0). So does a state.db read that fails (locked past
+    def _early_failures(self, rec: FixRecord, runs: list[Session]
+                        ) -> tuple[int, int, tuple[float, float] | None]:
+        """trial.early_failures for a job fix's trial `runs`, plus a reducer's
+        trial.reread_breach (None for other kinds). A fix that cannot be read has
+        nothing to count: (0, 0, None). So does a state.db read that fails (locked past
         its timeout): logged, and the record's verdict and deadline still run."""
         if rec.kind not in ("composed_tool", "reducer"):
-            return 0, 0
+            return 0, 0, None
         try:
             return self._count_early_failures(rec, runs)
         except HistoryUnavailable as exc:
             self.err(f"early check {rec.id}: {type(exc).__name__}: {exc}")
-            return 0, 0
+            return 0, 0, None
 
-    def _count_early_failures(self, rec: FixRecord, runs: list[Session]) -> tuple[int, int]:
+    def _count_early_failures(self, rec: FixRecord, runs: list[Session]
+                              ) -> tuple[int, int, tuple[float, float] | None]:
         try:
             fix = self.ledger.fix(rec.id)
         except (OSError, ValueError, TypeError):
-            return 0, 0
+            return 0, 0, None
         if fix.kind == "composed_tool":
             files = self._shadow_tool(fix)
             if files is None:
-                return 0, 0
+                return 0, 0, None
             own = files[0]["name"]
             texts = [t for s in runs for name, t in self.history.call_results(s.id)
                      if name == own]
-            return trial.early_failures(fix.kind, texts, 0, [], [])
+            return (*trial.early_failures(fix.kind, texts, 0), None)
         tool = fix.payload.get("tool") if isinstance(fix.payload, dict) else None
         if not isinstance(tool, str):
-            return 0, 0
+            return 0, 0, None
         errors, reduced = self._reducer_events(fix.id, runs)
         start = rec.live_from - trial.BASELINE_DAYS * DAY
         before = [s for s in self.sessions if start <= s.started_at < rec.live_from
                   and s.job_id == rec.target and s.calls and s.job_id not in self.shadow_ids]
-        return trial.early_failures(fix.kind, [], errors,
-                                    [trial.rereads(s, tool) for s in runs],
-                                    [trial.rereads(s, tool) for s in before], reduced=reduced)
+        worse = trial.reread_breach([trial.rereads(s, tool) for s in runs],
+                                    [trial.rereads(s, tool) for s in before])
+        return (*trial.early_failures(fix.kind, [], errors, reduced=reduced), worse)
 
     def _reducer_events(self, fix_id: str, runs: list[Session]) -> tuple[int, int]:
         """(error lines, reduction lines) the plugin logged for fix `fix_id` in `runs`

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes_tuner import policy
+from hermes_tuner import policy, trial
 from hermes_tuner.bridge import FakeBridge
 from hermes_tuner.ledger import FixRecord
 from hermes_tuner.measure import JobStats
@@ -628,6 +628,11 @@ def test_reducer_shadow_without_a_base_prompt_is_refused(tmp_path, base):
 
 # --- early rollback (Task 11) --------------------------------------------------------
 
+FIXTURE_1028 = Path(__file__).parent / "fixtures" / "history-2026-10-28.json.gz"
+CALENDAR = "cc68e24f21cd"
+needs_fixture_1028 = pytest.mark.skipif(not FIXTURE_1028.exists(),
+                                        reason=f"{FIXTURE_1028.name} not produced yet")
+
 TOOL_OK = json.dumps({"result": {"messages": ["m1", "m2"]}})
 TOOL_ERR = json.dumps({"error": "output exceeds 50000 bytes"})
 
@@ -636,26 +641,71 @@ def test_early_failures_batch_tool():
     """The live calendar batch tool: 14 of 41 calls failed on the output cap."""
     from hermes_tuner.trial import early_failures
     own = [TOOL_OK] * 27 + [TOOL_ERR] * 14
-    assert early_failures("composed_tool", own, 0, [], []) == (14, 41)
-    # a reducer's errors and re-reads do not count for a composed tool
-    assert early_failures("composed_tool", own, 5, [9], [0]) == (14, 41)
+    assert early_failures("composed_tool", own, 0) == (14, 41)
+    # a reducer's errors do not count for a composed tool
+    assert early_failures("composed_tool", own, 5) == (14, 41)
 
 
-def test_reducer_rereads_vs_baseline():
-    """Baseline [0, 0, 3]: mean 1, median 0, max 3. Only the trial run with 2 re-reads
-    exceeds the mean. `>=` mean gives 2, median gives 2, max gives 0."""
+def test_reducer_early_failures_are_hook_errors():
+    """A reducer's failures are its hook errors; calls are the results it reduced.
+    Composed-tool results do not count for a reducer."""
     from hermes_tuner.trial import early_failures
-    assert early_failures("reducer", [], 0, [1, 2, 0], [0, 0, 3], reduced=7) == (1, 7)
-    # reduce errors add to it; composed-tool results do not count for a reducer
-    assert early_failures("reducer", [TOOL_ERR] * 3, 2, [1, 2, 0], [0, 0, 3],
-                          reduced=7) == (3, 7)
-    # no baseline runs: re-reads have nothing to exceed
-    assert early_failures("reducer", [], 1, [4], [], reduced=0) == (1, 0)
+    assert early_failures("reducer", [], 0, reduced=7) == (0, 7)
+    assert early_failures("reducer", [TOOL_ERR] * 3, 2, reduced=7) == (2, 7)
+    assert early_failures("reducer", [], 1, reduced=0) == (1, 0)
 
 
 def test_early_failures_job_prompt_has_none():
     from hermes_tuner.trial import early_failures
-    assert early_failures("job_prompt", [TOOL_ERR] * 3, 4, [5], [0], reduced=9) == (0, 0)
+    assert early_failures("job_prompt", [TOOL_ERR] * 3, 4, reduced=9) == (0, 0)
+
+
+@pytest.mark.parametrize("trial_rr, base_rr, worse", [
+    ([3, 3, 2, 2, 3], [1, 1], True),        # 2.6 > 2 x 1 + 0.5
+    ([3, 2, 3, 2, 3, 2], [1, 1], False),     # 2.5: not strictly above
+    ([2, 2, 2, 2, 2], [1, 1], False),        # 2.0: above 1, under 2 x 1 + 0.5 (factor)
+    ([1, 0, 0, 0, 0], [0, 0, 0], False),     # 0.2: above 0, under 0 + 0.5 (margin)
+    ([1, 1, 1, 0, 0], [0, 0, 0], True),      # 0.6 > 0.5
+    ([9, 9, 9, 9], [0, 0, 0], False),        # 4 trial runs: too few to judge
+    ([9, 9, 9, 9, 9], [], False),            # no baseline runs: nothing to exceed
+])
+def test_reread_breach(trial_rr, base_rr, worse):
+    from hermes_tuner.trial import reread_breach
+    got = reread_breach(trial_rr, base_rr)
+    assert (got is not None) == worse
+    if worse:
+        assert got == (sum(trial_rr) / len(trial_rr), sum(base_rr) / len(base_rr))
+
+
+@needs_fixture_1028
+@pytest.mark.parametrize("tool, rolled", [
+    ("mcp__google__get_events", 0),
+    ("mcp__google__search_gmail_messages", 0),   # the per-run rule this replaced: 20
+    # the 09-22..09-24 burst (2, 2, 3 re-reads, none since 09-25); per-run rule: 4
+    ("mcp__google__get_gmail_message_content", 3),
+])
+def test_reread_breach_on_unchanged_calendar_runs(tool, rolled):
+    """Replay the recorded calendar-sync runs as if a reducer that changes nothing had
+    gone live before each of them: baseline = runs in the BASELINE_DAYS before, trial =
+    up to 21 runs from there, checked after each run as the cycle does. Count the
+    go-live dates that would have been rolled back early for re-reads."""
+    from hermes_tuner import scrub
+    from hermes_tuner.trial import BASELINE_DAYS, reread_breach, rereads
+    runs = sorted((s for s in scrub.load(FIXTURE_1028)
+                   if s.job_id == CALENDAR and s.calls), key=lambda s: s.started_at)
+    rr = [rereads(s, tool) for s in runs]
+    starts = fired = 0
+    for i in range(1, len(runs)):
+        live = runs[i].started_at - 1
+        base = [rr[j] for j in range(i) if runs[j].started_at >= live - BASELINE_DAYS * 86400]
+        if len(base) < 5:
+            continue
+        starts += 1
+        if any(reread_breach(rr[i:k], base) is not None
+               for k in range(i + 1, min(i + 21, len(runs)) + 1)):
+            fired += 1
+    assert starts == 24
+    assert fired == rolled
 
 
 def test_rereads_counts_repeats_of_the_tool_per_ref():
