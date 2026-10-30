@@ -117,3 +117,52 @@ RESTART_WINDOW = (2, 5)
 RESTART_TZ = "Europe/London"
 QUIET_MIN = 30
 JOB_MARGIN_MIN = 15
+
+# Carried-bytes ranking (tuner design 2026-10-28).
+CHARS_PER_TOKEN = 4  # ESTIMATE: messages.token_count is NULL on every tool row
+MIN_DRAFT_MONTHLY_USD = 0.05  # ESTIMATE
+# A parked candidate (backoff) may draft again this many days after its newest
+# outcome: the drafting request's tool schemas are not hashed (it sends {}), so a
+# change there could not unpark it otherwise.
+PARK_MAX_DAYS = 28
+
+# Result reducers (tuner design 2026-10-28). Calendar sync only.
+REDUCER_JOBS = frozenset({"cc68e24f21cd"})
+REDUCER_TOOLS = frozenset({
+    "mcp__google__get_gmail_message_content",
+    "mcp__google__search_gmail_messages",
+    "mcp__google__get_events",
+})
+# A subdomain matches too: us02web.zoom.us matches zoom.us.
+MEETING_HOSTS = frozenset({"meet.google.com", "zoom.us", "teams.microsoft.com"})
+REDUCER_CAP_LADDER = (16000, 8000, 4000, 2000)
+# A reducer is drafted only if it cuts at least this share of the tool's replayed
+# bytes (ESTIMATE, tunable; below the measured one-third).
+REDUCER_MIN_CUT = 0.15
+# The greedy search stops when the best next step cuts less than this share more.
+REDUCER_STEP_MIN = 0.02
+# Fewer replayed runs with a result for the tool than this: no reducer.
+REPLAY_MIN_SESSIONS = 3
+# Days of recorded history replayed and priced.
+REPLAY_WINDOW_DAYS = 28
+# Composed-tool replay (tuner design 2026-10-28): the newest this-many replayable runs,
+# each under this sandbox timeout, all composed replays of one cycle sharing
+# REPLAY_CYCLE_BUDGET_S. A run starts only while REPLAY_TIMEOUT_S + 30 s of the budget
+# is left, so replay ends within 360 s + 60 s + relay's reap/docker-rm slack. Worst
+# case per cycle: 3 drafts x 360 s + ~420 s of replay = ~1500 s (ESTIMATE), inside
+# the service's TimeoutStartSec=1800. Without the shared budget, 2 composed drafts
+# (one per editable job) x 6 x ~65 s took the total to ~1860 s.
+REPLAY_MAX_SESSIONS = 6
+REPLAY_TIMEOUT_S = 60
+REPLAY_CYCLE_BUDGET_S = 360
+
+# Replay used-string check (tuner design 2026-10-28). A reducer goes live only if
+# every string the model reused verbatim from a result survives the reduction.
+USED_MIN_CHARS = 8
+# Only the first this-many normalised chars of a result and of each later message
+# are compared; used strings past that point are not found.
+USED_MAX_CHARS = 50_000
+# Drop strings present in more than this share of a tool's results.
+BOILERPLATE_SHARE = 0.5
+# With fewer results than this in the window, nothing counts as boilerplate.
+BOILERPLATE_MIN_RESULTS = 4

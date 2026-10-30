@@ -12,6 +12,11 @@ class ToolCall:
     arg_keys: tuple[str, ...]
     ref: str | None
     result_chars: int
+    # 1-based ordinal of the assistant row that issued the call, counted across the
+    # run (root first, then continuations); 0 when unknown.
+    turn: int = 0
+    # Assistant rows after this call's tool row in the same sessions row.
+    later_turns: int = 0
 
 
 @dataclass(frozen=True)
@@ -30,12 +35,13 @@ class Session:
     input_tokens: int = 0
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+    turns: int = 0  # assistant rows in the run
 
 
 @dataclass(frozen=True)
 class Fix:
     id: str
-    kind: Literal["composed_tool", "job_prompt", "config", "skill", "new_reach"]
+    kind: Literal["composed_tool", "job_prompt", "config", "skill", "new_reach", "reducer"]
     target: str
     payload: dict
     candidate_key: str

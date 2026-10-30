@@ -1,7 +1,9 @@
 """Read-only view of Hermes's state.db."""
 from __future__ import annotations
 
+import bisect
 import json
+import dataclasses
 import posixpath
 import re
 import sqlite3
@@ -87,6 +89,58 @@ def _is_untrusted(name: str, args: dict) -> bool:
     return name in policy.UNTRUSTED_TOOLS or name.startswith(policy.UNTRUSTED_PREFIXES)
 
 
+def _key_ref(args: dict) -> str | None:
+    """The call's key: its message_id, else its search query."""
+    for k in ("message_id", "query"):
+        v = args.get(k)
+        if isinstance(v, str):
+            return v
+    return None
+
+
+def assistant_row_ids(rows) -> dict[str, list[int]]:
+    """Ids of each session's assistant rows, ascending. A row's turn is its 1-based
+    position in its session's list. `rows` need `id`, `session_id` and `role`, and
+    must be ordered by id."""
+    out: dict[str, list[int]] = {}
+    for r in rows:
+        if r["role"] == "assistant":
+            out.setdefault(r["session_id"], []).append(r["id"])
+    return out
+
+
+@dataclasses.dataclass(frozen=True)
+class ReplayCall:
+    pos: int            # row order within the run
+    call_id: str
+    name: str
+    args: dict
+    text: str           # result with Hermes's untrusted wrapper removed
+    chars: int          # len(text)
+    turn: int           # as ToolCall.turn
+    later_turns: int    # as ToolCall.later_turns
+    ref: str | None     # as ToolCall.ref
+
+
+@dataclasses.dataclass(frozen=True)
+class ReplayRun:
+    session_id: str
+    started_at: float
+    calls: tuple[ReplayCall, ...]
+    said: tuple[tuple[int, str], ...]   # (pos, text) of assistant content and arg string leaves
+
+
+def _string_leaves(value) -> Iterator[str]:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for v in value.values():
+            yield from _string_leaves(v)
+    elif isinstance(value, list):
+        for v in value:
+            yield from _string_leaves(v)
+
+
 class History:
     def __init__(self, conn: sqlite3.Connection):
         self._conn = conn
@@ -128,26 +182,32 @@ class History:
             "tool_calls, tool_name, timestamp "
             f"from messages {where}{' and' if where else ' where'} role in ('assistant', 'tool') "
             "order by id", params)
-        issued: dict[tuple[str, str], tuple[str, dict]] = {}
+        assistants = assistant_row_ids(rows)
+        issued: dict[tuple[str, str], tuple[str, dict, int]] = {}
         for r in rows:
             if r["role"] == "assistant" and r["tool_calls"]:
+                turn = bisect.bisect_right(assistants[r["session_id"]], r["id"])
                 for cid, name, args in _issued_calls(r["tool_calls"]):
-                    issued[(r["session_id"], cid)] = (name, args)
+                    issued[(r["session_id"], cid)] = (name, args, turn)
             elif r["role"] == "tool":
                 if since is not None and session_ids is None and r["timestamp"] < since:
                     continue
                 cid = r["tool_call_id"]
-                name, args = issued.get((r["session_id"], cid), ("?", {})) if cid else ("?", {})
+                name, args, turn = (issued.get((r["session_id"], cid), ("?", {}, 0))
+                                    if cid else ("?", {}, 0))
+                own = assistants.get(r["session_id"], [])
+                later = len(own) - bisect.bisect_right(own, r["id"])
                 if r["tool_name"]:
                     name = r["tool_name"]
                 text = (r["content"] or "") if with_text else None
-                ref = args.get("message_id")
                 yield r["session_id"], ToolCall(
                     call_id=cid or "",
                     name=name,
                     arg_keys=tuple(sorted(args)),
-                    ref=ref if isinstance(ref, str) else None,
+                    ref=_key_ref(args),
                     result_chars=r["clen"] or 0,
+                    turn=turn,
+                    later_turns=later,
                 ), args, text
 
     def _chains(self, roots: list[sqlite3.Row]) -> dict[str, list[str]]:
@@ -178,6 +238,17 @@ class History:
             frontier = nxt
         return chains
 
+    def _turn_counts(self, session_ids: list[str]) -> dict[str, int]:
+        """Assistant rows per session id (0 for a session with none)."""
+        counts = dict.fromkeys(session_ids, 0)
+        for i in range(0, len(session_ids), _CHUNK):
+            part = session_ids[i:i + _CHUNK]
+            for r in self._q("select session_id, count(*) as n from messages "
+                             "where role = 'assistant' and session_id in "
+                             f"({','.join('?' * len(part))}) group by session_id", tuple(part)):
+                counts[r["session_id"]] = r["n"]
+        return counts
+
     def _chain_calls(self, chains: dict[str, list[str]],
                      with_text: bool = False) -> dict[str, list]:
         """Group (ToolCall, args, text) by root id, root session first. text is None
@@ -189,8 +260,10 @@ class History:
         for i in range(0, len(ids), _CHUNK):
             for sid, call, args, text in self._calls(ids[i:i + _CHUNK], with_text=with_text):
                 per_session[sid].append((call, args, text))
+        counts = self._turn_counts(ids)
         out: dict[str, list] = {}
         for root, sids in chains.items():
+            offset = 0  # assistant rows of earlier chain members: turns unique per run
             # Hermes copies the compressed tail (tool rows and their ids included)
             # into the continuation: count each tool call once per run.
             seen: set[str] = set()
@@ -202,7 +275,10 @@ class History:
                         continue
                     if cid:
                         seen.add(cid)
-                    merged.append(x)
+                    call = x[0]
+                    merged.append((dataclasses.replace(call, turn=call.turn + offset)
+                                   if call.turn else call, x[1], x[2]))
+                offset += counts[sid]
             out[root] = merged
         return out
 
@@ -232,6 +308,7 @@ class History:
                              f"({','.join('?' * len(part))})", tuple(part)):
                 member_rows[r["id"]] = r
         calls = self._chain_calls(chains)
+        counts = self._turn_counts([sid for ids in chains.values() for sid in ids])
         out = []
         for r in roots:
             members = [member_rows[sid] for sid in chains[r["id"]]]
@@ -254,7 +331,86 @@ class History:
                 input_tokens=fresh,
                 cache_read_tokens=read,
                 cache_write_tokens=write,
+                turns=sum(counts[sid] for sid in chains[r["id"]]),
             ))
+        return out
+
+    def replay_runs(self, job_id: str, since: float,
+                    until: float | None = None) -> list[ReplayRun]:
+        """Recorded runs of cron job `job_id` (compression chains merged, as `sessions`
+        does) with each call's unwrapped result text and what the model said later.
+        Texts stay in the caller's memory: nothing here logs or writes them."""
+        sql = (f"select {_SESSION_COLS} from sessions s "
+               "left join sessions p on p.id = s.parent_session_id "
+               "where s.started_at >= ? and coalesce(p.end_reason, '') != 'compression'")
+        params: tuple = (since,)
+        if until is not None:
+            sql += " and s.started_at < ?"
+            params += (until,)
+        roots = [r for r in self._q(sql + " order by s.started_at", params)
+                 if (m := JOB_SESSION_RE.match(r["id"])) and m.group(1) == job_id]
+        if not roots:
+            return []
+        chains = self._chains(roots)
+        sids = [sid for ids in chains.values() for sid in ids]
+        rows_by_session: dict[str, list[sqlite3.Row]] = {sid: [] for sid in sids}
+        for i in range(0, len(sids), _CHUNK):
+            part = sids[i:i + _CHUNK]
+            for r in self._q(
+                    "select id, session_id, role, content, tool_calls, tool_call_id, tool_name "
+                    f"from messages where role in ('assistant', 'tool') and session_id in "
+                    f"({','.join('?' * len(part))}) order by id", tuple(part)):
+                rows_by_session[r["session_id"]].append(r)
+        out = []
+        for root in roots:
+            members = chains[root["id"]]
+            pending = []   # (pos, call_id, name, args, text, turn, later)
+            said_raw: list[tuple[int, str]] = []
+            seen: set[str] = set()
+            pos = 0
+            offset = 0
+            for sid in members:
+                rows = rows_by_session[sid]
+                assistants = assistant_row_ids(rows).get(sid, [])
+                issued: dict[str, tuple[str, dict, int]] = {}
+                for r in rows:
+                    pos += 1
+                    if r["role"] == "assistant":
+                        turn = bisect.bisect_right(assistants, r["id"])
+                        calls_here = list(_issued_calls(r["tool_calls"]))
+                        for cid, name, args in calls_here:
+                            issued[cid] = (name, args, turn)
+                        # A row whose calls were all seen already is the compressed tail
+                        # copied into this continuation: it says nothing new. (A copied
+                        # row that issued no calls cannot be told apart and is kept.)
+                        if calls_here and all(c[0] in seen for c in calls_here):
+                            continue
+                        if r["content"]:
+                            said_raw.append((pos, r["content"]))
+                        for _cid, _name, args in calls_here:
+                            said_raw.extend((pos, leaf) for leaf in _string_leaves(args))
+                        continue
+                    cid = r["tool_call_id"]
+                    if cid and cid in seen:
+                        continue
+                    if cid:
+                        seen.add(cid)
+                    name, args, turn = issued.get(cid, ("?", {}, 0)) if cid else ("?", {}, 0)
+                    if r["tool_name"]:
+                        name = r["tool_name"]
+                    later = len(assistants) - bisect.bisect_right(assistants, r["id"])
+                    pending.append((pos, cid or "", name, args, r["content"] or "",
+                                    turn + offset if turn else turn, later))
+                offset += len(assistants)
+            tools = frozenset(p[2] for p in pending)
+            calls = []
+            for p, cid, name, args, text, turn, later in pending:
+                text = _unwrap(text, tools)
+                calls.append(ReplayCall(pos=p, call_id=cid, name=name, args=args, text=text,
+                                        chars=len(text), turn=turn, later_turns=later,
+                                        ref=_key_ref(args)))
+            out.append(ReplayRun(session_id=root["id"], started_at=root["started_at"],
+                                 calls=tuple(calls), said=tuple(said_raw)))
         return out
 
     def last_activity(self) -> float:

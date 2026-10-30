@@ -39,9 +39,17 @@ def ctx(tmp_path, **kw):
 
 
 def composed(**over):
-    p = {"name": "tuned_x", "description": "does x", "parameters": {"type": "object"},
-         "calls": [GET], "mutating": False, "program": "print(1)", "job_prompt": None}
+    p = {"name": "tuned_x", "description": "does x",
+         "parameters": {"type": "object", "properties": {"ids": {"type": "array"}}},
+         "calls": [GET], "mutating": False, "program": "print(1)", "job_prompt": None,
+         "replay_inputs": [{"param": "ids", "from_call": GET, "arg": "message_id",
+                            "collect": "list"}]}
     p.update(over)
+    calls = p["calls"]
+    if "calls" in over and "replay_inputs" not in over and isinstance(calls, list) and calls \
+            and isinstance(calls[0], str):
+        # replay_inputs follows the overridden calls, so only what the test varies fails
+        p["replay_inputs"] = [dict(p["replay_inputs"][0], from_call=calls[0])]
     return Fix("f1", "composed_tool", "3bc4e11d29b1", p, "k")
 
 
@@ -269,15 +277,18 @@ def test_copied_text_rejects_every_text_field(tmp_path):
 def test_copy_in_nested_payload_rejected(tmp_path):
     params = {"type": "object", "properties": {"q": {"description": LEAK}},
               "required": [["a", LEAK]]}
-    assert check_fix(composed(parameters=params), ctx(tmp_path))
-    assert check_fix(composed(job_prompt=LEAK), ctx(tmp_path))
+    params["properties"]["ids"] = {"type": "array"}
+    copied = "contains text copied from untrusted tool results"
+    assert any(copied in r for r in check_fix(composed(parameters=params), ctx(tmp_path)))
+    assert any(copied in r for r in check_fix(composed(job_prompt=LEAK), ctx(tmp_path)))
     assert check_fix(cfg("compression.x", LEAK), ctx(tmp_path))
 
 
 def test_scanner_sees_nested_strings(tmp_path):
     seen = []
     c = ctx(tmp_path, scan=lambda s: seen.append(s) or [])
-    check_fix(composed(parameters={"properties": {"q": {"description": "NESTED"}}}), c)
+    check_fix(composed(parameters={"properties": {"q": {"description": "NESTED"},
+                                                   "ids": {"type": "array"}}}), c)
     assert "NESTED" in seen
 
 
@@ -389,3 +400,65 @@ def test_skill_fix_must_rewrite_the_candidates_skill(tmp_path):
     assert check_fix(not_skill, c)
     right = Fix("f", "skill", bar, {"path": bar, "text": "new"}, "skill_load:bar")
     assert check_fix(right, c) == []
+
+
+def reducer(target="cc68e24f21cd", **over):
+    p = {"tool": GET, "job": "cc68e24f21cd", "steps": [{"op": "collapse_ws"}],
+         "_base": {"prompt": "do the thing", "enabled_toolsets": None}}
+    p.update(over)
+    return Fix("f5", "reducer", target, p, "k")
+
+
+def test_reducer_limits(tmp_path):
+    c = ctx(tmp_path)
+    assert check_fix(reducer(), c) == []
+    assert any("unknown op" in r for r in check_fix(reducer(steps=[{"op": "eval"}]), c))
+    reasons = check_fix(reducer(target="3bc4e11d29b1", job="3bc4e11d29b1"), c)
+    assert "job not a reducer job" in reasons
+    assert "tool not allowed" in check_fix(reducer(tool=LABEL), c)
+    # The spec's job is the fix's target: the hook scopes by spec["job"].
+    assert "reducer job must be the fix's target" in check_fix(
+        reducer(target="3bc4e11d29b1"), c)
+    assert "job 8da9a6857256 is never edited" in check_fix(
+        reducer(target="8da9a6857256", job="8da9a6857256"), c)
+
+
+# --- Task 9: replay_inputs ---------------------------------------------------------------
+
+RI = {"param": "ids", "from_call": GET, "arg": "message_id", "collect": "list"}
+
+
+@pytest.mark.parametrize("entries,why", [
+    (None, "missing"),
+    ([], "empty"),
+    ("ids", "not a list"),
+    (["ids"], "entry not an object"),
+    ([{**RI, "param": "nope"}], "param not in parameters.properties"),
+    ([{**RI, "param": 3}], "param not a string"),
+    ([{**RI, "from_call": "web_search"}], "from_call not one of calls"),
+    ([{**RI, "arg": "message id"}], "arg not an identifier"),
+    ([{**RI, "arg": ""}], "arg empty"),
+    ([{**RI, "collect": "all"}], "collect not list/first"),
+    ([{k: v for k, v in RI.items() if k != "collect"}], "collect missing"),
+    ([RI, {**RI, "collect": "every"}], "second entry bad"),
+    ([RI, {**RI, "arg": "thread_id", "collect": "first"}], "param repeated"),
+])
+def test_composed_tool_needs_valid_replay_inputs(tmp_path, entries, why):
+    """Catches: a composed tool that cannot be replayed reaching the replay gate."""
+    over = {} if entries is None else {"replay_inputs": entries}
+    fix = composed(**over)
+    if entries is None:
+        fix.payload.pop("replay_inputs")
+    reasons = check_fix(fix, ctx(tmp_path))
+    assert any("replay_inputs" in r for r in reasons), (why, reasons)
+
+
+def test_valid_replay_inputs_pass(tmp_path):
+    first = {"param": "t", "from_call": GET, "arg": "thread_id", "collect": "first"}
+    params = {"type": "object", "properties": {"ids": {"type": "array"}, "t": {"type": "string"}}}
+    assert check_fix(composed(parameters=params, replay_inputs=[RI, first]), ctx(tmp_path)) == []
+
+
+def test_replay_inputs_need_parameter_properties(tmp_path):
+    reasons = check_fix(composed(parameters={"type": "object"}), ctx(tmp_path))
+    assert any("replay_inputs" in r for r in reasons)

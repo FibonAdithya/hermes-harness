@@ -1,4 +1,5 @@
-"""Hermes plugin for the tuner: composed tools and the shadow-session guard.
+"""Hermes plugin for the tuner: composed tools, result reducers and the
+shadow-session guard.
 
 - Registers each `$HERMES_HOME/tuner/tools/tuned_*/` (tool.json + program.py)
   as a tool in toolset `tuner`. The handler runs the program in the Docker
@@ -17,12 +18,21 @@
   session that has the `tuner` toolset (or no toolset list): a refusal costs that
   session one wasted call.
 - `on_session_start` -> re-scan the tools dir (spec 4.7).
+- `transform_tool_result` -> `reduce_result`: applies a result reducer
+  (`$HERMES_HOME/tuner/reducers/<fix id>.json`, re-listed on every call) to the
+  raw result of its tool. A live file applies only in runs of its spec's job
+  (scoped by the session's compression-lineage root); a shadow file only in its
+  fix's shadow session. Two matching files: neither applies. Each application
+  that changes the result appends one line of lengths (never result text) to
+  `$HERMES_HOME/tuner/reducer_events/<fix id>.jsonl`; a reducer that raises
+  appends its exception type; a no-op appends nothing.
 - `register` writes `$HERMES_HOME/tuner/plugin_heartbeat.json` =
   {"pid", "registered_at"}; the cycle schedules shadows and applies composed
   tools only when it is newer than the last gateway restart.
 
 Never raises into Hermes's plugin loader. Never writes outside
-`$HERMES_HOME/tuner/shadow/` and `$HERMES_HOME/tuner/plugin_heartbeat.json`.
+`$HERMES_HOME/tuner/shadow/`, `$HERMES_HOME/tuner/reducer_events/` and
+`$HERMES_HOME/tuner/plugin_heartbeat.json`.
 """
 from __future__ import annotations
 
@@ -41,7 +51,7 @@ _TUNER_DIR = str(Path(__file__).resolve().parents[2])
 if _TUNER_DIR not in sys.path:
     sys.path.insert(0, _TUNER_DIR)
 
-from hermes_tuner import lineage, policy, proposals  # noqa: E402
+from hermes_tuner import lineage, policy, proposals, reducers  # noqa: E402
 
 from . import relay  # noqa: E402
 
@@ -363,6 +373,160 @@ def scan(ctx) -> list[str]:
     return names
 
 
+# --- result reducers ----------------------------------------------------------
+
+_FIX_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,100}")  # ledger._ID
+# (path, mtime_ns, inode, size) -> the parsed file, or None when it is invalid.
+_REDUCER_CACHE: dict[tuple[str, int, int, int], dict | None] = {}
+_REDUCER_CACHE_MAX = 1024
+
+
+def _parse_reducer(path: Path) -> dict | None:
+    """The reducer file at `path` if it is valid, else None. Never raises."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    fix_id, shadow_only, shadow_fix = (data.get("fix_id"), data.get("shadow_only"),
+                                       data.get("shadow_fix"))
+    if (not isinstance(fix_id, str) or not _FIX_ID.fullmatch(fix_id) or ".." in fix_id
+            or fix_id != path.stem or not isinstance(shadow_only, bool)
+            or not (shadow_fix is None or isinstance(shadow_fix, str))):
+        return None
+    try:
+        if reducers.validate_spec(data.get("spec")):
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    return {"spec": data["spec"], "fix_id": fix_id, "shadow_only": shadow_only,
+            "shadow_fix": shadow_fix}
+
+
+def load_reducers(reducers_dir: Path) -> list[dict]:
+    """The valid reducer files in `reducers_dir`, by name. Lists the directory on
+    every call (new files apply without a restart); parsed files are cached by
+    (name, mtime_ns). Invalid files are skipped."""
+    try:
+        paths = sorted(p for p in Path(reducers_dir).iterdir()
+                       if p.suffix == ".json" and p.is_file())
+    except OSError:
+        return []
+    out = []
+    for path in paths:
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        key = (str(path), st.st_mtime_ns, st.st_ino, st.st_size)
+        if key not in _REDUCER_CACHE:
+            if len(_REDUCER_CACHE) >= _REDUCER_CACHE_MAX:
+                _REDUCER_CACHE.clear()
+            _REDUCER_CACHE[key] = _parse_reducer(path)
+        entry = _REDUCER_CACHE[key]
+        if entry is not None:
+            out.append(entry)
+    return out
+
+
+def _reducer_event(events_dir: Path, fix_id: str, event: dict) -> None:
+    """Append one JSON line to reducer_events/<fix id>.jsonl (0600). Never raises."""
+    try:
+        Path(events_dir).mkdir(mode=0o700, parents=True, exist_ok=True)
+        line = (json.dumps(event, sort_keys=True) + "\n").encode("utf-8")
+        fd = os.open(Path(events_dir) / f"{fix_id}.jsonl",
+                     os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, line)
+        finally:
+            os.close(fd)
+    except Exception:  # noqa: BLE001
+        logger.exception("hermes-tuner: could not record a reducer event")
+
+
+def _scoped(entries: list[dict], session_id: str, root_of) -> list[dict]:
+    """The entries that apply in `session_id`. Its lineage root (`root_of`) is a
+    shadow job's session: only the file of that shadow's fix. Otherwise only live
+    files of the root's job. No root (or LineageError): none.
+
+    Same split as shadow_root: its fail-closed case (lineage unreadable, a shadow
+    due) names no fix, so no file would match there either."""
+    try:
+        root = root_of(session_id)
+    except lineage.LineageError:
+        return []
+    job_id = _shadow_job_id(root)
+    if job_id is None:
+        return []
+    if _is_shadow_job(job_id):
+        fix_id = _shadow_fix_id(root)
+        return [e for e in entries
+                if fix_id is not None and e["shadow_only"] and e["shadow_fix"] == fix_id]
+    return [e for e in entries if not e["shadow_only"] and e["spec"]["job"] == job_id]
+
+
+def reduce_scoped(tool_name, result, session_id, tool_call_id, status, *, root_of,
+                  reducers_dir: Path, events_dir: Path, load, apply) -> str | None:
+    """The reduced result, or None to leave it unchanged. Never raises. Logs
+    {before, after} only when the result changed, and {error} when `apply` raised.
+
+    `root_of(session_id)` gives the compression-lineage root (may raise
+    LineageError), `load(reducers_dir)` the valid reducer files, `apply(spec,
+    result)` the reduced text."""
+    if status == "error" or not isinstance(result, str) or not isinstance(tool_name, str):
+        return None
+    try:
+        entries = [e for e in load(reducers_dir) if e["spec"]["tool"] == tool_name]
+        if not entries or not isinstance(session_id, str) or not session_id:
+            return None
+        matches = _scoped(entries, session_id, root_of)
+    except Exception:  # noqa: BLE001
+        logger.exception("hermes-tuner: reducer lookup failed")
+        return None
+    base = {"session_id": session_id, "tool_call_id": tool_call_id}
+    if len(matches) > 1:
+        for e in matches:
+            _reducer_event(events_dir, e["fix_id"], dict(base, error="ambiguous"))
+        return None
+    if not matches:
+        return None
+    entry = matches[0]
+    try:
+        out = apply(entry["spec"], result)
+        if not isinstance(out, str):
+            raise TypeError("reducer returned a non-string")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("hermes-tuner: reducer %s failed: %s", entry["fix_id"],
+                       type(exc).__name__)
+        _reducer_event(events_dir, entry["fix_id"], dict(base, error=type(exc).__name__))
+        return None
+    if out == result:  # a no-op is not a reduction: no event, Hermes keeps the original
+        return None
+    _reducer_event(events_dir, entry["fix_id"],
+                   dict(base, before=len(result), after=len(out)))
+    return out
+
+
+def _apply_strict(spec: dict, result: str) -> str:
+    """apply_reducer that raises on an internal error: reduce_scoped logs it."""
+    return reducers.apply_reducer(spec, result, strict=True)
+
+
+def reduce_result(tool_name=None, args=None, result=None, session_id="", tool_call_id="",
+                  status=None, **_) -> str | None:
+    """transform_tool_result hook. Sees the raw result (Hermes wraps it afterwards)."""
+    try:
+        root = tuner_root()
+        return reduce_scoped(tool_name, result, session_id, tool_call_id, status,
+                             root_of=_root_session, reducers_dir=root / "reducers",
+                             events_dir=root / "reducer_events", load=load_reducers,
+                             apply=_apply_strict)
+    except Exception:  # noqa: BLE001
+        logger.exception("hermes-tuner: reduce_result failed")
+        return None
+
+
 def write_heartbeat() -> None:
     """Atomically write {"pid", "registered_at"} to tuner/plugin_heartbeat.json.
     Never raises."""
@@ -387,6 +551,10 @@ def register(ctx) -> None:
     write_heartbeat()
     scan(ctx)
     ctx.register_hook("pre_tool_call", shadow_guard)
+    try:  # a Hermes without this hook must still load the rest of the plugin
+        ctx.register_hook("transform_tool_result", reduce_result)
+    except Exception:  # noqa: BLE001
+        logger.exception("hermes-tuner: could not register transform_tool_result")
 
     def on_session_start(**_):
         scan(ctx)

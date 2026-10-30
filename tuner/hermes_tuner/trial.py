@@ -27,7 +27,7 @@ from typing import Literal
 
 from . import policy
 from .bridge import CREATE_JOB_EXTRA_KEYS, Bridge, BridgeError
-from .ledger import FixRecord, atomic_write, job_after_for
+from .ledger import BASE_KEY, FixRecord, atomic_write, job_after_for
 from collections.abc import Callable
 from statistics import median
 
@@ -95,6 +95,9 @@ def _shadow_prompt(fix: Fix) -> str:
         prompt = p.get("prompt")
     elif fix.kind == "composed_tool":
         prompt = p.get("job_prompt")
+    elif fix.kind == "reducer":  # the job as drafted against (cycle's _shadow sets it)
+        base = p.get(BASE_KEY)
+        prompt = base.get("prompt") if isinstance(base, dict) else None
     else:
         raise ValueError(f"no shadow run for {fix.kind!r} fixes")
     if not isinstance(prompt, str) or not prompt:
@@ -396,3 +399,62 @@ def trial_verdict(record: FixRecord, stats_now: JobStats | None,
     else:
         better = stats_now.median_priced_cost < base
     return "keep" if better else "rollback"
+
+
+# --- early rollback ------------------------------------------------------------------
+
+# A trial is rolled back at once when its fix's own tool or reducer fails this many
+# times, or on this share of its calls.
+EARLY_FAIL_MIN = 2
+EARLY_FAIL_SHARE = 0.10
+# A reducer's trial is rolled back at once when, over at least REREAD_MIN_RUNS trial
+# runs, the mean re-reads per run exceed REREAD_FACTOR x the baseline mean plus
+# REREAD_MARGIN. Resampling the 29 calendar-sync runs of 2026-09-15..10-29 (ESTIMATE):
+# a reducer that changes nothing is rolled back 0-3% of the time over a 21-run trial;
+# one adding 2 re-reads per run ~100%. (The per-run rule this replaced, 2 runs above
+# the baseline mean, rolled back an unchanged search reducer ~98% of the time in 10.)
+REREAD_MIN_RUNS = 5
+REREAD_FACTOR = 2.0
+REREAD_MARGIN = 0.5
+
+
+def rereads(session: Session, tool: str) -> int:
+    """Re-reads in a run: over each ref read by `tool`, the reads after the first
+    (calls with no ref are not counted)."""
+    counts: dict[str, int] = {}
+    for c in session.calls:
+        if c.name == tool and c.ref is not None:
+            counts[c.ref] = counts.get(c.ref, 0) + 1
+    return sum(n - 1 for n in counts.values())
+
+
+def reread_breach(trial_rereads: list[int],
+                  baseline_rereads: list[int]) -> tuple[float, float] | None:
+    """(trial mean, baseline mean) re-reads per run when the trial re-reads more than
+    the baseline by the margin above; else None. None with fewer than REREAD_MIN_RUNS
+    trial runs or no baseline runs."""
+    if len(trial_rereads) < REREAD_MIN_RUNS or not baseline_rereads:
+        return None
+    t = sum(trial_rereads) / len(trial_rereads)
+    b = sum(baseline_rereads) / len(baseline_rereads)
+    return (t, b) if t > REREAD_FACTOR * b + REREAD_MARGIN else None
+
+
+def early_failures(kind: str, own_results: list[str], reduce_errors: int,
+                   reduced: int = 0) -> tuple[int, int]:
+    """(failures, calls) of a fix's own tool or reducer during its trial.
+
+    composed_tool: `own_results` are the texts its own tool returned in the trial runs;
+    failures are those `call_failed` says failed, calls is how many there were.
+    reducer: failures are `reduce_errors` (the hook's error lines for the trial runs);
+    calls is `reduced`, the results it reduced. Re-reads are judged separately
+    (reread_breach). Other kinds have no tool of their own: (0, 0).
+
+    So the denominator of the EARLY_FAIL_SHARE test differs by kind: for a composed
+    tool it is every call, failures included; for a reducer only the results it
+    reduced (its errors are not in it)."""
+    if kind == "composed_tool":
+        return sum(call_failed(t) for t in own_results), len(own_results)
+    if kind == "reducer":
+        return reduce_errors, reduced
+    return 0, 0

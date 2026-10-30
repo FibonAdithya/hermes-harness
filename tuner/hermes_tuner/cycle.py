@@ -6,7 +6,8 @@ validate / shadow / apply / propose -> restart if allowed -> weekly line.
 
 Without a price list (lookup failed and no cached list at most PRICING_MAX_AGE_S
 old) the run still cleans up, checks shadow quality, applies approved proposals,
-rolls back trials past their deadline, restarts and writes the weekly line (with
+rolls back trials past their deadline or whose own tool or reducer fails (early
+rollback), restarts and writes the weekly line (with
 "pricing unavailable"); it skips drafting and cost-based trial verdicts.
 
 `now` is a parameter; nothing here reads the clock. A BridgeError in any step is
@@ -36,11 +37,11 @@ from statistics import median
 from . import policy, trial
 from .bridge import Bridge, BridgeError
 from .budget import DAY, JOB_KINDS, weekly_line
-from .cycle_draft import BASE_KEY, GLOBAL_KINDS, DraftSteps
+from .cycle_draft import GLOBAL_KINDS, DraftSteps
 from .fingerprint import CopyIndex
 from .history import History, HistoryUnavailable
-from .ledger import (ACTIVE_STATES, APPLIED_STATES, FixRecord, Ledger, _tool_files, apply,
-                     atomic_write, is_shadow_tool, rollback)
+from .ledger import (ACTIVE_STATES, APPLIED_STATES, BASE_KEY, FixRecord, Ledger, _tool_files,
+                     apply, atomic_write, is_shadow_tool, remove_reducer, rollback)
 from .measure import priced_cost
 from .model import Fix, Pricing, Session
 from .proposals import apply_approved, approved, dropped
@@ -54,6 +55,8 @@ NO_LIVE_RUN_S = 3 * DAY    # a shadow with no live run to compare 3 days after r
 ERROR_KEEP_S = 28 * DAY
 RESTART_KEEP_S = 28 * DAY
 STATE_FILE = "cycle_state.json"
+REDUCER_EVENTS_DIR = "reducer_events"   # the plugin's hook logs each reduction here
+NEVER_REDUCED = "shadow never reduced a result"
 HEARTBEAT_FILE = "plugin_heartbeat.json"   # written by the plugin at register()
 PLUGIN_NAME = "hermes-tuner"
 
@@ -89,16 +92,22 @@ class CycleReport:
     skipped: str = ""
     dry_run: bool = False
     pricing: dict | None = None   # the price list this run used (Pricing.to_dict)
+    parked: int = 0               # candidates not drafted until their inputs change (backoff)
 
 
 def run_cycle(cfg: CycleConfig, bridge: Bridge, now: float,
-              clock: Callable[[], float] | None = None) -> CycleReport:
+              clock: Callable[[], float] | None = None,
+              run_program: Callable[..., str] | None = None,
+              replay_argv: Callable[[str], list[str]] | None = None) -> CycleReport:
     """`now` anchors the run's decisions. `clock` reads the time again where a step
     depends on the time it actually happens (the restart, after drafting that can
-    take many minutes); it defaults to `now`."""
+    take many minutes); it defaults to `now`. `run_program` (relay.run_program's
+    signature) and `replay_argv` (container name -> runner argv) run the composed-tool
+    replay; None means the plugin's relay in Docker."""
     report = CycleReport(dry_run=cfg.dry_run)
+    replay = {"run_program": run_program, "replay_argv": replay_argv}
     if cfg.dry_run:
-        _Cycle(cfg, bridge, now, report, clock).run()
+        _Cycle(cfg, bridge, now, report, clock, **replay).run()
         return report
     root = Path(cfg.root)
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -109,7 +118,7 @@ def run_cycle(cfg: CycleConfig, bridge: Bridge, now: float,
         except BlockingIOError:
             report.skipped = "already running"
             return report
-        _Cycle(cfg, bridge, now, report, clock).run()
+        _Cycle(cfg, bridge, now, report, clock, **replay).run()
     finally:
         os.close(fd)  # releases the lock
     return report
@@ -117,8 +126,11 @@ def run_cycle(cfg: CycleConfig, bridge: Bridge, now: float,
 
 class _Cycle(DraftSteps):
     def __init__(self, cfg: CycleConfig, bridge: Bridge, now: float, report: CycleReport,
-                 clock: Callable[[], float] | None = None):
+                 clock: Callable[[], float] | None = None,
+                 run_program: Callable[..., str] | None = None,
+                 replay_argv: Callable[[str], list[str]] | None = None):
         self.cfg, self.bridge, self.now, self.report = cfg, bridge, now, report
+        self.run_program, self.replay_argv = run_program, replay_argv
         self.clock = clock if clock is not None else (lambda: now)
         self.root = Path(cfg.root)
         self.dry = cfg.dry_run
@@ -369,12 +381,33 @@ class _Cycle(DraftSteps):
             fix = self.ledger.fix(rec.id)
         except (OSError, ValueError, TypeError) as exc:
             return f"fix unreadable: {type(exc).__name__}"
+        if fix.kind == "reducer" and not self._reduced_in(fix.id, shadow):
+            return NEVER_REDUCED
         if fix.kind == "composed_tool":
             files = self._shadow_tool(fix)
             if files is None:
                 return "fix has no valid composed tool"
             own = files[0]["name"]
         return trial.tool_check(self.history.call_results(shadow.id), own, self._live_tools())
+
+    def _reduced_in(self, fix_id: str, shadow: Session) -> bool:
+        """True when the plugin logged a reduction (a line with "after") by fix
+        `fix_id` in the shadow run or one of its compression continuations: the hook
+        logs the agent's current session id. Malformed lines are skipped."""
+        path = self.root / REDUCER_EVENTS_DIR / f"{fix_id}.jsonl"
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return False
+        chain = set(self.history.chain_ids(shadow.id))
+        for line in lines:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(e, dict) and "after" in e and e.get("session_id") in chain:
+                return True
+        return False
 
     def _live_tools(self) -> frozenset[str]:
         """Names of the composed tools of applied, trial and kept fixes."""
@@ -423,7 +456,13 @@ class _Cycle(DraftSteps):
 
     def _remove_shadow_tool(self, rec: FixRecord) -> None:
         """Remove the shadow-only tool dir written for a composed_tool shadow, if it
-        is still exactly ours."""
+        is still exactly ours, or a reducer fix's shadow file (named by its fix id)."""
+        if rec.kind == "reducer":
+            try:
+                remove_reducer(self.root, rec.id)
+            except (OSError, ValueError) as exc:
+                self.err(f"remove reducer {rec.id}: {type(exc).__name__}")
+            return
         try:
             fix = self.ledger.fix(rec.id)
         except (OSError, ValueError, TypeError):
@@ -455,7 +494,7 @@ class _Cycle(DraftSteps):
             self.plan(f"apply {rec.id}")
             return
         fix = self.ledger.fix(rec.id)
-        if fix.kind == "composed_tool" and not self.plugin_loaded():
+        if fix.kind in ("composed_tool", "reducer") and not self.plugin_loaded():
             self.err(f"plugin not loaded; {rec.id} not applied")
             return  # stays shadow_pending; retried next cycle
         changed = self._owner_changed_job(fix)
@@ -505,6 +544,21 @@ class _Cycle(DraftSteps):
             verdict = "continue"
             if rec.kind not in JOB_KINDS and rec.kind not in GLOBAL_KINDS:
                 continue
+            runs = self._trial_runs(rec)
+            if rec.live_from is not None and rec.trial_runs != len(runs) and not self.dry:
+                rec.trial_runs = len(runs)
+                self.ledger.save()
+            if rec.live_from is not None and rec.kind in JOB_KINDS:
+                failures, calls, worse = self._early_failures(rec, runs)
+                if failures >= trial.EARLY_FAIL_MIN or (
+                        calls > 0 and failures / calls >= trial.EARLY_FAIL_SHARE):
+                    self._rollback(rec, f"trial: {failures} failures in {calls} calls (early)",
+                                   runs)
+                    continue
+                if worse is not None:
+                    self._rollback(rec, f"trial: re-reads {worse[0]:.2f} per run vs "
+                                        f"baseline {worse[1]:.2f} (early)", runs)
+                    continue
             if rec.live_from is None or self.pricing is None:
                 pass  # waiting for the restart (spec 4.7), or no price list: deadline only
             elif rec.kind in JOB_KINDS:
@@ -516,11 +570,93 @@ class _Cycle(DraftSteps):
                 verdict = self._global_verdict(rec, rec.live_from)
             start = rec.live_from if rec.live_from is not None else rec.applied_at
             if verdict == "keep":
-                self._keep(rec)
+                self._keep(rec, runs)
             elif verdict == "rollback":
-                self._rollback(rec)
+                self._rollback(rec, runs=runs)
             elif self.now - start >= policy.TRIAL_DEADLINE_DAYS * DAY:
                 self._rollback(rec, f"no verdict in {policy.TRIAL_DEADLINE_DAYS} days")
+
+    def _trial_runs(self, rec: FixRecord) -> list[Session]:
+        """The runs a trial is judged on: since live_from, with at least one tool call
+        (zero-call runs are outages), not shadow runs; for a job fix the job's runs,
+        for a config or skill fix chat sessions and editable-job runs. [] before
+        live_from."""
+        if rec.live_from is None:
+            return []
+        keep = ((lambda s: s.job_id == rec.target) if rec.kind in JOB_KINDS else _global_run)
+        return [s for s in self.sessions if s.started_at > rec.live_from and s.calls
+                and s.job_id not in self.shadow_ids and keep(s)]
+
+    def _early_failures(self, rec: FixRecord, runs: list[Session]
+                        ) -> tuple[int, int, tuple[float, float] | None]:
+        """trial.early_failures for a job fix's trial `runs`, plus a reducer's
+        trial.reread_breach (None for other kinds). A fix that cannot be read has
+        nothing to count: (0, 0, None). So does a state.db read that fails (locked past
+        its timeout): logged, and the record's verdict and deadline still run."""
+        if rec.kind not in ("composed_tool", "reducer"):
+            return 0, 0, None
+        try:
+            return self._count_early_failures(rec, runs)
+        except HistoryUnavailable as exc:
+            self.err(f"early check {rec.id}: {type(exc).__name__}: {exc}")
+            return 0, 0, None
+
+    def _count_early_failures(self, rec: FixRecord, runs: list[Session]
+                              ) -> tuple[int, int, tuple[float, float] | None]:
+        try:
+            fix = self.ledger.fix(rec.id)
+        except (OSError, ValueError, TypeError):
+            return 0, 0, None
+        if fix.kind == "composed_tool":
+            files = self._shadow_tool(fix)
+            if files is None:
+                return 0, 0, None
+            own = files[0]["name"]
+            texts = [t for s in runs for name, t in self.history.call_results(s.id)
+                     if name == own]
+            return (*trial.early_failures(fix.kind, texts, 0), None)
+        tool = fix.payload.get("tool") if isinstance(fix.payload, dict) else None
+        if not isinstance(tool, str):
+            return 0, 0, None
+        errors, reduced = self._reducer_events(fix.id, runs)
+        start = rec.live_from - trial.BASELINE_DAYS * DAY
+        before = [s for s in self.sessions if start <= s.started_at < rec.live_from
+                  and s.job_id == rec.target and s.calls and s.job_id not in self.shadow_ids]
+        worse = trial.reread_breach([trial.rereads(s, tool) for s in runs],
+                                    [trial.rereads(s, tool) for s in before])
+        return (*trial.early_failures(fix.kind, [], errors, reduced=reduced), worse)
+
+    def _reducer_events(self, fix_id: str, runs: list[Session]) -> tuple[int, int]:
+        """(error lines, reduction lines) the plugin logged for fix `fix_id` in `runs`
+        or their compression continuations. A missing or unreadable file is (0, 0);
+        malformed lines are skipped."""
+        path = self.root / REDUCER_EVENTS_DIR / f"{fix_id}.jsonl"
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return 0, 0
+        ids = {i for s in runs for i in self.history.chain_ids(s.id)}
+        errors = reduced = 0
+        for line in lines:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(e, dict) or e.get("session_id") not in ids:
+                continue
+            if "error" in e:
+                errors += 1
+            elif "after" in e:
+                reduced += 1
+        return errors, reduced
+
+    def _measured_saving(self, rec: FixRecord, runs: list[Session]) -> float | None:
+        """Median priced cost of the stored baseline runs minus that of the trial
+        `runs`, both at this run's list; None without a list or with either side empty."""
+        if self.pricing is None or not rec.baseline_runs or not runs:
+            return None
+        base, _prompt = trial.baseline_medians(rec.baseline_runs, self.pricing)
+        return base - median(priced_cost(s, self.pricing) for s in runs)
 
     def _global_verdict(self, rec: FixRecord, live_from: float) -> str:
         """keep only if the median priced_cost over chat sessions and editable-job runs
@@ -542,15 +678,19 @@ class _Cycle(DraftSteps):
             better = ca < cb
         return "keep" if better else "rollback"
 
-    def _keep(self, rec: FixRecord) -> None:
+    def _keep(self, rec: FixRecord, runs: list[Session] | None = None) -> None:
         if self.dry:
             self.plan(f"keep {rec.id}")
             return
         rec.decided_at = self.now
+        rec.measured_saving_per_run = self._measured_saving(rec, runs or [])
         self._close(rec, "kept", "trial: cheaper than baseline")
         self.report.kept.append(rec.id)
 
-    def _rollback(self, rec: FixRecord, reason: str = "trial: not cheaper than baseline") -> None:
+    def _rollback(self, rec: FixRecord, reason: str = "trial: not cheaper than baseline",
+                  runs: list[Session] | None = None) -> None:
+        """Roll back `rec`. With the trial `runs` (a verdict or an early rollback) the
+        measured saving is recorded; without them (a deadline, a retried revert) not."""
         if self.dry:
             self.plan(f"rollback {rec.id}")
             return
@@ -564,6 +704,8 @@ class _Cycle(DraftSteps):
             self.err(f"rollback {rec.id}: {out.reason}")
             return
         out.decided_at = self.now
+        if runs is not None:
+            out.measured_saving_per_run = self._measured_saving(out, runs)
         if out.state == "rolled_back":
             out.reason = reason
             self.restart_wanted |= out.needs_restart
@@ -652,7 +794,7 @@ class _Cycle(DraftSteps):
             recent = sum(1 for e in self.state.get("errors", []) if isinstance(e, dict)
                          and isinstance(e.get("at"), (int, float)) and since < e["at"] <= self.now)
         line = weekly_line(self.ledger, self.sessions, self.now, self.pricing, self.shadow_ids,
-                           errors=recent, since=since)
+                           errors=recent, since=since, parked=self.report.parked)
         self.report.weekly = line
         if self.dry:
             self.plan(f"weekly line {tag}")

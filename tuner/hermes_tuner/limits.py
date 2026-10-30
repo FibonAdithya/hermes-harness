@@ -12,6 +12,7 @@ from . import policy
 from .bridge import is_setting_value
 from .fingerprint import CopyIndex
 from .model import Fix
+from .reducers import validate_spec
 
 
 @dataclass(frozen=True)
@@ -110,6 +111,41 @@ def _check_composed(fix: Fix, ctx: LimitContext) -> list[str]:
             reasons.append(f"call {c!r} is not on the callable allowlist")
     if any(c in policy.MUTATING_TOOLS for c in calls) and p.get("mutating") is not True:
         reasons.append("tool calls a mutating tool but is not declared mutating")
+    return reasons + _check_replay_inputs(p, calls)
+
+
+_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+
+
+def _check_replay_inputs(p: dict, calls: list[str]) -> list[str]:
+    """Each entry: {"param": a key of parameters.properties, "from_call": one of calls,
+    "arg": an identifier, "collect": "list" | "first"}; at least one entry."""
+    entries = p.get("replay_inputs")
+    if not isinstance(entries, list) or not entries:
+        return ["replay_inputs must be a non-empty list"]
+    params = p.get("parameters")
+    props = params.get("properties") if isinstance(params, dict) else None
+    props = props if isinstance(props, dict) else {}
+    reasons = []
+    params_seen: set[str] = set()
+    for i, e in enumerate(entries):
+        where = f"replay_inputs[{i}]"
+        if not isinstance(e, dict):
+            reasons.append(f"{where} must be an object")
+            continue
+        param, src, arg = e.get("param"), e.get("from_call"), e.get("arg")
+        if not isinstance(param, str) or param not in props:
+            reasons.append(f"{where}.param must name a property of parameters")
+        elif param in params_seen:
+            reasons.append(f"{where}.param repeats an earlier entry's param")
+        else:
+            params_seen.add(param)
+        if not isinstance(src, str) or src not in calls:
+            reasons.append(f"{where}.from_call must be one of calls")
+        if not isinstance(arg, str) or not _IDENT.fullmatch(arg):
+            reasons.append(f"{where}.arg must be an identifier")
+        if e.get("collect") not in ("list", "first"):
+            reasons.append(f"{where}.collect must be \"list\" or \"first\"")
     return reasons
 
 
@@ -174,6 +210,13 @@ def _check_skill(fix: Fix, ctx: LimitContext) -> list[str]:
     return []
 
 
+def _check_reducer(fix: Fix) -> list[str]:
+    reasons = _check_job_target(fix) + validate_spec(fix.payload)
+    if fix.payload.get("job") != fix.target:
+        reasons.append("reducer job must be the fix's target")
+    return reasons
+
+
 def _check_new_reach(fix: Fix) -> list[str]:
     change = fix.payload.get("change")
     kind = change.get("type") if isinstance(change, dict) else None
@@ -197,6 +240,8 @@ def check_fix(fix: Fix, ctx: LimitContext) -> list[str]:
         reasons = _check_skill(fix, ctx)
     elif fix.kind == "new_reach":
         reasons = _check_new_reach(fix)
+    elif fix.kind == "reducer":
+        reasons = _check_reducer(fix)
     else:
         return [f"unknown fix kind {fix.kind!r}"]
     for where, s in _strings(fix.payload):

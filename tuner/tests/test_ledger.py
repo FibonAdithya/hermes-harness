@@ -1120,3 +1120,103 @@ def test_go_live_accepts_a_shadow_tool_written_before_shadow_fix(tmp_path):
     rec = do_apply(f, ledger, bridge, root, skills)
     assert rec.state == "trial"
     assert json.loads((d / "tool.json").read_text()) == spec
+
+
+# --- reducer fixes ------------------------------------------------------------------
+
+CAL = "cc68e24f21cd"
+BASE = {"prompt": OLD, "enabled_toolsets": None}
+
+
+def reducer_payload(**kw):
+    p = {"tool": "mcp__google__get_gmail_message_content", "job": CAL,
+         "steps": [{"op": "collapse_ws"}]}
+    p.update(kw)
+    return p
+
+
+def reducer_fix(fid="r1", **kw):
+    return Fix(fid, "reducer", CAL, dict(reducer_payload(**kw), _base=BASE), "k")
+
+
+def reducer_file(root, fid):
+    return json.loads((root / "reducers" / f"{fid}.json").read_text())
+
+
+def test_apply_and_rollback_reducer(tmp_path):
+    from hermes_tuner.ledger import needs_restart
+    root, skills, _, ledger = make(tmp_path)
+    bridge = FakeBridge()
+    fix = reducer_fix()
+    assert needs_restart(fix) is False
+    rec = do_apply(fix, ledger, bridge, root, skills)
+    path = root / "reducers" / "r1.json"
+    assert reducer_file(root, "r1") == {"spec": reducer_payload(), "fix_id": "r1",
+                                        "shadow_only": False, "shadow_fix": None}
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    assert rec.state == "trial" and rec.needs_restart is False and rec.live_from == 100.0
+    assert bridge.calls == []  # a reducer never touches Hermes's jobs or config
+    out = do_rollback(rec, ledger, bridge, root, skills)
+    assert out.state == "rolled_back" and not path.exists()
+    assert Ledger.load(root).get("r1").state == "rolled_back"
+    assert bridge.calls == []
+
+
+def test_apply_reducer_rejects_bad_spec_before_writing(tmp_path):
+    root, skills, _, ledger = make(tmp_path)
+    for fix in (reducer_fix("r2", steps=[{"op": "eval"}]),
+                Fix("r3", "reducer", "3bc4e11d29b1", reducer_payload(), "k")):
+        with pytest.raises(ValueError):
+            apply(fix, ledger, FakeBridge(), root, 100.0, skills_root=skills)
+    assert not (root / "reducers").exists()
+    assert ledger.records == []
+
+
+def test_shadow_reducer_write_and_remove(tmp_path):
+    from hermes_tuner.ledger import remove_reducer, write_shadow_reducer
+    root = tmp_path / "tuner"
+    write_shadow_reducer(root, dict(reducer_payload(), _base=BASE), "r1")
+    path = root / "reducers" / "r1.json"
+    assert reducer_file(root, "r1") == {"spec": reducer_payload(), "fix_id": "r1",
+                                        "shadow_only": True, "shadow_fix": "r1"}
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    remove_reducer(root, "r1")
+    assert not path.exists()
+    remove_reducer(root, "r1")  # already gone: no error
+    with pytest.raises(ValueError):
+        write_shadow_reducer(root, reducer_payload(steps=[{"op": "eval"}]), "r2")
+    with pytest.raises(ValueError):
+        write_shadow_reducer(root, reducer_payload(), "../r2")
+    assert not (root / "reducers" / "r2.json").exists()
+
+
+def test_apply_reducer_after_shadow_goes_live(tmp_path):
+    from hermes_tuner.ledger import write_shadow_reducer
+    root, skills, _, ledger = make(tmp_path)
+    write_shadow_reducer(root, reducer_fix().payload, "r1")
+    do_apply(reducer_fix(), ledger, FakeBridge(), root, skills)
+    assert reducer_file(root, "r1")["shadow_only"] is False
+    assert reducer_file(root, "r1")["shadow_fix"] is None
+
+
+def test_job_after_for_reducer_is_the_live_job_unchanged():
+    from hermes_tuner.ledger import job_after_for
+    for toolsets in (["google"], None):
+        live = {"id": CAL, "prompt": OLD, "enabled_toolsets": toolsets, "name": "x"}
+        assert job_after_for(reducer_fix(), live) == {"prompt": OLD,
+                                                      "enabled_toolsets": toolsets}
+
+
+def test_fix_record_est_saving_defaults_and_old_ledgers_load(tmp_path):
+    rec = FixRecord("r1", "reducer", CAL, "k", "shadow_pending", 1.0)
+    assert rec.est_saving_per_run is None
+    root = tmp_path / "tuner"
+    root.mkdir()
+    old = {k: v for k, v in rec.__dict__.items() if k != "est_saving_per_run"}
+    (root / "ledger.json").write_text(json.dumps({"records": [old]}))
+    assert Ledger.load(root).records[0].est_saving_per_run is None
+    rec.est_saving_per_run = 0.0123
+    led = Ledger(root, [rec])
+    led.save()
+    assert Ledger.load(root).records[0].est_saving_per_run == 0.0123

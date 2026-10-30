@@ -10,6 +10,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+from . import policy
 from .measure import priced_cost
 from .model import Pricing, Session
 
@@ -27,7 +28,7 @@ SKILL_TOOL = "skill_view"
 
 @dataclass(frozen=True)
 class Candidate:
-    kind: Literal["sequence", "reread", "schema_lookup", "skill_load"]
+    kind: Literal["sequence", "reread", "schema_lookup", "skill_load", "bytes"]
     key: str
     job_id: str | None
     sessions: int
@@ -38,6 +39,52 @@ class Candidate:
 
 def _total_chars(s: Session) -> int:
     return sum(c.result_chars for c in s.calls)
+
+
+def carried_usd(chars: int, later_turns: int, pricing: Pricing) -> float:
+    """Cost of a tool result's first send plus its re-sends on later turns (USD, an
+    ESTIMATE: chars / CHARS_PER_TOKEN). The first send is input-priced and happens only
+    if a model turn follows the result; each further turn re-reads it from cache."""
+    tokens = chars / policy.CHARS_PER_TOKEN
+    read = pricing.cache_read_per_m if pricing.cache_read_per_m is not None else pricing.input_per_m
+    first = tokens * pricing.input_per_m if later_turns >= 1 else 0.0
+    carry = tokens * read * max(later_turns - 1, 0)
+    return (first + carry) / 1e6
+
+
+def _covered(names: Sequence[str], gram: tuple[str, ...]) -> set[int]:
+    n = len(gram)
+    idx: set[int] = set()
+    for i in range(len(names) - n + 1):
+        if tuple(names[i:i + n]) == gram:
+            idx.update(range(i, i + n))
+    return idx
+
+
+def _saved_for(session: Session, covered: set[int]) -> int:
+    """Model turns a composed call would remove: per maximal run of consecutive covered
+    calls, the turns whose calls all lie in the run (minus one for the composed call when
+    every turn of the run is full)."""
+    by_turn: dict[int, set[int]] = defaultdict(set)
+    for i, c in enumerate(session.calls):
+        by_turn[c.turn].add(i)
+    saved = 0
+    run: list[int] = []
+    for i in sorted(covered) + [None]:  # type: ignore[list-item]
+        if run and (i is None or i != run[-1] + 1):
+            rs = set(run)
+            turns = {session.calls[j].turn for j in run}
+            full = sum(1 for t in turns if by_turn[t] <= rs)
+            saved += max(full - 1 if full == len(turns) else full, 0)
+            run = []
+        if i is not None:
+            run.append(i)
+    return saved
+
+
+def saved_turns(session: Session, gram: tuple[str, ...]) -> int:
+    """Model turns removed in `session` if `gram` became one composed call."""
+    return _saved_for(session, _covered([c.name for c in session.calls], gram))
 
 
 def _money(per_session: Mapping[str, int], by_id: Mapping[str, Session],
@@ -70,6 +117,17 @@ def _sequences(sessions: list[Session], by_id: Mapping[str, Session],
                 chars = sum(s.calls[i].result_chars for i in idx)
                 seen[(s.job_id, g)][s.id] = (chars, matches[g])
 
+    def usd(job, g) -> float:
+        total = 0.0
+        for sid, (chars, _m) in seen[(job, g)].items():
+            s = by_id[sid]
+            if s.turns > 0:
+                n = _saved_for(s, _covered([c.name for c in s.calls], g))
+                total += n * priced_cost(s, pricing) / s.turns
+            else:  # v2 fixture: no turn data, fall back to the char share
+                total += _money({sid: chars}, by_id, pricing) * WINDOW_DAYS / MONTH_DAYS
+        return total * MONTH_DAYS / WINDOW_DAYS
+
     best: dict[tuple[str | None, frozenset[str]], tuple[tuple, tuple[str | None, tuple[str, ...]]]] = {}
     for (job, g), per in seen.items():
         if len(per) < MIN_SEQUENCE_SESSIONS:
@@ -87,8 +145,25 @@ def _sequences(sessions: list[Session], by_id: Mapping[str, Session],
             kind="sequence", key="seq:" + ">".join(g), job_id=job, sessions=len(per),
             occurrences=sum(m for _c, m in per.values()),
             result_chars=sum(c for c, _m in per.values()),
-            est_monthly_usd=_money({sid: c for sid, (c, _m) in per.items()}, by_id, pricing)))
+            est_monthly_usd=usd(job, g)))
     return out
+
+
+def _bytes(sessions: list[Session], pricing: Pricing,
+           aliases: Mapping[str, str]) -> list[Candidate]:
+    # (job, tool) -> [session ids, calls, chars, usd]
+    acc: dict[tuple[str | None, str], list] = {}
+    for s in sessions:
+        for c in s.calls:
+            a = acc.setdefault((s.job_id, aliases.get(c.name, c.name)), [set(), 0, 0, 0.0])
+            a[0].add(s.id)
+            a[1] += 1
+            a[2] += c.result_chars
+            a[3] += carried_usd(c.result_chars, c.later_turns, pricing)
+    return [Candidate(kind="bytes", key="bytes:" + tool, job_id=job, sessions=len(a[0]),
+                      occurrences=a[1], result_chars=a[2],
+                      est_monthly_usd=a[3] * MONTH_DAYS / WINDOW_DAYS)
+            for (job, tool), a in acc.items() if len(a[0]) >= MIN_SEQUENCE_SESSIONS]
 
 
 def _loop_signature(seq: tuple[str, ...]) -> tuple[str, ...]:
@@ -199,12 +274,14 @@ def _skill_loads(sessions: list[Session], by_id: Mapping[str, Session],
 
 
 def detect(sessions: list[Session], now: float, pricing: Pricing,
-           skill_names: Mapping[str, Sequence[str]] | None = None) -> list[Candidate]:
+           skill_names: Mapping[str, Sequence[str]] | None = None,
+           aliases: Mapping[str, str] | None = None) -> list[Candidate]:
     """Candidates ranked by estimated monthly cost at `pricing`'s list prices."""
     window = [s for s in sessions if now - WINDOW_DAYS * DAY <= s.started_at <= now]
     by_id = {s.id: s for s in window}
     cands = (_sequences(window, by_id, pricing) + _rereads(window, by_id, pricing)
-             + _schema_lookups(window, by_id, pricing))
+             + _schema_lookups(window, by_id, pricing)
+             + _bytes(window, pricing, aliases or {}))
     if skill_names is not None:
         cands += _skill_loads(window, by_id, skill_names, pricing)
     cands = [c for c in cands if c.est_monthly_usd > 0]  # worth nothing: not a candidate

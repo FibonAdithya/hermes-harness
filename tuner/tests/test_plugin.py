@@ -216,7 +216,9 @@ def test_registration_reads_tool_dir(home):
     assert ctx.tools["tuned_alpha"]["schema"]["name"] == "tuned_alpha"
     assert "dry_run" in ctx.tools["tuned_beta"]["schema"]["parameters"]["properties"]
     assert "dry_run" not in ctx.tools["tuned_alpha"]["schema"]["parameters"]["properties"]
-    assert sorted(h for h, _ in ctx.hooks) == ["on_session_start", "pre_tool_call"]
+    assert sorted(h for h, _ in ctx.hooks) == ["on_session_start", "pre_tool_call",
+                                               "transform_tool_result"]
+    assert dict(ctx.hooks)["transform_tool_result"] is plugin.reduce_result
     assert syn.exists()
 
 
@@ -460,4 +462,238 @@ def test_heartbeat_failure_does_not_raise(tmp_path, monkeypatch):
     plugin = load_plugin()
     ctx = FakeCtx()
     plugin.register(ctx)
-    assert sorted(h for h, _ in ctx.hooks) == ["on_session_start", "pre_tool_call"]
+    assert sorted(h for h, _ in ctx.hooks) == ["on_session_start", "pre_tool_call",
+                                               "transform_tool_result"]
+
+
+# --- result reducers (transform_tool_result) ----------------------------------------
+
+CAL = "cc68e24f21cd"
+CAL_SID = "cron_cc68e24f21cd_20261029_060000"
+CAL_CHILD = "20261029_061500_a1b2c3"
+CHAT_SID = "20261029_101500_abc123"
+F1_SHADOW_SID = "cron_abc123abc123_20261029_060000"
+F2_SHADOW_SID = "cron_def456def456_20261029_060000"
+RAW = json.dumps({"result": "a    b\n\n\n\nc", "structuredContent": {"result": "x   y"}})
+STEPS = [{"op": "collapse_ws"}]
+
+
+def write_reducer(home, name, *, tool=GET, job=CAL, steps=STEPS, shadow_fix=None,
+                  fix_id=None):
+    d = home / "tuner" / "reducers"
+    d.mkdir(exist_ok=True)
+    path = d / f"{name}.json"
+    path.write_text(json.dumps({
+        "spec": {"tool": tool, "job": job, "steps": steps},
+        "fix_id": name if fix_id is None else fix_id,
+        "shadow_only": shadow_fix is not None, "shadow_fix": shadow_fix}))
+    return path
+
+
+def reducer_events(home, fix_id):
+    p = home / "tuner" / "reducer_events" / f"{fix_id}.jsonl"
+    if not p.exists():
+        return []
+    return [json.loads(line) for line in p.read_text().splitlines()]
+
+
+def roots(mapping):
+    """Injected lineage-root lookup: a cron id is its own root; others from `mapping`
+    (an exception value is raised)."""
+    def root_of(sid):
+        if sid.startswith("cron_"):
+            return sid
+        v = mapping.get(sid)
+        if isinstance(v, Exception):
+            raise v
+        return v
+    return root_of
+
+
+def reduce(plugin, home, sid, *, tool=GET, result=RAW, status="success", root_map=None,
+           load=None, apply=None, call_id="c1"):
+    return plugin.reduce_scoped(
+        tool, result, sid, call_id, status,
+        root_of=roots(root_map or {}), reducers_dir=home / "tuner" / "reducers",
+        events_dir=home / "tuner" / "reducer_events",
+        load=load or plugin.load_reducers, apply=apply or plugin.reducers.apply_reducer)
+
+
+def expected(steps=STEPS, result=RAW):
+    from hermes_tuner.reducers import apply_reducer
+    return apply_reducer({"tool": GET, "job": CAL, "steps": steps}, result)
+
+
+def test_hook_scoping(home):
+    from hermes_tuner import lineage
+    plugin = load_plugin()
+    two_shadow_jobs(home)  # abc123abc123 = F1's shadow, def456def456 = F2's shadow
+    write_reducer(home, "r1")
+    write_reducer(home, "F1", shadow_fix="F1")
+    want = expected()
+    assert want != RAW and len(want) < len(RAW)
+
+    assert reduce(plugin, home, CAL_SID) == want
+    assert reducer_events(home, "r1") == [
+        {"session_id": CAL_SID, "tool_call_id": "c1", "before": len(RAW),
+         "after": len(want)}]
+    ev = home / "tuner" / "reducer_events"
+    assert stat_mode(ev) == 0o700 and stat_mode(ev / "r1.jsonl") == 0o600
+
+    child_map = {CHAT_SID: CHAT_SID, CAL_CHILD: CAL_SID}
+    assert reduce(plugin, home, CHAT_SID, root_map=child_map) is None
+    assert reduce(plugin, home, "cron_3bc4e11d29b1_20261029_060000") is None
+    assert reduce(plugin, home, F2_SHADOW_SID) is None  # F2's shadow: F1's file is not its
+    assert reduce(plugin, home, CAL_SID, tool="web_extract") is None
+    assert reduce(plugin, home, CAL_SID, tool="mcp__google__get_events") is None
+    assert reduce(plugin, home, CAL_SID, status="error") is None
+    assert reduce(plugin, home, CAL_SID, result={"result": "a    b"}) is None
+    assert reduce(plugin, home, CAL_CHILD, root_map={}) is None  # no root
+    assert reduce(plugin, home, CAL_CHILD,
+                  root_map={CAL_CHILD: lineage.LineageError("db")}) is None
+    assert reduce(plugin, home, "", root_map={}) is None
+    assert len(reducer_events(home, "r1")) == 1
+    assert reducer_events(home, "F1") == []
+
+    # A compression child of the calendar run keeps its reducer.
+    assert reduce(plugin, home, CAL_CHILD, root_map=child_map, call_id="c2") == want
+    assert reducer_events(home, "r1")[-1] == {
+        "session_id": CAL_CHILD, "tool_call_id": "c2", "before": len(RAW),
+        "after": len(want)}
+    # F1's own shadow session gets F1's shadow file, and no live file.
+    assert reduce(plugin, home, F1_SHADOW_SID) == want
+    assert len(reducer_events(home, "F1")) == 1 and len(reducer_events(home, "r1")) == 2
+    assert sorted(p.name for p in ev.iterdir()) == ["F1.jsonl", "r1.jsonl"]
+
+
+def stat_mode(path):
+    import stat as st
+    return st.S_IMODE(path.stat().st_mode)
+
+
+def test_hook_wrapper_uses_hermes_home(home):
+    plugin = load_plugin()
+    write_reducer(home, "r1")
+    out = plugin.reduce_result(tool_name=GET, args={"message_id": "m"}, result=RAW,
+                               task_id="t", session_id=CAL_SID, tool_call_id="c9",
+                               turn_id="u", api_request_id="a", duration_ms=5,
+                               status="success", error_type=None, error_message=None)
+    assert out == expected()
+    assert reducer_events(home, "r1")[0]["tool_call_id"] == "c9"
+    # No state.db: the chat session's root cannot be found, so nothing applies.
+    assert plugin.reduce_result(tool_name=GET, args={}, result=RAW, session_id=CHAT_SID,
+                                tool_call_id="c", status="success") is None
+    assert plugin.reduce_result(tool_name=GET, args={}, result=RAW) is None
+
+
+def test_hook_two_live_reducers_same_tool(home):
+    plugin = load_plugin()
+    write_reducer(home, "r1")
+    write_reducer(home, "r2", steps=[{"op": "cap", "chars": 2000}])
+    assert reduce(plugin, home, CAL_SID) is None
+    for fid in ("r1", "r2"):
+        assert reducer_events(home, fid) == [
+            {"session_id": CAL_SID, "tool_call_id": "c1", "error": "ambiguous"}]
+
+
+def test_hook_skips_bad_reducer_file(home):
+    plugin = load_plugin()
+    write_reducer(home, "r1")
+    d = home / "tuner" / "reducers"
+    good = (d / "r1.json").read_text()
+    (d / "bad1.json").write_text(good[: len(good) // 2])  # truncated
+    write_reducer(home, "bad2", steps=[{"op": "eval"}])
+    write_reducer(home, "bad3", fix_id="r1")  # claims another file's fix id
+    write_reducer(home, "bad4", fix_id="../x")
+    (d / "bad5.json").write_text("[]")
+    (d / "bad6.json").write_text(json.dumps(dict(json.loads(good), fix_id="bad6",
+                                                 shadow_only=0)))  # falsy, not False
+    (d / "bad7.json").write_text(json.dumps({"fix_id": "bad7", "shadow_only": False,
+                                             "shadow_fix": None}))
+    (d / "notes.txt").write_text(good)
+    (d / "sub.json").mkdir()
+    assert reduce(plugin, home, CAL_SID) == expected()
+    assert len(reducer_events(home, "r1")) == 1
+    assert sorted(p.name for p in (home / "tuner" / "reducer_events").iterdir()) == [
+        "r1.jsonl"]
+
+
+def test_hook_reloads_changed_files_without_restart(home):
+    import os
+    plugin = load_plugin()
+    path = write_reducer(home, "r1")
+    d = home / "tuner" / "reducers"
+    first = plugin.load_reducers(d)
+    assert [e["fix_id"] for e in first] == ["r1"]
+    assert plugin.load_reducers(d)[0] is first[0]  # cached
+    # Rewritten in place under the same name (as go-live does): the new content applies.
+    mtime = path.stat().st_mtime_ns
+    write_reducer(home, "r1", steps=[{"op": "cap", "chars": 4000}])
+    os.utime(path, ns=(mtime + 10**9, mtime + 10**9))
+    assert plugin.load_reducers(d)[0]["spec"]["steps"] == [{"op": "cap", "chars": 4000}]
+    path.unlink()
+    write_reducer(home, "r3", steps=[{"op": "cap", "chars": 2000}])
+    big = json.dumps({"result": "z" * 3000})
+    assert reduce(plugin, home, CAL_SID, result=big) == expected(
+        [{"op": "cap", "chars": 2000}], big)
+    assert reducer_events(home, "r1") == []
+
+
+def test_hook_fail_open(home):
+    plugin = load_plugin()
+    write_reducer(home, "r1")
+
+    def boom(spec, result):
+        raise RuntimeError("x")
+
+    assert reduce(plugin, home, CAL_SID, apply=boom) is None
+    assert reducer_events(home, "r1") == [
+        {"session_id": CAL_SID, "tool_call_id": "c1", "error": "RuntimeError"}]
+
+    def bad_load(d):
+        raise OSError("disk")
+
+    assert reduce(plugin, home, CAL_SID, load=bad_load) is None
+    # The events dir cannot be created: the reduced result is still returned.
+    (home / "tuner" / "reducer_events").rename(home / "tuner" / "ev_old")
+    (home / "tuner" / "reducer_events").write_text("a file")
+    assert reduce(plugin, home, CAL_SID) == expected()
+
+
+def test_hook_no_op_reducer_writes_no_event(home):
+    """A reducer that leaves the result as it was logs nothing and returns None
+    (Hermes keeps the original), so "reduced" in the event log means changed."""
+    plugin = load_plugin()
+    write_reducer(home, "r1")
+    assert reduce(plugin, home, CAL_SID, apply=lambda spec, result: str(result)) is None
+    assert reducer_events(home, "r1") == []
+    # Through the hook: collapse_ws on a result with no runs of whitespace is a no-op.
+    plain = json.dumps({"result": "a b"})
+    assert plugin.reduce_result(tool_name=GET, result=plain, session_id=CAL_SID,
+                                tool_call_id="c1", status="success") is None
+    assert reducer_events(home, "r1") == []
+    assert not (home / "tuner" / "reducer_events").exists()
+
+
+def test_hook_logs_a_reducer_crash_as_an_error(home):
+    """The hook applies with strict=True: an exception inside the reducer is logged
+    as its type, not mistaken for a no-op, and the result is left unchanged."""
+    plugin = load_plugin()
+    write_reducer(home, "r1")
+    deep = "[" * 100_000 + "]" * 100_000  # json.loads raises RecursionError
+    assert plugin.reduce_result(tool_name=GET, result=deep, session_id=CAL_SID,
+                                tool_call_id="c3", status="success") is None
+    assert reducer_events(home, "r1") == [
+        {"session_id": CAL_SID, "tool_call_id": "c3", "error": "RecursionError"}]
+
+
+def test_hook_shadow_of_unknown_fix_gets_nothing(home):
+    """A shadow whose fix is unknown (no fix_id, no tuner-shadow-<id> job name) is
+    still a shadow: no live file applies in it, and no shadow file either."""
+    (home / "tuner" / "shadow_jobs.json").write_text(json.dumps({
+        "abc123abc123": {"live_job_id": CAL, "run_at": time.time()}}))
+    plugin = load_plugin()
+    write_reducer(home, "r1")  # live: shadow_fix is None, as is the unknown fix
+    write_reducer(home, "F1", shadow_fix="F1")
+    assert reduce(plugin, home, F1_SHADOW_SID) is None
+    assert not (home / "tuner" / "reducer_events").exists()
