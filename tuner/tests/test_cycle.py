@@ -2474,3 +2474,29 @@ def test_cycle_weekly_line_reports_parked(env):
     c.weekly()
     assert c.report.weekly.endswith("; parked: 2")
     assert (env.root / "outbox" / "weekly-2026-W43.txt").read_text().endswith("; parked: 2\n")
+
+
+# --- trusted text in the copy check ----------------------------------------------------
+
+ECHOED_PROMPT = "Triage the inbox: read the 20 newest messages and star the ones that need a reply."
+
+
+def test_cycle_does_not_count_the_job_prompt_as_copied(env):
+    """Live 2026-11-02: session_search hits quote the job's own prompt, so a job_prompt
+    fix that kept the prompt's wording was rejected as copied. Here every read result
+    quotes the prompt. Catches: _limits not passing the target job's prompt."""
+    runs = triage_runs()
+    for r in runs:
+        r["calls"] = [(n, a, f"{res} quoted: {ECHOED_PROMPT}" if n == GET else res, t)
+                      for n, a, res, t in r["calls"]]
+    build(env, runs)
+    the_jobs = jobs()
+    the_jobs[TRIAGE]["prompt"] = ECHOED_PROMPT
+    edit = {"kind": "job_prompt", "target": TRIAGE,
+            "payload": {"prompt": ECHOED_PROMPT + " Skip mail already starred.",
+                        "add_toolsets": []}}
+    bridge = FakeBridge(jobs=the_jobs, oneshot_script=[reply(edit)])
+    report = run_cycle(env, bridge, NOW)
+    (rec,) = Ledger.load(env.root).records
+    assert rec.state == "shadow_pending", rec.reason
+    assert report.errors == []

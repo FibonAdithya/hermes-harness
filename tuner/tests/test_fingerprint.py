@@ -67,3 +67,46 @@ def test_copy_with_zero_width_and_full_width_characters_is_detected():
     # control: unrelated text of the same shape is not a copy
     assert not CopyIndex.build(["header " + secret + " footer"]).contains_copy(
         _disguise("Quarterly report for the north-east team"))
+
+
+# --- trusted text (without) ----------------------------------------------------------
+
+def _corpus_with_trusted():
+    rng = random.Random(77)
+    trusted, leak = rand(rng, 120), rand(rng, 200)
+    return trusted, leak, CopyIndex.build([leak[:100] + " " + trusted + " " + leak[100:]])
+
+
+def test_without_drops_text_that_is_also_trusted():
+    """Trusted text echoed in an untrusted result (a job prompt in a session_search
+    hit) is not a copy. Catches: without() returning the index unchanged."""
+    trusted, _leak, idx = _corpus_with_trusted()
+    assert idx.contains_copy(trusted)
+    assert not idx.without([trusted]).contains_copy(trusted)
+
+
+def test_without_keeps_every_untrusted_40_char_run():
+    """Catches: without() emptying the index or dropping fingerprints outside the
+    trusted text."""
+    trusted, leak, idx = _corpus_with_trusted()
+    sub = idx.without([trusted])
+    for part in (leak[:100], leak[100:]):
+        for i in range(0, len(part) - 40 + 1, 5):
+            assert sub.contains_copy(part[i:i + 40]), i
+
+
+def test_without_leaves_the_original_index_alone():
+    """The cycle caches one index and checks fixes for different jobs against it.
+    Catches: without() removing fingerprints in place."""
+    trusted, _leak, idx = _corpus_with_trusted()
+    idx.without([trusted])
+    assert idx.contains_copy(trusted)
+
+
+def test_without_matches_trusted_text_after_normalisation():
+    """Trusted text and corpus are normalised the same way. Catches: without()
+    hashing the raw trusted text (here its doubled spaces would not match)."""
+    rng = random.Random(5)
+    words = [rand(rng, 8) for _ in range(10)]
+    idx = CopyIndex.build([" ".join(words)])
+    assert not idx.without(["  ".join(words)]).contains_copy(" ".join(words))

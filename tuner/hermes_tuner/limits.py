@@ -26,6 +26,9 @@ class LimitContext:
     # Hermes's current settings the tuner may change (changeable_settings); a config
     # fix must name one of these keys. Empty when they could not be read: fail closed.
     config_settings: Mapping[str, Any]
+    # Owner-controlled text that untrusted results may echo back (the target job's
+    # current prompt). Text found here is not counted as copied.
+    trusted_texts: tuple[str, ...] = ()
 
 
 def _strings(obj: object, path: str = "payload") -> Iterator[tuple[str, str]]:
@@ -244,9 +247,14 @@ def check_fix(fix: Fix, ctx: LimitContext) -> list[str]:
         reasons = _check_reducer(fix)
     else:
         return [f"unknown fix kind {fix.kind!r}"]
+    # The Google MCP server names its tools in its own results, and session_search
+    # echoes job prompts back: neither is text an untrusted source supplied. Tool names
+    # come from the allowlists only, never from history (the model may call any name).
+    trusted = sorted(policy.CALLABLE_TOOLS | policy.REDUCER_TOOLS | ctx.approved_callables)
+    copies = ctx.copy_index.without([*trusted, *ctx.trusted_texts])
     for where, s in _strings(fix.payload):
         for finding in ctx.scan(s):
             reasons.append(f"{where}: scanner finding {finding}")
-        if ctx.copy_index.contains_copy(s):
+        if copies.contains_copy(s):
             reasons.append(f"{where}: contains text copied from untrusted tool results")
     return reasons

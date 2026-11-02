@@ -4,6 +4,11 @@ Any shared run of at least K + W - 1 = 40 characters (after normalisation:
 NFKC, format characters such as zero-width spaces removed, whitespace collapsed)
 is detected. Shorter runs may be detected; nothing is
 guaranteed below 40.
+
+`without(trusted)` drops every fingerprint whose K characters also occur in
+trusted text. After that, a shared run is detected if one of its winnowed
+fingerprints is not made of trusted text; a run made entirely of trusted text
+is not a copy.
 """
 from __future__ import annotations
 
@@ -27,6 +32,22 @@ def _normalise(text: str) -> str:
     text = unicodedata.normalize("NFKC", text)
     text = "".join(c for c in text if unicodedata.category(c) != "Cf")
     return " ".join(text.split())
+
+
+def _kgrams(text: str) -> set[int]:
+    """The hash of every K-character window of already-normalised text."""
+    n = len(text) - K + 1
+    if n <= 0:
+        return set()
+    codes = [ord(c) for c in text]
+    h = 0
+    for c in codes[:K]:
+        h = (h * BASE + c) % MOD
+    out = {h}
+    for i in range(1, n):
+        h = ((h - codes[i - 1] * _TOP) * BASE + codes[i + K - 1]) % MOD
+        out.add(h)
+    return out
 
 
 def _winnow(text: str) -> set[int]:
@@ -66,6 +87,15 @@ class CopyIndex:
         for t in texts:
             fps |= _winnow(_normalise(t))
         return cls(array("Q", sorted(fps)))
+
+    def without(self, trusted: Iterable[str]) -> "CopyIndex":
+        """A new index lacking every fingerprint that also occurs in trusted text."""
+        drop: set[int] = set()
+        for t in trusted:
+            drop |= _kgrams(_normalise(t))
+        if not drop:
+            return self
+        return CopyIndex(array("Q", (f for f in self._fp if f not in drop)))
 
     def contains_copy(self, text: str) -> bool:
         fp = self._fp
