@@ -43,6 +43,12 @@ JOB_CANDIDATES = ("sequence", "reread", "bytes")
 REDUCER_BLOCKING = ACTIVE_STATES | APPLIED_STATES
 
 
+def _job_texts(job: dict | None) -> tuple[str, ...]:
+    """The target job's current prompt, which untrusted results echo back."""
+    prompt = job.get("prompt") if isinstance(job, dict) else None
+    return (prompt,) if isinstance(prompt, str) and prompt else ()
+
+
 def _skill_file(skills_root: Path, name: str) -> Path | None:
     """The SKILL.md of the skill directory called `name`, first in sorted order."""
     try:
@@ -464,7 +470,7 @@ class DraftSteps:
             self.err(f"draft {fix.id} is already in the ledger")
             return spend, False
         try:
-            reasons = self._limits(fix, cand, bundled)
+            reasons = self._limits(fix, cand, bundled, job)
         except BridgeError as exc:
             self._record(fix, "bridge_error", spend, f"scan: {exc}")
             self.err(f"check {fix.id}: {exc}")
@@ -549,7 +555,8 @@ class DraftSteps:
             self.report.rejected.append(fix.id)
         return rec
 
-    def _limits(self, fix: Fix, cand: Candidate, bundled: frozenset[str] | None) -> list[str]:
+    def _limits(self, fix: Fix, cand: Candidate, bundled: frozenset[str] | None,
+                job: dict | None) -> list[str]:
         reasons = []
         if fix.kind in JOB_KINDS and fix.target != cand.job_id:
             reasons.append("fix targets a job other than the candidate's")
@@ -564,7 +571,8 @@ class DraftSteps:
             copy_index=self.copy_index(), scan=self.bridge.scan,
             bundled_skills=bundled or frozenset(), skills_root=Path(self.cfg.skills_root),
             approved_callables=approved_callables(self.root, self.cfg.broker_state),
-            existing_tools=existing, config_settings=self._settings())
+            existing_tools=existing, config_settings=self._settings(),
+            trusted_texts=_job_texts(job))
         return reasons + check_fix(fix, ctx)
 
     def _shadow(self, fix: Fix, job: dict | None, spend: float) -> bool:
