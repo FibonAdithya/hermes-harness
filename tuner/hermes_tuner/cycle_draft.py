@@ -44,7 +44,7 @@ REDUCER_BLOCKING = ACTIVE_STATES | APPLIED_STATES
 
 
 def _job_texts(job: dict | None) -> tuple[str, ...]:
-    """The target job's current prompt: owner text that untrusted results echo back."""
+    """The target job's current prompt, which untrusted results echo back."""
     prompt = job.get("prompt") if isinstance(job, dict) else None
     return (prompt,) if isinstance(prompt, str) and prompt else ()
 

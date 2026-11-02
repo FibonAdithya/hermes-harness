@@ -26,8 +26,9 @@ class LimitContext:
     # Hermes's current settings the tuner may change (changeable_settings); a config
     # fix must name one of these keys. Empty when they could not be read: fail closed.
     config_settings: Mapping[str, Any]
-    # Owner-controlled text that untrusted results may echo back (the target job's
-    # current prompt). Text found here is not counted as copied.
+    # The target job's current prompt, which untrusted results may echo back. Text found
+    # here is not counted as copied, but only in the field holding that job's new prompt
+    # (_PROMPT_FIELD): the agent can rewrite a job prompt, so it is not owner-only text.
     trusted_texts: tuple[str, ...] = ()
 
 
@@ -228,6 +229,10 @@ def _check_new_reach(fix: Fix) -> list[str]:
     return []
 
 
+# The payload field holding the new prompt of the fix's own job, by fix kind.
+_PROMPT_FIELD = {"job_prompt": "payload.prompt", "composed_tool": "payload.job_prompt"}
+
+
 def check_fix(fix: Fix, ctx: LimitContext) -> list[str]:
     if not isinstance(fix.payload, dict):
         return ["payload must be an object"]
@@ -248,13 +253,17 @@ def check_fix(fix: Fix, ctx: LimitContext) -> list[str]:
     else:
         return [f"unknown fix kind {fix.kind!r}"]
     # The Google MCP server names its tools in its own results, and session_search
-    # echoes job prompts back: neither is text an untrusted source supplied. Tool names
-    # come from the allowlists only, never from history (the model may call any name).
+    # echoes job prompts back. Tool names come from the allowlists only, never from
+    # history (the model may call any name).
     trusted = sorted(policy.CALLABLE_TOOLS | policy.REDUCER_TOOLS | ctx.approved_callables)
-    copies = ctx.copy_index.without([*trusted, *ctx.trusted_texts])
+    copies = ctx.copy_index.without(trusted)
+    # The job's prompt is trusted only where it stays in that job: the agent's cronjob
+    # tool can write mail text into it, and a description or skill reaches every session.
+    prompt_at = _PROMPT_FIELD.get(fix.kind)
+    prompt_copies = copies.without(ctx.trusted_texts) if prompt_at else copies
     for where, s in _strings(fix.payload):
         for finding in ctx.scan(s):
             reasons.append(f"{where}: scanner finding {finding}")
-        if copies.contains_copy(s):
+        if (prompt_copies if where == prompt_at else copies).contains_copy(s):
             reasons.append(f"{where}: contains text copied from untrusted tool results")
     return reasons
