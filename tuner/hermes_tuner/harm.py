@@ -56,7 +56,7 @@ def classify(name: str, text: str) -> tuple[str, str] | None:
     body = LOOP_SUFFIX.sub("", body, count=1).strip()
     try:
         data = json.loads(body)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     err = data.get("error") if isinstance(data, dict) else None
     if not isinstance(err, str):

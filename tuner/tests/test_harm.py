@@ -166,3 +166,12 @@ def test_kill_switch_silences_all_signals(monkeypatch):
     assert signals(run, Baseline()) == ["run_failed"]
     monkeypatch.setattr(policy, "HARM_CHECKS", False)
     assert signals(run, Baseline()) == []
+
+
+def test_deeply_nested_result_is_unclassifiable():
+    """Tool results are untrusted text; json.loads raises RecursionError on deep nesting.
+    Catches: catching only ValueError around json.loads, letting RecursionError abort a cycle."""
+    deep = "[" * 200_000
+    assert classify(GET, deep) is None
+    assert error_rate([(GET, deep)]) == 0.0
+    assert signals(RunEvidence(((GET, deep),)), Baseline()) == []
