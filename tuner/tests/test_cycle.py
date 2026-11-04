@@ -2765,3 +2765,40 @@ def test_dry_run_harm_rollback_writes_no_notice(env):
     assert Ledger.load(env.root).get(fix.id).state == "trial"
     assert f"rollback {fix.id}" in report.planned
     assert list((env.root / "outbox").glob("rollback-*")) == []
+
+
+# --- final review fixes -------------------------------------------------------------
+
+def test_trial_status_of_a_later_zero_call_run_is_not_blamed_on_the_earlier_run(env):
+    """Spec 2.1: a run with no tool calls is not harm. The day-1 run had calls; a
+    triage session 12 h later made none (an outage), and the job's error status is from
+    that one. Catches: job status applied to runs[-1] whenever last_run_at >= its start,
+    though a later run of the job, left out of runs for having no calls, is the one that
+    set it."""
+    fix, bridge = job_prompt_trial(env)
+    t = NOW - 3 * 3600 + 7 * 3600 + DAY
+    outage = {"id": sid(TRIAGE, t + 12 * 3600), "source": "cron", "started_at": t + 12 * 3600,
+              "cost": 0.0, "in": 100, "out": 0, "calls": []}
+    env.db.unlink()
+    build(env, SETUP_SESSIONS[env.root] + [later_run([]), outage])
+    bridge.jobs[TRIAGE] |= {"last_status": "error", "last_run_at": iso(t + 12 * 3600 + 60)}
+    bridge.jobs[CAL] |= {"last_status": "ok", "last_run_at": iso(t - 3600)}
+    run_cycle(env, bridge, NOW + 2 * DAY)
+    assert Ledger.load(env.root).get(fix.id).state == "trial"
+
+
+def test_trial_run_failed_when_the_other_jobs_error_is_outside_the_outage_window(env):
+    """Calendar-sync's error is more than OUTAGE_WINDOW_S before the triage run started,
+    so it is not the same outage. Catches: the abs(t - started_at) <= OUTAGE_WINDOW_S
+    clause deleted (any other job's error, however old, suppressing run_failed)."""
+    from hermes_tuner import harm
+    fix, bridge = job_prompt_trial(env)
+    t = NOW - 3 * 3600 + 7 * 3600 + DAY
+    env.db.unlink()
+    build(env, SETUP_SESSIONS[env.root] + [later_run([])])
+    bridge.jobs[TRIAGE] |= {"last_status": "error", "last_run_at": iso(t + 60)}
+    bridge.jobs[CAL] |= {"last_status": "error",
+                         "last_run_at": iso(t - harm.OUTAGE_WINDOW_S - 60)}
+    run_cycle(env, bridge, NOW + 2 * DAY)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert (rec.state, rec.reason) == ("rolled_back", "harm: run_failed (early)")

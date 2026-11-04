@@ -667,8 +667,9 @@ class _Cycle(DraftSteps):
     def _harm_in_trial(self, rec: FixRecord, runs: list[Session]) -> str | None:
         """The first harm signal over a job fix's trial `runs` (oldest first), or None.
         Job status (from list_jobs, not get_job) applies only to the newest run, and only
-        once the job has run since that run started. A bridge or state.db failure is
-        logged and leaves the signals that need no bridge, or none."""
+        once the job has run since that run started and no later run of the job (one
+        with no tool calls, left out of `runs`) could have set it. A bridge or state.db
+        failure is logged and leaves the signals that need no bridge, or none."""
         if not runs or rec.live_from is None:
             return None
         jobs: list[dict] = []
@@ -682,7 +683,8 @@ class _Cycle(DraftSteps):
                 status, delivery_failed = None, False
                 if run is runs[-1] and mine is not None:
                     ran = trial._epoch(mine.get("last_run_at"))
-                    if ran is not None and ran >= run.started_at:
+                    if ran is not None and ran >= run.started_at \
+                            and not self._ran_again(rec.target, run.started_at, ran):
                         status = mine.get("last_status")
                         delivery_failed = bool(mine.get("last_delivery_error"))
                 outage = any(
@@ -695,6 +697,13 @@ class _Cycle(DraftSteps):
         except HistoryUnavailable as exc:
             self.err(f"harm check {rec.id}: {type(exc).__name__}: {exc}")
         return None
+
+    def _ran_again(self, job_id: str, after: float, until: float) -> bool:
+        """True when a session of job `job_id` (a live job, so never a shadow), with or
+        without tool calls, started in (after, until]: the job's last status may be that
+        run's."""
+        return any(s.job_id == job_id and after < s.started_at <= until
+                   for s in self.sessions)
 
     def _early_failures(self, rec: FixRecord, runs: list[Session]
                         ) -> tuple[int, int, tuple[float, float] | None]:
