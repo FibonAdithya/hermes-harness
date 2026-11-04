@@ -819,6 +819,16 @@ class _Cycle(DraftSteps):
             out.reason = reason
             self.restart_wanted |= out.needs_restart
         self.ledger.save()
+        if out.state == "rolled_back":
+            jobs = self._jobs_cache if isinstance(self._jobs_cache, list) else []
+            name = next((j.get("name") for j in jobs if j.get("id") == rec.target
+                         and isinstance(j.get("name"), str)), rec.target)
+            note = f"tuner rolled back {rec.id} ({name}): {out.reason}\n"
+            try:
+                atomic_write(self.root / "outbox" / f"rollback-{rec.id}.txt",
+                             note.encode("utf-8"))
+            except OSError as exc:
+                self.err(f"rollback notice {rec.id}: {type(exc).__name__}: {exc}")
         self.report.rolled_back.append(rec.id)
 
     # 4. proposals ----------------------------------------------------------------------

@@ -2660,3 +2660,59 @@ def test_registered_tools_cached_and_fail_soft(env):
     assert c.registered_ok is False
     assert len([e for e in c.report.errors if e.startswith("registered_tools:")]) == 1
     assert len([x for x in bad.calls if x[0] == "registered_tools"]) == 1
+
+
+def _unknown_tool_run(env):
+    fix, bridge = job_prompt_trial(env)
+    env.db.unlink()
+    build(env, SETUP_SESSIONS[env.root] + [later_run([("tool_describe", {}, UNKNOWN)])])
+    return fix, bridge
+
+
+def test_harm_classes_reach_the_drafting_request(env):
+    """A candidate whose last fix was rolled back for harm: the next request's history
+    names the harm class, not the reason text.
+    Catches: harm_* missing from REASON_CLASSES, so the class is dropped from history."""
+    build(env, triage_runs(days=range(-3, 13)))
+    heartbeat(env, NOW - 60)
+    run_cycle(env, FakeBridge(jobs=jobs(), oneshot_script=[reply(COPY_REPLY)]), NOW)
+    led = Ledger.load(env.root)
+    (rec,) = led.records
+    rec.state, rec.reason = "rolled_back", "harm: unknown_tool (early)"
+    led.save()
+    bridge = FakeBridge(jobs=jobs(), oneshot_script=[reply(COPY_REPLY)])
+    heartbeat(env, NOW + DAY - 60)
+    run_cycle(env, bridge, NOW + DAY)
+    (call,) = oneshots(bridge)
+    history = json.loads(call[1][1])["history"]
+    assert history[0]["reason_class"] == "harm_unknown_tool"
+    assert "unknown_tool (early)" not in call[1][1]
+
+
+def test_rollback_writes_one_outbox_line(env):
+    """Catches: no notice, a file name the listener's *.txt glob misses, or two lines."""
+    fix, bridge = _unknown_tool_run(env)
+    run_cycle(env, bridge, NOW + 2 * DAY)
+    out = env.root / "outbox"
+    assert [p.name for p in out.glob("rollback-*")] == [f"rollback-{fix.id}.txt"]
+    assert (out / f"rollback-{fix.id}.txt").read_text() == \
+        f"tuner rolled back {fix.id} (morning-briefing): harm: unknown_tool (early)\n"
+
+
+def test_owner_changed_writes_no_notice(env):
+    """Catches: a notice written for every _rollback call, not only a real rollback."""
+    fix, bridge = _unknown_tool_run(env)
+    bridge.jobs[TRIAGE]["prompt"] = "The owner rewrote this."
+    run_cycle(env, bridge, NOW + 2 * DAY)
+    assert Ledger.load(env.root).get(fix.id).state == "owner_changed"
+    assert list((env.root / "outbox").glob("rollback-*")) == []
+
+
+def test_dry_run_harm_rollback_writes_no_notice(env):
+    """Catches: dry run rolling back or writing the outbox."""
+    fix, bridge = _unknown_tool_run(env)
+    dry = CycleConfig(**{**env.__dict__, "dry_run": True})
+    report = run_cycle(dry, bridge, NOW + 2 * DAY)
+    assert Ledger.load(env.root).get(fix.id).state == "trial"
+    assert f"rollback {fix.id}" in report.planned
+    assert list((env.root / "outbox").glob("rollback-*")) == []

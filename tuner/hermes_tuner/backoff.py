@@ -12,7 +12,7 @@ import json
 import re
 from typing import Literal
 
-from . import policy
+from . import harm, policy
 from .budget import DAY
 from .draft import HISTORY_LEN, top_fields
 from .ledger import FixRecord
@@ -32,6 +32,8 @@ REPLAY_OUTAGES = ("replay: history unavailable", "replay: no time left",
 def reason_class(rec: FixRecord) -> str:
     """The outcome class of a record; "" for records that are not failed drafts."""
     reason = rec.reason or ""
+    if reason.startswith("harm: ") and reason[6:].split(" ")[0] in harm.SIGNALS:
+        return f"harm_{reason[6:].split(' ')[0]}"
     if rec.state == "rejected":
         if COPY_TEXT in reason:
             return "copy"

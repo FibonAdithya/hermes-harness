@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from collections.abc import Iterable
 from typing import Any
 
-from . import policy
+from . import harm, policy
 from .bridge import Bridge
 from .detect import Candidate
 from .measure import priced_breakdown
@@ -46,7 +46,7 @@ Reply with a single JSON object and nothing else: no prose, no code fence. Shape
 4. "skill": shrink a skill that is loaded often and is large. target is the skill path. payload: {{"path": str, "text": str}}. A skill fix may only rewrite an existing SKILL.md that is not bundled with the agent, and must keep its frontmatter block (the leading --- block) byte-identical. Shrink the body, keep the decision guidance, and point at the tool for mechanics.
 5. "new_reach": use only when the fix truly needs a tool outside the allowed list. payload: {{"change": {{"type": "mcp_include_add", "server": str, "tool": str}} or {{"type": "callable_add", "tool": str}}, "why": str}}. target is the tool name. The owner must approve it.
 
-history lists earlier drafts for this candidate and why they failed; fields named for a copy rejection must not contain literal text from tool results (no label names, addresses or subjects).
+history lists earlier drafts for this candidate and why they failed; fields named for a copy rejection must not contain literal text from tool results (no label names, addresses or subjects). A reason_class starting with "harm_" means the fix was undone because its runs went wrong: harm_unknown_tool, the agent tried a tool that does not exist; harm_server_tripped, its calls failed until a server was cut off; harm_self_inflicted_errors, many of its calls were malformed; harm_run_failed, the run failed. Do not repeat that design.
 
 job_prompt and composed_tool fixes target only the job in the request. Do not include keys that are not listed. Do not include secrets, message ids or any text other than your own design.
 """
@@ -124,7 +124,8 @@ MAX_SHAPE_CALLS = 200
 # first segment is sent; it must be identifier-shaped, else "?".
 _TOP_FIELD = re.compile(r"[A-Za-z0-9_]{1,40}")
 REASON_CLASSES = frozenset({"copy", "replay_limit", "replay", "timeout", "unparseable",
-                            "shadow", "limits", "trial", ""})
+                            "shadow", "limits", "trial", "",
+                            *(f"harm_{s}" for s in harm.SIGNALS)})
 HISTORY_LEN = 3
 MAX_HISTORY_FIELDS = 20
 

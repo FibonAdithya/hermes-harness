@@ -24,6 +24,20 @@ def rej(kind, reason, t, ih=h, key=KEY):
     return rec(kind, "rejected", reason, t, ih, key)
 
 
+@pytest.mark.parametrize("state, reason, cls", [
+    ("rolled_back", "harm: unknown_tool (early)", "harm_unknown_tool"),
+    ("shadow_failed", "harm: server_tripped", "harm_server_tripped"),
+    ("rolled_back", "harm: self_inflicted_errors (early)", "harm_self_inflicted_errors"),
+    ("rolled_back", "harm: run_failed (early)", "harm_run_failed"),
+    ("rolled_back", "harm: bogus (early)", "trial"),
+    ("shadow_failed", "harm: bogus", "shadow"),
+    ("rolled_back", "trial: not cheaper than baseline", "trial")])
+def test_reason_class_maps_harm_reasons(state, reason, cls):
+    """Catches: harm reasons falling into the generic trial/shadow class, or an
+    unknown signal name becoming a class."""
+    assert reason_class(rec("job_prompt", state, reason, 1.0)) == cls
+
+
 # --- reason_class -----------------------------------------------------------------------
 
 @pytest.mark.parametrize("kind, state, reason, want", [
