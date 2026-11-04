@@ -12,6 +12,7 @@ from . import policy
 from .bridge import is_setting_value
 from .fingerprint import CopyIndex
 from .model import Fix
+from .prompt_block import check as check_prompt_block
 from .reducers import validate_spec
 
 
@@ -30,6 +31,9 @@ class LimitContext:
     # here is not counted as copied, but only in the field holding that job's new prompt
     # (_PROMPT_FIELD): the agent can rewrite a job prompt, so it is not owner-only text.
     trusted_texts: tuple[str, ...] = ()
+    # The target job's current prompt as read from Hermes (P2): a job_prompt fix must
+    # keep its text outside the tuner notes block. None when unknown: fail closed.
+    job_prompt: str | None = None
 
 
 def _strings(obj: object, path: str = "payload") -> Iterator[tuple[str, str]]:
@@ -87,8 +91,12 @@ def _check_job_target(fix: Fix) -> list[str]:
     return []
 
 
-def _check_job_prompt(fix: Fix) -> list[str]:
+def _check_job_prompt(fix: Fix, ctx: LimitContext) -> list[str]:
     reasons = _check_job_target(fix)
+    new = fix.payload.get("prompt")
+    reason = check_prompt_block(new if isinstance(new, str) else "", ctx.job_prompt)
+    if reason is not None:
+        reasons.append(reason)
     extra = fix.payload.get("add_toolsets", [])
     if not isinstance(extra, list) or any(t != policy.TOOLSET for t in extra):
         reasons.append(f"add_toolsets may only contain {policy.TOOLSET!r}")
@@ -98,6 +106,10 @@ def _check_job_prompt(fix: Fix) -> list[str]:
 def _check_composed(fix: Fix, ctx: LimitContext) -> list[str]:
     reasons = _check_job_target(fix)
     p = fix.payload
+    if isinstance(p.get("job_prompt"), str):
+        reason = check_prompt_block(p["job_prompt"], ctx.job_prompt)
+        if reason is not None:
+            reasons.append(reason)
     name = p.get("name")
     if not isinstance(name, str) or not policy.TOOL_NAME_RE.fullmatch(name):
         reasons.append(f"tool name must match {policy.TOOL_NAME_RE.pattern}")
@@ -241,7 +253,7 @@ def check_fix(fix: Fix, ctx: LimitContext) -> list[str]:
     if fix.kind == "config":
         reasons = _check_config(fix.payload, ctx.config_settings)
     elif fix.kind == "job_prompt":
-        reasons = _check_job_prompt(fix)
+        reasons = _check_job_prompt(fix, ctx)
     elif fix.kind == "composed_tool":
         reasons = _check_composed(fix, ctx)
     elif fix.kind == "skill":

@@ -13,7 +13,7 @@ from hermes_tuner.detect import Candidate
 NOW = datetime(2026, 10, 19, 12, 0, tzinfo=timezone.utc).timestamp()
 CAND = Candidate(kind="sequence", key="seq:a>b>c", job_id="3bc4e11d29b1", sessions=12,
                  occurrences=30, result_chars=90_000, est_monthly_usd=1.5)
-JOB_PAYLOAD = {"prompt": "Do the thing.", "add_toolsets": []}
+JOB_PAYLOAD = {"block": "Do the thing.", "add_toolsets": []}
 
 
 def reply(kind="job_prompt", target="3bc4e11d29b1", payload=None):
@@ -28,7 +28,7 @@ def test_fix_id_stable_for_same_draft():
     h = hashlib.sha256((CAND.key + json.dumps(JOB_PAYLOAD, sort_keys=True)).encode()).hexdigest()[:8]
     assert a.id == f"20261019-{h}"
     assert a.candidate_key == CAND.key
-    other = D.parse_draft(reply(payload={"prompt": "Other.", "add_toolsets": []}), CAND, NOW)
+    other = D.parse_draft(reply(payload={"block": "Other.", "add_toolsets": []}), CAND, NOW)
     assert other.id != a.id
 
 
@@ -107,10 +107,11 @@ BAD = [
     ("composed_tool", {**COMPOSED, "mutating": "yes"}),
     ("composed_tool", {**COMPOSED, "job_prompt": 5}),
     ("composed_tool", {k: v for k, v in COMPOSED.items() if k != "program"}),
-    ("job_prompt", {"prompt": "p"}),
-    ("job_prompt", {"prompt": "p", "add_toolsets": "tuner"}),
-    ("job_prompt", {"prompt": "p", "add_toolsets": [1]}),
-    ("job_prompt", {"prompt": 1, "add_toolsets": []}),
+    ("job_prompt", {"block": "p"}),
+    ("job_prompt", {"block": "p", "add_toolsets": "tuner"}),
+    ("job_prompt", {"block": "p", "add_toolsets": [1]}),
+    ("job_prompt", {"block": 1, "add_toolsets": []}),
+    ("job_prompt", {"prompt": "p", "add_toolsets": []}),  # the pre-P2 whole-prompt shape
     ("config", {"key": "compression.x", "value": None}),
     ("config", {"key": "compression.x", "value": [1]}),
     ("config", {"key": "compression.x"}),
@@ -437,3 +438,10 @@ def test_draft_passes_history_to_the_request():
     D.draft(CAND, {"id": "j"}, None, {}, [], b, NOW, FLAT, history=hist)
     (_m, (_instr, user, _mt)), = b.calls
     assert json.loads(user)["history"] == hist
+
+
+def test_instructions_ask_for_a_block_not_a_prompt():
+    """Catches: INSTRUCTIONS still asking the model to rewrite the whole job prompt."""
+    assert '"block": str' in D.INSTRUCTIONS and "rewrite a job's prompt" not in D.INSTRUCTIONS
+    assert "an existing tuner notes block is replaced by yours" in D.INSTRUCTIONS
+    assert "Write only the block." in D.INSTRUCTIONS

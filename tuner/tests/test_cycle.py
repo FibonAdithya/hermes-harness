@@ -17,6 +17,7 @@ from hermes_tuner.cycle import CycleConfig, run_cycle, weekly_line
 from hermes_tuner.history import History, HistoryUnavailable
 from hermes_tuner.ledger import FixRecord, Ledger, _tool_files, write_shadow_tool
 from hermes_tuner.model import Fix, Session, ToolCall
+from hermes_tuner.prompt_block import splice
 from hermes_tuner.proposals import change_hash
 
 TRIAGE, CAL = "3bc4e11d29b1", "cc68e24f21cd"
@@ -106,8 +107,7 @@ def reply(obj, tokens=(1000, 200)):
 
 
 JOB_PROMPT_REPLY = {"kind": "job_prompt", "target": TRIAGE,
-                    "payload": {"prompt": "Triage the inbox; skip mail already starred.",
-                                "add_toolsets": []}}
+                    "payload": {"block": "Skip mail already starred.", "add_toolsets": []}}
 
 
 @pytest.fixture
@@ -171,6 +171,18 @@ def test_cycle_drafts_and_shadows_when_job_is_free(env):
     assert led.fix(rec.id).payload["_base"] == {"prompt": "Triage the inbox.",
                                                 "enabled_toolsets": ["google"]}
     assert "_base" not in json.dumps(bridge.calls)
+
+
+def test_cycle_splices_the_drafted_block(env):
+    """The ledger holds the owner's prompt plus the drafted block, byte for byte.
+    Catches: the block reaching the ledger unspliced, or the owner text altered."""
+    build(env, triage_runs())
+    bridge = FakeBridge(jobs=jobs(), oneshot_script=[reply(JOB_PROMPT_REPLY)])
+    run_cycle(env, bridge, NOW)
+    (rec,) = Ledger.load(env.root).records
+    payload = Ledger.load(env.root).fix(rec.id).payload
+    assert payload["prompt"] == splice("Triage the inbox.", "Skip mail already starred.")
+    assert "block" not in payload
 
 
 # --- budget ------------------------------------------------------------------------------
@@ -980,7 +992,7 @@ def test_composed_shadow_restarted_in_its_scheduling_cycle_reaches_trial(env):
     assert (env.root / "tools" / "tuned_triage" / "program.py").exists()
     assert "shadow_only" not in json.loads(
         (env.root / "tools" / "tuned_triage" / "tool.json").read_text())
-    assert b2.jobs[TRIAGE]["prompt"] == "new prompt"
+    assert b2.jobs[TRIAGE]["prompt"] == splice("Triage the inbox.", "new prompt")
     assert "tuner" in b2.jobs[TRIAGE]["enabled_toolsets"]
 
 
@@ -2025,7 +2037,7 @@ def test_default_replay_runner_is_the_plugin_relay_in_docker():
 COPY_TEXT = f"{RESULT_SENTINEL} body " + "y" * 800  # what every triage GET returned
 COPY = "payload.prompt: contains text copied from untrusted tool results"
 COPY_REPLY = {"kind": "job_prompt", "target": TRIAGE,
-              "payload": {"prompt": "Triage the inbox. " + COPY_TEXT, "add_toolsets": []}}
+              "payload": {"block": "Triage the inbox. " + COPY_TEXT, "add_toolsets": []}}
 
 
 def request_key(call):
@@ -2631,8 +2643,7 @@ def test_cycle_does_not_count_the_job_prompt_as_copied(env):
     the_jobs = jobs()
     the_jobs[TRIAGE]["prompt"] = ECHOED_PROMPT
     edit = {"kind": "job_prompt", "target": TRIAGE,
-            "payload": {"prompt": ECHOED_PROMPT + " Skip mail already starred.",
-                        "add_toolsets": []}}
+            "payload": {"block": "Skip mail already starred.", "add_toolsets": []}}
     bridge = FakeBridge(jobs=the_jobs, oneshot_script=[reply(edit)])
     report = run_cycle(env, bridge, NOW)
     (rec,) = Ledger.load(env.root).records

@@ -11,6 +11,7 @@ from hermes_tuner import policy
 from hermes_tuner.fingerprint import CopyIndex
 from hermes_tuner.limits import LimitContext, changeable_settings, check_fix
 from hermes_tuner.model import Fix
+from hermes_tuner.prompt_block import splice
 
 GET = "mcp__google__get_gmail_message_content"
 LABEL = "mcp__google__manage_gmail_label"
@@ -21,6 +22,7 @@ def rtext(seed, n=200):
     return "".join(rng.choice(string.ascii_letters) for _ in range(n))
 
 
+OWNER = "do the thing"
 LEAK = rtext(99)  # stands in for untrusted tool-result text
 
 
@@ -33,6 +35,7 @@ def ctx(tmp_path, **kw):
         approved_callables=frozenset(),
         existing_tools=frozenset({"web_search", "tuned_old"}),
         config_settings={"tools.tool_search.enabled": "auto", "compression.threshold": 0.5},
+        job_prompt=OWNER,
     )
     base.update(kw)
     return LimitContext(**base)
@@ -54,7 +57,7 @@ def composed(**over):
 
 
 def jp(target="cc68e24f21cd", **over):
-    p = {"prompt": "do the thing", "add_toolsets": []}
+    p = {"prompt": splice(OWNER, "be brief"), "add_toolsets": []}
     p.update(over)
     return Fix("f2", "job_prompt", target, p, "k")
 
@@ -146,6 +149,20 @@ def test_approved_callable_extends_allowlist(tmp_path):
     assert check_fix(composed(calls=[LABEL]), ctx(tmp_path))
     c = ctx(tmp_path, approved_callables=frozenset({LABEL}))
     assert check_fix(composed(calls=[LABEL]), c) == []
+
+
+def test_job_prompt_must_keep_owner_text(tmp_path):
+    """Catches: P2 not wired for job_prompt or for a composed tool's job_prompt."""
+    assert any("owner's text" in r for r in check_fix(jp(prompt=splice("rewritten", "x")), ctx(tmp_path)))
+    assert any("owner's text" in r for r in check_fix(composed(job_prompt=splice("rewritten", "x")), ctx(tmp_path)))
+    assert not any("owner's text" in r for r in check_fix(composed(job_prompt=None), ctx(tmp_path)))
+
+
+def test_job_prompt_fix_is_rejected_when_the_job_prompt_is_unknown(tmp_path):
+    """Catches: skipping P2 when LimitContext.job_prompt is None."""
+    c = ctx(tmp_path, job_prompt=None)
+    assert any("current job prompt unknown" in r for r in check_fix(jp(), c))
+    assert any("current job prompt unknown" in r for r in check_fix(composed(job_prompt=splice(OWNER, "x")), c))
 
 
 def test_job_prompt_only_for_editable_jobs(tmp_path):
@@ -266,7 +283,7 @@ def test_scanner_findings_reject(tmp_path):
 
 def test_copied_text_rejects_every_text_field(tmp_path):
     c = ctx(tmp_path)
-    assert check_fix(jp(prompt="intro " + LEAK), c)
+    assert check_fix(jp(prompt=splice(OWNER, "intro " + LEAK)), c)
     assert check_fix(composed(description=LEAK), c)
     assert check_fix(composed(program=LEAK), c)
     assert check_fix(skill(str(tmp_path / "skills/mine/SKILL.md"), text=LEAK), c)
@@ -280,7 +297,7 @@ def test_copy_in_nested_payload_rejected(tmp_path):
     params["properties"]["ids"] = {"type": "array"}
     copied = "contains text copied from untrusted tool results"
     assert any(copied in r for r in check_fix(composed(parameters=params), ctx(tmp_path)))
-    assert any(copied in r for r in check_fix(composed(job_prompt=LEAK), ctx(tmp_path)))
+    assert any(copied in r for r in check_fix(composed(job_prompt=splice(OWNER, LEAK)), ctx(tmp_path)))
     assert check_fix(cfg("compression.x", LEAK), ctx(tmp_path))
 
 
