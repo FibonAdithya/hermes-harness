@@ -174,6 +174,14 @@ runs in the 28 days before the fix, re-read from state.db (the stored
 `baseline_runs` hold token counts only), the way `_count_early_failures`
 already re-reads runs for re-reads.
 
+Amended 2026-11-04 after replaying the signals on 28 days of state.db (plan
+audit): `unknown_tool` counts only a name the fix's own payload mentions and
+that is not registered, because every briefing run from 10-30 to 11-03 called
+a rolled-back composed tool still listed until the gateway restart, with no
+fix in trial; and Hermes returns "not a deferrable tool" for registered core
+tools too. Google API failures (`API error in ...`) are outages and count
+toward neither `self_inflicted_errors` nor `server_tripped`.
+
 Where the checks run, for job fixes only (`JOB_KINDS`: job_prompt,
 composed_tool, reducer). Config and skill fixes keep their current judging,
 because their runs include every owner chat and one bad chat would roll
