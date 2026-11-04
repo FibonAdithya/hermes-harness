@@ -24,6 +24,7 @@ RUN_TIMEOUT_S = 300
 MAX_CALLS = 50
 MAX_OUTPUT_BYTES = 50_000
 COMPOSED_TOOL_NEEDS_RESTART = True
+HARM_CHECKS = True
 
 COMPUTE_READ_TOOLS = frozenset({
     "mcp__compute__night_status",
