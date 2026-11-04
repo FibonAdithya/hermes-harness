@@ -246,10 +246,35 @@ def pricing():
                           get_pricing_entry, vendors, detect_vendor)
 
 
+def _registered(native, mcp_servers):
+    """Pure. Tool names Hermes would register: its native names plus the
+    mcp__<server>__<tool> names each MCP server's `tools.include` list declares.
+    `mcp_complete` is False when any server has no include list (its tools are unknown)."""
+    mcp, complete = [], True
+    for server, conf in (mcp_servers or {}).items():
+        tools = conf.get("tools") if isinstance(conf, dict) else None
+        include = tools.get("include") if isinstance(tools, dict) else None
+        if not isinstance(include, list):
+            complete = False
+            continue
+        mcp.extend(f"mcp__{server}__{t}" for t in include)
+    return {"native": sorted(native), "mcp": sorted(mcp), "mcp_complete": complete}
+
+
+def registered_tools():
+    """Read-only. Native tool names from model_tools (outside the gateway it lists no
+    mcp__ names), MCP names from the config's includes."""
+    from hermes_cli.config import load_config
+    import model_tools
+    servers = load_config().get("mcp_servers")
+    return _registered(list(model_tools.get_all_tool_names()),
+                       servers if isinstance(servers, dict) else {})
+
+
 OPS = {f.__name__: f for f in (scan, get_job, list_jobs, update_job, create_job,
                                remove_job, config_get, config_default_is_str,
                                config_set, config_set_json, config_settings, oneshot,
-                               pricing)}
+                               pricing, registered_tools)}
 
 
 def load_hermes_env():

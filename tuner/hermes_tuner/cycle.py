@@ -141,11 +141,26 @@ class _Cycle(DraftSteps):
         self._config_settings: dict | None = None
         self._plugin_ok: bool | None = None
         self.pricing: Pricing | None = None
+        self._registered: frozenset[str] | None = None
+        self.registered_ok: bool | None = None
 
     # --- plumbing -----------------------------------------------------------------
 
     def err(self, msg: str) -> None:
         self.report.errors.append(msg)
+
+    def _registered_tools(self) -> frozenset[str]:
+        """Registered native and MCP tool names, one bridge call per cycle. Empty on a
+        BridgeError (logged once); registered_ok says which."""
+        if self._registered is None:
+            try:
+                got = self.bridge.registered_tools()
+                self._registered = frozenset(got["native"]) | frozenset(got["mcp"])
+                self.registered_ok = True
+            except BridgeError as exc:
+                self.err(f"registered_tools: {exc}")
+                self._registered, self.registered_ok = frozenset(), False
+        return self._registered
 
     def plan(self, msg: str) -> None:
         self.report.planned.append(msg)

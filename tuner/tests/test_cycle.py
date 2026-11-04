@@ -2500,3 +2500,25 @@ def test_cycle_does_not_count_the_job_prompt_as_copied(env):
     (rec,) = Ledger.load(env.root).records
     assert rec.state == "shadow_pending", rec.reason
     assert report.errors == []
+
+
+def test_registered_tools_cached_and_fail_soft(env):
+    """Catches: one bridge call per check instead of per cycle, or a BridgeError escaping.
+    """
+    from hermes_tuner.cycle import CycleReport, _Cycle
+    get = "mcp__google__get_events"
+    bridge = FakeBridge(jobs=jobs(),
+                        tools={"native": ["terminal"], "mcp": [get], "mcp_complete": True})
+    c = _Cycle(env, bridge, NOW, CycleReport())
+    assert c._registered_tools() == frozenset({"terminal", get})
+    assert c._registered_tools() == frozenset({"terminal", get})
+    assert [x for x in bridge.calls if x[0] == "registered_tools"] == [("registered_tools", ())]
+    assert c.registered_ok is True
+
+    bad = FakeBridge(jobs=jobs(), fail={"registered_tools"})
+    c = _Cycle(env, bad, NOW, CycleReport())
+    assert c._registered_tools() == frozenset()
+    assert c._registered_tools() == frozenset()
+    assert c.registered_ok is False
+    assert len([e for e in c.report.errors if e.startswith("registered_tools:")]) == 1
+    assert len([x for x in bad.calls if x[0] == "registered_tools"]) == 1

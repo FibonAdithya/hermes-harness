@@ -138,3 +138,47 @@ def test_fake_bridge_config_settings_is_read_only_and_filters():
 def test_fake_bridge_config_settings_can_fail():
     with pytest.raises(B.BridgeError):
         FakeBridge(fail={"config_settings"}).config_settings(["x."])
+
+
+def test_registered_names_mcp_tools_from_includes():
+    """Catches: wrong mcp__<server>__<tool> format, or mcp_complete True with a server
+    that has no include list."""
+    out = bridge_entry._registered(
+        ["terminal"], {"google": {"tools": {"include": ["get_events"]}}, "compute": {}})
+    assert out == {"native": ["terminal"], "mcp": ["mcp__google__get_events"],
+                   "mcp_complete": False}
+
+
+def test_registered_complete_and_sorted_when_every_server_has_includes():
+    """Catches: unsorted output, or mcp_complete False when every server lists its tools."""
+    out = bridge_entry._registered(
+        ["web", "terminal"],
+        {"b": {"tools": {"include": ["z", "a"]}}, "a": {"tools": {"include": ["x"]}}})
+    assert out == {"native": ["terminal", "web"],
+                   "mcp": ["mcp__a__x", "mcp__b__a", "mcp__b__z"], "mcp_complete": True}
+
+
+def test_registered_tools_op_reads_model_tools_and_config(monkeypatch):
+    """Catches: the op not feeding get_all_tool_names and the config's mcp_servers to
+    _registered."""
+    mt = types.ModuleType("model_tools")
+    mt.get_all_tool_names = lambda: ["terminal"]
+    cfgmod = types.ModuleType("hermes_cli.config")
+    cfgmod.load_config = lambda: {"mcp_servers": {"g": {"tools": {"include": ["t"]}}}}
+    monkeypatch.setitem(sys.modules, "model_tools", mt)
+    monkeypatch.setitem(sys.modules, "hermes_cli", types.ModuleType("hermes_cli"))
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", cfgmod)
+    assert bridge_entry.registered_tools() == {
+        "native": ["terminal"], "mcp": ["mcp__g__t"], "mcp_complete": True}
+    assert "registered_tools" in bridge_entry.OPS
+
+
+def test_fake_bridge_registered_tools_default_records_and_fails():
+    """Catches: a missing default, an unrecorded call, or fail ignored."""
+    b = FakeBridge()
+    assert b.registered_tools() == {"native": [], "mcp": [], "mcp_complete": False}
+    assert b.calls == [("registered_tools", ())]
+    assert FakeBridge(tools={"native": ["a"], "mcp": [], "mcp_complete": True}
+                      ).registered_tools()["native"] == ["a"]
+    with pytest.raises(B.BridgeError):
+        FakeBridge(fail={"registered_tools"}).registered_tools()
