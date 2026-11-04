@@ -148,10 +148,12 @@ A new module (`tuner/hermes_tuner/harm.py`) computes harm signals for one
 run. Each signal has a fixed name. They are deterministic; no LLM decides.
 
 Data sources, all on the droplet and readable by the tuner today:
-state.db (tool calls and results via `History`), the plugin's event files,
-`~/.hermes/logs/agent.log` lines tagged with the run's session id (the
-"MCP server ... unreachable" line is only there), and the job's last run
-status through the bridge (`get_job`).
+state.db (tool calls and results via `History`) and the job's last run
+status through the bridge (`get_job`: `last_status`, `last_run_at`,
+`last_delivery_error`). The "not a deferrable tool", "Error calling tool"
+and "MCP server ... is unreachable" errors are all stored as tool results
+in state.db (MEASURED 2026-11-04 on `cron_3bc4e11d29b1_20261104_080057`),
+so `agent.log` is not needed.
 
 | signal | fires when |
 |---|---|
@@ -227,8 +229,8 @@ built here:
   kept states, as `cycle._live_tools` computes), `registered_tools` (names
   Hermes has registered, from a new bridge op; the `Bridge` protocol has no
   tool listing today), and the target job's current prompt and policy name.
-- Harm signals receive the run's calls and results, its agent.log lines,
-  its job status, the fix, and the same tool sets.
+- Harm signals receive the run's calls and results, its job status, the
+  fix kind, and the same tool sets.
 
 A repair that needs anything else touches wiring code, is not eligible
 (§4.1), and waits for the owner.
