@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
 
-from . import harm, policy, trial
+from . import harm, policy, prompt_block, trial
 from .bridge import Bridge, BridgeError
 from .budget import DAY, JOB_KINDS, weekly_line
 from .cycle_draft import GLOBAL_KINDS, DraftSteps
@@ -433,8 +433,12 @@ class _Cycle(DraftSteps):
         leaves: list[str] = []
 
         def walk(v: object) -> None:
+            # A spliced prompt (P2) is the owner's text plus the tuner notes block; only
+            # the block is the fix's. A prompt without the block (recorded before P2) is
+            # wholly tuner-written.
             if isinstance(v, str):
-                leaves.append(v)
+                block = prompt_block.block_text(v)
+                leaves.append(v if block is None else block)
             elif isinstance(v, dict):
                 for k, x in v.items():
                     if k != BASE_KEY:

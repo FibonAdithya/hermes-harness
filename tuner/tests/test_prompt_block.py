@@ -3,7 +3,8 @@ from __future__ import annotations
 import pytest
 
 from hermes_tuner.model import Fix
-from hermes_tuner.prompt_block import END, START, check, splice, strip_block, with_prompt
+from hermes_tuner.prompt_block import (END, START, block_text, check, splice, strip_block,
+                                       with_prompt)
 
 
 @pytest.mark.parametrize("owner", ["Triage.", "Triage.\n", "Triage.  ", ""])
@@ -102,3 +103,15 @@ def test_with_prompt_leaves_other_kinds_alone():
     """Catches: with_prompt touching config or skill payloads."""
     fix = Fix("f", "config", "k", {"key": "k", "value": 1}, "c")
     assert with_prompt(fix, {"prompt": "Owner."}) == fix
+
+
+@pytest.mark.parametrize("text, want", [
+    (splice("Fetch mail with tuned_x.", "Skip starred."), "\nSkip starred.\n"),
+    (splice("", "Skip starred."), "\nSkip starred.\n"),
+    ("Fetch mail with tuned_x.", None),
+    ("Owner.\n\n" + START + "\nno end", None),
+    ("Owner. " + START + "\nx\n" + END, None)])
+def test_block_text_is_the_block_strip_block_removes(text, want):
+    """Catches: block_text finding a block strip_block would not (no leading blank line,
+    or no END), or returning text outside the markers."""
+    assert block_text(text) == want

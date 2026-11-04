@@ -2802,3 +2802,23 @@ def test_trial_run_failed_when_the_other_jobs_error_is_outside_the_outage_window
     run_cycle(env, bridge, NOW + 2 * DAY)
     rec = Ledger.load(env.root).get(fix.id)
     assert (rec.state, rec.reason) == ("rolled_back", "harm: run_failed (early)")
+
+
+@pytest.mark.parametrize("prompt, state, reason", [
+    # P2: the owner's text names tuned_x, the tuner notes block does not
+    (splice("Fetch mail with tuned_x.", "Skip mail already starred."), "trial", ""),
+    # P2: the block names tuned_x
+    (splice("Triage the inbox.", "Fetch mail with tuned_x."), "shadow_failed",
+     "harm: unknown_tool"),
+    # old format, as the live incident record 20261103-23272612: no markers, the whole
+    # prompt is tuner-written
+    ("Fetch mail with tuned_x.", "shadow_failed", "harm: unknown_tool")])
+def test_shadow_harm_reads_only_the_tuner_notes_block(env, prompt, state, reason):
+    """Spec 2.1: an unknown tool is harm only if it plausibly comes from the fix; 2.2:
+    the owner's text is not checked. Catches: the whole spliced prompt used as fix_text
+    (the first case fails); a leaf with a block dropped entirely (the second); a leaf
+    without markers contributing nothing (the third)."""
+    fix = passing_shadow(env, [("tool_describe", {}, UNKNOWN)], prompt=prompt)
+    run_cycle(env, FakeBridge(jobs=jobs()), NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert (rec.state, rec.reason) == (state, reason)

@@ -24,6 +24,16 @@ def strip_block(text: str) -> str:
     return text[:i] + text[j + len(END):]
 
 
+def block_text(text: str) -> str | None:
+    """The contents of the first well-formed block (as strip_block finds it), or None
+    when `text` has none."""
+    i = text.find(_LEAD)
+    if i < 0:
+        return None
+    j = text.find(END, i + len(_LEAD))
+    return None if j < 0 else text[i + len(_LEAD):j]
+
+
 def splice(current: str, block: str) -> str:
     return strip_block(current) + "\n\n" + START + "\n" + block.strip() + "\n" + END
 
