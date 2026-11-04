@@ -569,13 +569,17 @@ class DraftSteps:
         tools_dir = self.root / "tools"
         existing = frozenset(p.name for p in tools_dir.iterdir() if p.is_dir()) \
             if tools_dir.is_dir() else frozenset()
+        registered = self._registered_tools()
         ctx = LimitContext(
             copy_index=self.copy_index(), scan=self.bridge.scan,
             bundled_skills=bundled or frozenset(), skills_root=Path(self.cfg.skills_root),
             approved_callables=approved_callables(self.root, self.cfg.broker_state),
             existing_tools=existing, config_settings=self._settings(),
             trusted_texts=_job_texts(job),
-            job_prompt=job.get("prompt") if isinstance(job, dict) else None)
+            job_prompt=job.get("prompt") if isinstance(job, dict) else None,
+            live_tools=self._live_tools(),
+            registered_tools=registered if self.registered_ok else None,
+            job_policy=policy.EDITABLE_JOBS.get(fix.target))
         return reasons + check_fix(fix, ctx)
 
     def _shadow(self, fix: Fix, job: dict | None, spend: float) -> bool:

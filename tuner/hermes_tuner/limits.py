@@ -34,6 +34,12 @@ class LimitContext:
     # The target job's current prompt as read from Hermes (P2): a job_prompt fix must
     # keep its text outside the tuner notes block. None when unknown: fail closed.
     job_prompt: str | None = None
+    # Snapshot for later checks. live_tools: composed tools of applied, trial and kept
+    # fixes. registered_tools: names Hermes has registered, None when the bridge call
+    # failed this cycle (unknown, not none). job_policy: the target's EDITABLE_JOBS entry.
+    live_tools: frozenset[str] = frozenset()
+    registered_tools: frozenset[str] | None = None
+    job_policy: str | None = None
 
 
 def _strings(obj: object, path: str = "payload") -> Iterator[tuple[str, str]]:

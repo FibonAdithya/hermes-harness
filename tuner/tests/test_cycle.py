@@ -1182,6 +1182,44 @@ def test_unexpected_error_after_drafting_still_records_the_spend(env, monkeypatc
     assert (env.root / "outbox" / "weekly-2026-W43.txt").exists()
 
 
+def _limit_contexts(env, monkeypatch, bridge):
+    from hermes_tuner import cycle_draft
+    seen = []
+    monkeypatch.setattr(cycle_draft, "check_fix", lambda fix, ctx: seen.append(ctx) or [])
+    build(env, triage_runs())
+    run_cycle(env, bridge, NOW)
+    return seen
+
+
+def test_limits_receive_the_snapshot(env, monkeypatch):
+    """policy.EDITABLE_JOBS[TRIAGE] is "triage" (checked in the assert).
+    Catches: the registered tools or the job policy not passed to check_fix."""
+    assert policy.EDITABLE_JOBS[TRIAGE] == "triage"
+    tools = {"native": ["terminal"], "mcp": [GET], "mcp_complete": True}
+    (c,) = _limit_contexts(env, monkeypatch, FakeBridge(
+        jobs=jobs(), tools=tools, oneshot_script=[reply(JOB_PROMPT_REPLY)]))
+    assert (c.registered_tools, c.job_policy) == (frozenset({"terminal", GET}), "triage")
+    assert c.live_tools == frozenset()
+
+
+def test_limits_receive_live_composed_tools(env, monkeypatch):
+    """Catches: live_tools left at its empty default in _limits."""
+    from hermes_tuner import cycle as cycle_mod
+    monkeypatch.setattr(cycle_mod._Cycle, "_live_tools", lambda self: frozenset({"live_one"}))
+    (c,) = _limit_contexts(env, monkeypatch, FakeBridge(
+        jobs=jobs(), oneshot_script=[reply(JOB_PROMPT_REPLY)]))
+    assert c.live_tools == frozenset({"live_one"})
+
+
+def test_unreadable_tool_list_gives_none(env, monkeypatch):
+    """Catches: a bridge failure aborting drafting, or reported as an empty set."""
+    bridge = FakeBridge(jobs=jobs(), fail={"registered_tools"},
+                        oneshot_script=[reply(JOB_PROMPT_REPLY)])
+    (c,) = _limit_contexts(env, monkeypatch, bridge)
+    assert c.registered_tools is None
+    assert [r.state for r in Ledger.load(env.root).records] == ["shadow_pending"]
+
+
 # --- m3: a trial with no verdict after 21 days is rolled back ------------------------------
 
 @pytest.mark.parametrize("age, rolled", [(21 * DAY, True), (21 * DAY - 60, False)])
