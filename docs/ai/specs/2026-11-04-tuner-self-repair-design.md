@@ -243,6 +243,69 @@ built here:
 A repair that needs anything else touches wiring code, is not eligible
 (§4.1), and waits for the owner.
 
+### 2.5 Loop 0: repair a rejected draft in the same cycle
+
+Added 2026-11-04 (owner: "the second, with draft repair inside it"). Not part
+of loop 1's plan; it gets its own plan after loop 1 ships.
+
+**Why.** Of 26 fixes in the ledger, 18 were rejected at drafting (MEASURED
+2026-11-04, `ledger.json` on hermes-vm). Today a rejected draft is retried
+at the earliest at the next nightly cycle, and back-off skips a candidate for
+7 days after two same-class failures, so one bad draft can cost a candidate a
+week. Many rejections name a field and a fixable rule (a key that does not
+exist, a tool name of the wrong shape, copied text in one field).
+
+**What.** When a draft is rejected in `_act` by `check_fix`, the copy check,
+or as unparseable, the tuner makes one more drafting call for the same
+candidate in the same cycle. The repair request is the original request plus
+a `rejection` object:
+
+- `class`: the `backoff.reason_class` of the rejection (`limits`, `copy`,
+  `unparseable`).
+- `fields`: the payload field names the reasons name (as `copy_fields` does
+  today, extended to limits reasons).
+- `rules`: fixed hint sentences from a closed table keyed by rule (one entry
+  per distinct `check_fix` reason prefix, for example "config key is not a
+  setting Hermes has" → "Use only a key from settings."). A reason with no
+  table entry gives no hint.
+
+The model never sees the reason text or its own rejected draft. Both can
+hold text the copy check exists to stop, and the drafting model already sees
+only classes and field names (`draft_history`). The repair is drafted from
+the same statistics as the first attempt.
+
+**Not repaired:** drafting timeouts and bridge errors (class `timeout`;
+retrying spends the same time again), replay rejections (the program failed
+on recorded runs, which a field hint cannot fix), shadow and trial failures
+(loop 1 and the next cycle's history handle those), and a repair's own
+rejection (at most one repair per candidate per cycle).
+
+**Limits.**
+
+- Spend: a repair is a draft. It counts against the weekly cap with
+  `DRAFT_EST_USD` projected, and is skipped when the cap would be passed.
+- Time: `hermes-tuner.service` has `TimeoutStartSec=1800` and a draft can
+  wait 360 s. A repair starts only when the time left in the cycle is at
+  least one draft wait plus the time the later steps (restart, weekly line)
+  need. The builder measures that from recent cycle durations and records
+  the number.
+- Ledger: the rejected draft keeps its record and spend. The repair is a new
+  record with `repair_of: <first id>`. Both count for back-off as they do
+  today, so a repair rejected in the same class moves the candidate to
+  "skip" at once. That is intended: two failures in a row on the same rule
+  mean a hint did not help.
+- Code repair (§3.1 R2): repairs count as drafted proposals. A cycle where
+  repairs succeed is not "stuck".
+
+**Measure.** Share of drafted candidates that reach `shadow_pending` per
+cycle, before and after, over the same number of cycles. Baseline: 26 fixes
+in the ledger, 7 got past drafting (3 shadow_failed, 2 rolled_back, 2 trial),
+18 rejected, 1 bridge_error (MEASURED 2026-11-04; re-measure at build time).
+
+**Calls made here (owner to check):** which classes are repaired (above);
+the model does not see its rejected draft; one repair per candidate per
+cycle.
+
 ## 3. Loop 2: repair requests
 
 ### 3.1 What files a request
@@ -499,6 +562,8 @@ merging; the tuner keeps rolling back. Loop 1 has its own policy flag.
    reason classes, notices, P2, the input snapshot (§2.4) with the new
    bridge op. Deployable alone; it rolls back `20261103-23272612` at its
    first cycle.
+1b. Loop 0 (§2.5, droplet only, its own plan): repair a rejected draft in
+    the same cycle.
 2. Box changes, one `deploy <sha>`: self-repair and review modes in
    `run-task.sh` and `run_task`, and the `pr_status`, `pr_mark`,
    `pr_update` verbs.
