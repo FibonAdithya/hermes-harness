@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
 
-from . import policy, trial
+from . import harm, policy, trial
 from .bridge import Bridge, BridgeError
 from .budget import DAY, JOB_KINDS, weekly_line
 from .cycle_draft import GLOBAL_KINDS, DraftSteps
@@ -355,6 +355,14 @@ class _Cycle(DraftSteps):
             if reason is not None:
                 self._shadow_failed(rec, reason)
                 continue
+            try:
+                sig = self._harm(rec, shadow, before=shadow.started_at)
+            except HistoryUnavailable as exc:
+                self.err(f"harm check {rec.id}: {type(exc).__name__}: {exc}")
+                sig = None
+            if sig is not None:
+                self._shadow_failed(rec, f"harm: {sig}")
+                continue
             old = next((s for s in by_start if s.job_id == live and s.calls
                         and s.started_at > shadow.started_at), None)
             if old is None:
@@ -404,6 +412,43 @@ class _Cycle(DraftSteps):
                 return "fix has no valid composed tool"
             own = files[0]["name"]
         return trial.tool_check(self.history.call_results(shadow.id), own, self._live_tools())
+
+    def _harm(self, rec: FixRecord, run: Session, before: float, status: str | None = None,
+              delivery_failed: bool = False, outage: bool = False) -> str | None:
+        """The first harm signal for `run` of job fix `rec`, or None. The baseline is the
+        target job's own runs (not shadows) that started in the BASELINE_DAYS before
+        `before`. Lets HistoryUnavailable propagate."""
+        if not policy.HARM_CHECKS or rec.kind not in JOB_KINDS:
+            return None
+        low = before - trial.BASELINE_DAYS * DAY
+        rates = tuple(
+            harm.error_rate(self.history.call_results(s.id)) for s in self.sessions
+            if s.job_id == rec.target and s.calls and s.job_id not in self.shadow_ids
+            and low <= s.started_at < before)
+        try:
+            payload = self.ledger.fix(rec.id).payload
+        except (OSError, ValueError, TypeError):
+            payload = None
+        leaves: list[str] = []
+
+        def walk(v: object) -> None:
+            if isinstance(v, str):
+                leaves.append(v)
+            elif isinstance(v, dict):
+                for k, x in v.items():
+                    if k != BASE_KEY:
+                        walk(x)
+            elif isinstance(v, (list, tuple)):
+                for x in v:
+                    walk(x)
+
+        walk(payload)
+        evidence = harm.RunEvidence(
+            results=tuple(self.history.call_results(run.id)), status=status,
+            delivery_failed=delivery_failed, fix_kind=rec.kind,
+            tools=self._live_tools() | self._registered_tools(), fix_text="\n".join(leaves))
+        found = harm.signals(evidence, harm.Baseline(error_rates=rates, outage=outage))
+        return found[0] if found else None
 
     def _reduced_in(self, fix_id: str, shadow: Session) -> bool:
         """True when the plugin logged a reduction (a line with "after") by fix

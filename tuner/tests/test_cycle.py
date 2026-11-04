@@ -519,11 +519,16 @@ SETUP_SESSIONS: dict = {}  # env.root -> the sessions shadow_setup built
 
 TOOL_OK = json.dumps({"result": {"messages": ["m1", "m2"]}})
 TOOL_ERR = json.dumps({"error": "output exceeds 50000 bytes"})
+UNKNOWN = json.dumps({"error": "'mcp__google__tuned_x' is not a deferrable tool. If you see it "
+                               "in the tools list already, call it directly; otherwise check "
+                               "the spelling against tool_search."})
+ARG_ERR = json.dumps({"error": "Error calling tool 'get_gmail_message_content': "
+                               "expected_sha256 and page_size require page_offset."})
 
 
 def shadow_setup(env, old_mod, new_mod, composed=False, live=True, base_runs=None,
                  shadow_ids=("m1", "m2"), tool_results=(TOOL_OK,), extra_calls=(),
-                 legacy_tool=False):
+                 legacy_tool=False, prompt="new prompt"):
     """A shadow-pending triage fix whose shadow ran at 06:40 yesterday and (if `live`)
     a live run at 07:00. `composed`: a composed_tool fix needing a restart, with the
     tool dir written as at shadow scheduling, whose shadow called tuned_triage once per
@@ -555,7 +560,7 @@ def shadow_setup(env, old_mod, new_mod, composed=False, live=True, base_runs=Non
                 json.dumps(dict(spec, shadow_only=True)))
     else:
         fix = Fix("20261018-bbbb0001", "job_prompt", TRIAGE,
-                  {"prompt": "new prompt", "add_toolsets": []} | base, "seq:x")
+                  {"prompt": prompt, "add_toolsets": []} | base, "seq:x")
     add_record(env, FixRecord(fix.id, fix.kind, TRIAGE, "seq:x", "shadow_pending",
                               NOW - DAY - 3600, spend_usd=0.01, needs_restart=composed), fix)
     (env.root / "shadow_jobs.json").write_text(json.dumps({SHADOW_JOB: {
@@ -566,6 +571,37 @@ def shadow_setup(env, old_mod, new_mod, composed=False, live=True, base_runs=Non
     (shadow_dir / f"{sid(SHADOW_JOB, shadow_t)}.jsonl").write_text(
         "\n".join(json.dumps({"tool": MOD, "args": a}) for a in new_mod))
     return fix
+
+
+# --- harm checks ---------------------------------------------------------------------
+
+def passing_shadow(env, extra_calls=(), prompt="Fetch mail with tuned_x."):
+    return shadow_setup(env, old_mod=[(MOD, {"message_id": "m2", "add_label_ids": ["TRASH"]}, "ok")],
+                        new_mod=[{"message_id": "m2", "add_label_ids": ["TRASH"]}],
+                        extra_calls=list(extra_calls), prompt=prompt)
+
+
+def test_shadow_that_looks_up_a_missing_tool_fails(env):
+    """Incident A at shadow time. Catches: harm not wired into evaluate_shadows."""
+    fix = passing_shadow(env, [("tool_describe", {}, UNKNOWN)])
+    run_cycle(env, FakeBridge(jobs=jobs()), NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert (rec.state, rec.reason) == ("shadow_failed", "harm: unknown_tool")
+
+
+def test_shadow_with_baseline_level_errors_goes_live(env):
+    """Two argument errors, as in an ordinary run. Catches: any error failing a shadow."""
+    fix = passing_shadow(env, [(GET, {}, ARG_ERR)] * 2)
+    run_cycle(env, FakeBridge(jobs=jobs()), NOW)
+    assert Ledger.load(env.root).get(fix.id).state == "trial"
+
+
+def test_harm_checks_switch_off(env, monkeypatch):
+    """Catches: policy.HARM_CHECKS ignored."""
+    monkeypatch.setattr(policy, "HARM_CHECKS", False)
+    fix = passing_shadow(env, [("tool_describe", {}, UNKNOWN)])
+    run_cycle(env, FakeBridge(jobs=jobs()), NOW)
+    assert Ledger.load(env.root).get(fix.id).state == "trial"
 
 
 def test_shadow_pass_applies_with_priced_baseline_cost(env):
