@@ -2198,6 +2198,106 @@ def composed_trial(env):
     return fix, bridge
 
 
+def job_prompt_trial(env):
+    """A job_prompt fix (its prompt names tuned_x) taken to trial by the real cycle,
+    live from NOW."""
+    fix = passing_shadow(env)
+    bridge = FakeBridge(jobs=jobs())
+    run_cycle(env, bridge, NOW)
+    led = Ledger.load(env.root)
+    rec = led.get(fix.id)
+    assert rec.state == "trial", rec.reason
+    rec.live_from = NOW
+    led.save()
+    return fix, bridge
+
+
+def later_run(calls, day=1):
+    """One triage run `day` days after NOW with `calls` then one message read."""
+    t = NOW - 3 * 3600 + 7 * 3600 + day * DAY
+    return {"id": sid(TRIAGE, t), "source": "cron", "started_at": t, "cost": 0.04,
+            "in": 40_000, "out": 400,
+            "calls": list(calls) + [(GET, {"message_id": "m"}, "b")]}
+
+
+def test_job_prompt_trial_rolls_back_on_unknown_tool(env):
+    """Incident A: a live job_prompt fix whose first run looks up a missing tool.
+    Catches: harm checks still limited to composed tools and reducers."""
+    fix, bridge = job_prompt_trial(env)
+    env.db.unlink()
+    build(env, SETUP_SESSIONS[env.root] + [later_run([("tool_describe", {}, UNKNOWN)])])
+    run_cycle(env, bridge, NOW + 2 * DAY)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert (rec.state, rec.reason, rec.trial_runs) == (
+        "rolled_back", "harm: unknown_tool (early)", 1)
+    assert bridge.jobs[TRIAGE]["prompt"] == "Triage the inbox."
+
+
+@pytest.mark.parametrize("cal_status, rolled", [("ok", True), ("error", False)])
+def test_trial_run_failed_unless_another_job_failed_too(env, cal_status, rolled):
+    """Catches: run_failed rolling back during an outage that hit every job."""
+    fix, bridge = job_prompt_trial(env)
+    t = NOW - 3 * 3600 + 7 * 3600 + DAY
+    env.db.unlink()
+    build(env, SETUP_SESSIONS[env.root] + [later_run([])])
+    bridge.jobs[TRIAGE] |= {"last_status": "error", "last_run_at": iso(t + 60)}
+    bridge.jobs[CAL] |= {"last_status": cal_status, "last_run_at": iso(t - 3600)}
+    run_cycle(env, bridge, NOW + 2 * DAY)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert (rec.state == "rolled_back") is rolled
+    if rolled:
+        assert rec.reason == "harm: run_failed (early)"
+
+
+def test_trial_job_status_older_than_the_run_is_ignored(env):
+    """The job's error status predates the newest run, so it says nothing about it.
+    Catches: last_run_at not compared with the run's started_at."""
+    fix, bridge = job_prompt_trial(env)
+    t = NOW - 3 * 3600 + 7 * 3600 + DAY
+    env.db.unlink()
+    build(env, SETUP_SESSIONS[env.root] + [later_run([])])
+    bridge.jobs[TRIAGE] |= {"last_status": "error", "last_run_at": iso(t - 600)}
+    run_cycle(env, bridge, NOW + 2 * DAY)
+    assert Ledger.load(env.root).get(fix.id).state == "trial"
+
+
+def test_trial_harm_survives_job_status_failure(env):
+    """Review Focus 4. Catches: a list_jobs failure aborting judge_trials or
+    suppressing the result-based signals."""
+    fix, bridge = job_prompt_trial(env)
+    env.db.unlink()
+    build(env, SETUP_SESSIONS[env.root] + [later_run([("tool_describe", {}, UNKNOWN)])])
+    bridge.fail = {"list_jobs"}
+    report = run_cycle(env, bridge, NOW + 2 * DAY)
+    assert Ledger.load(env.root).get(fix.id).state == "rolled_back"
+    assert any(e.startswith(f"harm status {fix.id}:") for e in report.errors)
+
+
+def test_trial_ignores_a_stale_tool_the_fix_does_not_name(env):
+    """The 10-30..11-03 pattern: an old tool's "no longer available" results, in a
+    trial whose fix does not name it.
+    Catches: the trial path counting any unknown tool, not only one the fix names."""
+    fix, bridge = job_prompt_trial(env)
+    stale = '{"error": "tuned_old is no longer available"}'
+    env.db.unlink()
+    build(env, SETUP_SESSIONS[env.root] + [later_run([("tuned_old", {}, stale)])])
+    run_cycle(env, bridge, NOW + 2 * DAY)
+    assert Ledger.load(env.root).get(fix.id).state == "trial"
+
+
+def test_config_trial_ignores_harm(env):
+    """Three argument errors in a chat would trip self_inflicted_errors for a job fix.
+    Catches: harm applied to config or skill fixes, whose runs are every chat."""
+    fix = config_trial(env, applied_days_ago=2)
+    chat = {"id": "20261019_010000_ab12cd", "source": "telegram", "started_at": NOW - 2 * 3600,
+            "cost": 0.05, "in": 10_000, "out": 10,
+            "calls": [(GET, {}, ARG_ERR)] * 3}
+    build(env, [chat])
+    run_cycle(env, FakeBridge(jobs=jobs(), config={CFG_KEY: 0.7}), NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert rec.state == "trial" and not (rec.reason or "").startswith("harm:")
+
+
 def own_tool_runs(results_per_run, cost=0.04):
     """Triage runs on the days after NOW, each calling tuned_triage once per result,
     then reading a message (a result that is not a composed tool's: not its own)."""
@@ -2385,7 +2485,9 @@ def test_history_failure_in_early_check_does_not_stop_judging(env, kind):
     assert led.get(fix.id).state == "trial"
     assert led.get(old.id).state == "rolled_back"
     assert led.get(old.id).reason == "no verdict in 21 days"
-    assert c.report.errors == [f"early check {fix.id}: HistoryUnavailable: database is locked"]
+    # the harm check reads the history first and fails the same way; both are logged
+    assert c.report.errors == [f"harm check {fix.id}: HistoryUnavailable: database is locked",
+                               f"early check {fix.id}: HistoryUnavailable: database is locked"]
 
 
 def test_trial_runs_written(env):

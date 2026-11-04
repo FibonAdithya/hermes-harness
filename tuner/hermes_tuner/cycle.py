@@ -142,6 +142,7 @@ class _Cycle(DraftSteps):
         self._plugin_ok: bool | None = None
         self.pricing: Pricing | None = None
         self._registered: frozenset[str] | None = None
+        self._jobs_cache: list[dict] | BridgeError | None = None
         self.registered_ok: bool | None = None
 
     # --- plumbing -----------------------------------------------------------------
@@ -609,6 +610,10 @@ class _Cycle(DraftSteps):
                 rec.trial_runs = len(runs)
                 self.ledger.save()
             if rec.live_from is not None and rec.kind in JOB_KINDS:
+                sig = self._harm_in_trial(rec, runs)
+                if sig is not None:
+                    self._rollback(rec, f"harm: {sig} (early)", runs)
+                    continue
                 failures, calls, worse = self._early_failures(rec, runs)
                 if failures >= trial.EARLY_FAIL_MIN or (
                         calls > 0 and failures / calls >= trial.EARLY_FAIL_SHARE):
@@ -646,6 +651,50 @@ class _Cycle(DraftSteps):
         keep = ((lambda s: s.job_id == rec.target) if rec.kind in JOB_KINDS else _global_run)
         return [s for s in self.sessions if s.started_at > rec.live_from and s.calls
                 and s.job_id not in self.shadow_ids and keep(s)]
+
+    def _job_list(self) -> list[dict]:
+        """The bridge's job list, one call per cycle. A BridgeError is cached and
+        re-raised so each caller can log it against its own record."""
+        if self._jobs_cache is None:
+            try:
+                self._jobs_cache = [j for j in self.bridge.list_jobs() if isinstance(j, dict)]
+            except BridgeError as exc:
+                self._jobs_cache = exc
+        if isinstance(self._jobs_cache, BridgeError):
+            raise self._jobs_cache
+        return self._jobs_cache
+
+    def _harm_in_trial(self, rec: FixRecord, runs: list[Session]) -> str | None:
+        """The first harm signal over a job fix's trial `runs` (oldest first), or None.
+        Job status (from list_jobs, not get_job) applies only to the newest run, and only
+        once the job has run since that run started. A bridge or state.db failure is
+        logged and leaves the signals that need no bridge, or none."""
+        if not runs or rec.live_from is None:
+            return None
+        jobs: list[dict] = []
+        try:
+            jobs = self._job_list()
+        except BridgeError as exc:
+            self.err(f"harm status {rec.id}: {exc}")
+        mine = next((j for j in jobs if j.get("id") == rec.target), None)
+        try:
+            for run in runs:
+                status, delivery_failed = None, False
+                if run is runs[-1] and mine is not None:
+                    ran = trial._epoch(mine.get("last_run_at"))
+                    if ran is not None and ran >= run.started_at:
+                        status = mine.get("last_status")
+                        delivery_failed = bool(mine.get("last_delivery_error"))
+                outage = any(
+                    j.get("id") != rec.target and j.get("last_status") == "error"
+                    and (t := trial._epoch(j.get("last_run_at"))) is not None
+                    and abs(t - run.started_at) <= harm.OUTAGE_WINDOW_S for j in jobs)
+                sig = self._harm(rec, run, rec.live_from, status, delivery_failed, outage)
+                if sig is not None:
+                    return sig
+        except HistoryUnavailable as exc:
+            self.err(f"harm check {rec.id}: {type(exc).__name__}: {exc}")
+        return None
 
     def _early_failures(self, rec: FixRecord, runs: list[Session]
                         ) -> tuple[int, int, tuple[float, float] | None]:
