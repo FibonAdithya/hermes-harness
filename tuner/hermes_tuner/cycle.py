@@ -152,7 +152,7 @@ class _Cycle(DraftSteps):
 
     def _registered_tools(self) -> frozenset[str]:
         """Registered native and MCP tool names, one bridge call per cycle. Empty on a
-        BridgeError (logged once); registered_ok says which."""
+        BridgeError or a malformed result (logged once); registered_ok says which."""
         if self._registered is None:
             try:
                 got = self.bridge.registered_tools()
@@ -160,6 +160,9 @@ class _Cycle(DraftSteps):
                 self.registered_ok = True
             except BridgeError as exc:
                 self.err(f"registered_tools: {exc}")
+                self._registered, self.registered_ok = frozenset(), False
+            except (KeyError, TypeError) as exc:
+                self.err(f"registered_tools: malformed result: {type(exc).__name__}")
                 self._registered, self.registered_ok = frozenset(), False
         return self._registered
 

@@ -109,9 +109,15 @@ def backoff(records: list[FixRecord], candidate_key: str, current_hash: str,
     return "ok"
 
 
+def _drafted_field(rec: FixRecord, field: str) -> str:
+    """The payload field the drafting model wrote for `field`: a job_prompt fix's model
+    writes "block", which the tuner splices into "prompt" before the copy check."""
+    return "block" if rec.kind == "job_prompt" and field == "prompt" else field
+
+
 def draft_history(records: list[FixRecord], candidate_key: str) -> list[dict]:
     """The candidate's last HISTORY_LEN outcomes, newest first, as class and field
-    names only: no ledger reason text."""
+    names only (the fields the model wrote): no ledger reason text."""
     return [{"kind": r.kind, "state": r.state, "reason_class": reason_class(r),
-             "fields": copy_fields(r)}
+             "fields": [_drafted_field(r, f) for f in copy_fields(r)]}
             for r in _newest_first(records, candidate_key)[:HISTORY_LEN]]

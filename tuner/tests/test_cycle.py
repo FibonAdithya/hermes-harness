@@ -2129,7 +2129,7 @@ def test_cycle_drafting_history_reaches_the_request(env):
     first, second = (json.loads(c[1][1]) for c in calls)
     assert first["history"] == []
     assert second["history"] == [{"kind": "job_prompt", "state": "rejected",
-                                  "reason_class": "copy", "fields": ["prompt"]}]
+                                  "reason_class": "copy", "fields": ["block"]}]
     assert "copied from" not in calls[1][1][1] and RESULT_SENTINEL not in calls[1][1][1]
 
 
@@ -2822,3 +2822,58 @@ def test_shadow_harm_reads_only_the_tuner_notes_block(env, prompt, state, reason
     run_cycle(env, FakeBridge(jobs=jobs()), NOW)
     rec = Ledger.load(env.root).get(fix.id)
     assert (rec.state, rec.reason) == (state, reason)
+
+
+@pytest.mark.parametrize("tools", [{"native": None, "mcp": [], "mcp_complete": True},
+                                   {"native": ["terminal"], "mcp_complete": True}])
+def test_malformed_registered_listing_is_treated_as_unreadable(env, tools):
+    """Catches: a malformed bridge result (TypeError, KeyError) escaping _registered_tools,
+    or not logged once, or reported as a readable listing."""
+    from hermes_tuner.cycle import CycleReport, _Cycle
+    bridge = FakeBridge(jobs=jobs(), tools=tools)
+    c = _Cycle(env, bridge, NOW, CycleReport())
+    assert c._registered_tools() == frozenset()
+    assert c._registered_tools() == frozenset()
+    assert c.registered_ok is False
+    assert len([e for e in c.report.errors if e.startswith("registered_tools:")]) == 1
+    assert len([x for x in bridge.calls if x[0] == "registered_tools"]) == 1
+
+
+def test_empty_registered_listing_gives_an_empty_set(env, monkeypatch):
+    """A successful listing with no tools is known-empty, not unknown.
+    Catches: registered_tools passed as `registered or None` (an empty set becoming None)."""
+    tools = {"native": [], "mcp": [], "mcp_complete": True}
+    (c,) = _limit_contexts(env, monkeypatch, FakeBridge(
+        jobs=jobs(), tools=tools, oneshot_script=[reply(JOB_PROMPT_REPLY)]))
+    assert c.registered_tools == frozenset()
+    assert c.registered_tools is not None
+
+
+def test_history_failure_in_shadow_harm_check_is_logged_and_the_cycle_continues(env,
+                                                                                monkeypatch):
+    """History.call_results (a class attribute, patched on the class) raises for the
+    baseline sessions only; the shadow's own reads succeed, since _tool_check reads them
+    before the harm check. A second shadow_pending record, after the first in the ledger,
+    is still evaluated. Catches: HistoryUnavailable escaping evaluate_shadows (the second
+    record is not reached and the error is not the harm-check line), or the record failed
+    on harm when its baseline cannot be read."""
+    fix = passing_shadow(env, [("tool_describe", {}, UNKNOWN)])
+    shadow_id = sid(SHADOW_JOB, SHADOW_T)
+    real = History.call_results
+
+    def call_results(self, session_id):
+        if session_id != shadow_id:
+            raise HistoryUnavailable("database is locked")
+        return real(self, session_id)
+
+    monkeypatch.setattr(History, "call_results", call_results)
+    other = Fix("20261009-cccc0011", "job_prompt", CAL, {"prompt": "p", "add_toolsets": []},
+                "seq:cal")
+    add_record(env, FixRecord(other.id, other.kind, CAL, other.candidate_key,
+                              "shadow_pending", NOW - 10 * DAY), other)
+    report = run_cycle(env, FakeBridge(jobs=jobs()), NOW)
+    led = Ledger.load(env.root)
+    assert led.get(fix.id).state == "trial"
+    assert (led.get(other.id).state, led.get(other.id).reason) == (
+        "shadow_failed", "shadow did not run")
+    assert f"harm check {fix.id}: HistoryUnavailable: database is locked" in report.errors

@@ -280,6 +280,19 @@ def test_draft_history_newest_three_with_class_and_fields_only():
         {"kind": "unparseable", "state": "rejected", "reason_class": "unparseable",
          "fields": []},
         {"kind": "job_prompt", "state": "rejected", "reason_class": "copy",
-         "fields": ["prompt"]},
+         "fields": ["block"]},
         {"kind": "job_prompt", "state": "kept", "reason_class": "", "fields": []},
     ]
+
+
+def test_draft_history_names_the_field_the_model_writes():
+    """A job_prompt fix's model writes payload.block; the tuner splices it into
+    payload.prompt, which the copy check names. A composed tool's model writes
+    job_prompt itself. Catches: "prompt" shown to the model for a job_prompt copy
+    rejection, the mapping applied to other kinds, or the ledger reason rewritten."""
+    jp = rej("job_prompt", f"payload.prompt: {COPY}; payload.add_toolsets[0]: {COPY}", 1.0)
+    ct = rej("composed_tool", f"payload.job_prompt: {COPY}; payload.prompt: {COPY}", 2.0)
+    assert [h["fields"] for h in draft_history([jp, ct], KEY)] == [
+        ["job_prompt", "prompt"], ["block", "add_toolsets"]]
+    assert jp.reason == f"payload.prompt: {COPY}; payload.add_toolsets[0]: {COPY}"
+    assert copy_fields(jp) == ["prompt", "add_toolsets"]
