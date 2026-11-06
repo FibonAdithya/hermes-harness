@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from collections.abc import Iterable
 from typing import Any
 
-from . import policy
+from . import harm, policy
 from .bridge import Bridge
 from .detect import Candidate
 from .measure import priced_breakdown
@@ -37,16 +37,16 @@ Reply with a single JSON object and nothing else: no prose, no code fence. Shape
    - Allowed tools: {", ".join(sorted(policy.CALLABLE_TOOLS))}.
    - web_search and web_extract are refused after any other call in the same run, so call them first or not at all.
    - If the program calls a mutating tool ({", ".join(sorted(policy.MUTATING_TOOLS & policy.CALLABLE_TOOLS))}), set mutating to true and add a boolean "dry_run" argument to parameters; the program must not perform effects when it is set (calls are recorded instead).
-   - job_prompt is optional new job prompt text telling the agent to use the tool, or null.
+   - job_prompt is optional block text (as in "job_prompt" below) telling the agent to use the tool, or null.
    - The program's JSON output must stay under {policy.MAX_OUTPUT_BYTES} bytes, at most {policy.MAX_CALLS} tool calls and {policy.RUN_TIMEOUT_S} seconds; return only what the job needs, not whole tool results.
    - turn_layout lists how many of the observed calls the agent already sends per turn; merging calls that already share a turn saves nothing.
    - replay_inputs says how the tool's arguments are built from the observed calls, so the tool can be tested on recorded runs before it is used. Each entry fills the parameter named param (a key of parameters.properties) from argument arg of the observed calls to from_call (one of calls): "list" collects every value, "first" takes the first. List at least one entry.
-2. "job_prompt": rewrite a job's prompt. target is the job id from the request. payload: {{"prompt": str, "add_toolsets": [str]}}. add_toolsets may only be ["{policy.TOOLSET}"] or [].
+2. "job_prompt": add notes to a job's prompt. target is the job id from the request. payload: {{"block": str, "add_toolsets": [str]}}. block is text placed at the end of the job's prompt under a "tuner notes" heading; the owner's prompt is kept unchanged, and an existing tuner notes block is replaced by yours. Write only the block. add_toolsets may only be ["{policy.TOOLSET}"] or [].
 3. "config": change one setting. target is the key. payload: {{"key": str, "value": string, number or boolean}}. The request's "settings" object maps every setting you may change to its current value. key must be one of its keys, copied exactly; any other key is refused. Keep the type of the current value. If "settings" is empty, do not choose this kind.
 4. "skill": shrink a skill that is loaded often and is large. target is the skill path. payload: {{"path": str, "text": str}}. A skill fix may only rewrite an existing SKILL.md that is not bundled with the agent, and must keep its frontmatter block (the leading --- block) byte-identical. Shrink the body, keep the decision guidance, and point at the tool for mechanics.
 5. "new_reach": use only when the fix truly needs a tool outside the allowed list. payload: {{"change": {{"type": "mcp_include_add", "server": str, "tool": str}} or {{"type": "callable_add", "tool": str}}, "why": str}}. target is the tool name. The owner must approve it.
 
-history lists earlier drafts for this candidate and why they failed; fields named for a copy rejection must not contain literal text from tool results (no label names, addresses or subjects).
+history lists earlier drafts for this candidate and why they failed; fields named for a copy rejection must not contain literal text from tool results (no label names, addresses or subjects). A reason_class starting with "harm_" means the fix was undone because its runs went wrong: harm_unknown_tool, the agent tried a tool that does not exist; harm_server_tripped, its calls failed until a server was cut off; harm_self_inflicted_errors, many of its calls were malformed; harm_run_failed, the run failed. Do not repeat that design.
 
 job_prompt and composed_tool fixes target only the job in the request. Do not include keys that are not listed. Do not include secrets, message ids or any text other than your own design.
 """
@@ -79,8 +79,8 @@ def _clean_composed(p: dict) -> dict | None:
 
 
 def _clean_job_prompt(p: dict) -> dict | None:
-    if isinstance(p.get("prompt"), str) and _is_str_list(p.get("add_toolsets")):
-        return {"prompt": p["prompt"], "add_toolsets": p["add_toolsets"]}
+    if isinstance(p.get("block"), str) and _is_str_list(p.get("add_toolsets")):
+        return {"block": p["block"], "add_toolsets": p["add_toolsets"]}
     return None
 
 
@@ -124,7 +124,8 @@ MAX_SHAPE_CALLS = 200
 # first segment is sent; it must be identifier-shaped, else "?".
 _TOP_FIELD = re.compile(r"[A-Za-z0-9_]{1,40}")
 REASON_CLASSES = frozenset({"copy", "replay_limit", "replay", "timeout", "unparseable",
-                            "shadow", "limits", "trial", ""})
+                            "shadow", "limits", "trial", "",
+                            *(f"harm_{s}" for s in harm.SIGNALS)})
 HISTORY_LEN = 3
 MAX_HISTORY_FIELDS = 20
 

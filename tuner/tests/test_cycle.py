@@ -17,6 +17,7 @@ from hermes_tuner.cycle import CycleConfig, run_cycle, weekly_line
 from hermes_tuner.history import History, HistoryUnavailable
 from hermes_tuner.ledger import FixRecord, Ledger, _tool_files, write_shadow_tool
 from hermes_tuner.model import Fix, Session, ToolCall
+from hermes_tuner.prompt_block import splice
 from hermes_tuner.proposals import change_hash
 
 TRIAGE, CAL = "3bc4e11d29b1", "cc68e24f21cd"
@@ -106,8 +107,7 @@ def reply(obj, tokens=(1000, 200)):
 
 
 JOB_PROMPT_REPLY = {"kind": "job_prompt", "target": TRIAGE,
-                    "payload": {"prompt": "Triage the inbox; skip mail already starred.",
-                                "add_toolsets": []}}
+                    "payload": {"block": "Skip mail already starred.", "add_toolsets": []}}
 
 
 @pytest.fixture
@@ -171,6 +171,18 @@ def test_cycle_drafts_and_shadows_when_job_is_free(env):
     assert led.fix(rec.id).payload["_base"] == {"prompt": "Triage the inbox.",
                                                 "enabled_toolsets": ["google"]}
     assert "_base" not in json.dumps(bridge.calls)
+
+
+def test_cycle_splices_the_drafted_block(env):
+    """The ledger holds the owner's prompt plus the drafted block, byte for byte.
+    Catches: the block reaching the ledger unspliced, or the owner text altered."""
+    build(env, triage_runs())
+    bridge = FakeBridge(jobs=jobs(), oneshot_script=[reply(JOB_PROMPT_REPLY)])
+    run_cycle(env, bridge, NOW)
+    (rec,) = Ledger.load(env.root).records
+    payload = Ledger.load(env.root).fix(rec.id).payload
+    assert payload["prompt"] == splice("Triage the inbox.", "Skip mail already starred.")
+    assert "block" not in payload
 
 
 # --- budget ------------------------------------------------------------------------------
@@ -519,11 +531,16 @@ SETUP_SESSIONS: dict = {}  # env.root -> the sessions shadow_setup built
 
 TOOL_OK = json.dumps({"result": {"messages": ["m1", "m2"]}})
 TOOL_ERR = json.dumps({"error": "output exceeds 50000 bytes"})
+UNKNOWN = json.dumps({"error": "'mcp__google__tuned_x' is not a deferrable tool. If you see it "
+                               "in the tools list already, call it directly; otherwise check "
+                               "the spelling against tool_search."})
+ARG_ERR = json.dumps({"error": "Error calling tool 'get_gmail_message_content': "
+                               "expected_sha256 and page_size require page_offset."})
 
 
 def shadow_setup(env, old_mod, new_mod, composed=False, live=True, base_runs=None,
                  shadow_ids=("m1", "m2"), tool_results=(TOOL_OK,), extra_calls=(),
-                 legacy_tool=False):
+                 legacy_tool=False, prompt="new prompt", base_prompt="Triage the inbox."):
     """A shadow-pending triage fix whose shadow ran at 06:40 yesterday and (if `live`)
     a live run at 07:00. `composed`: a composed_tool fix needing a restart, with the
     tool dir written as at shadow scheduling, whose shadow called tuned_triage once per
@@ -545,7 +562,7 @@ def shadow_setup(env, old_mod, new_mod, composed=False, live=True, base_runs=Non
                                    (GET, {"message_id": "m2"}, "b")] + old_mod})
     build(env, sessions)
     SETUP_SESSIONS[env.root] = sessions
-    base = {"_base": {"prompt": "Triage the inbox.", "enabled_toolsets": ["google"]}}
+    base = {"_base": {"prompt": base_prompt, "enabled_toolsets": ["google"]}}
     if composed:
         fix = Fix("20261018-bbbb0002", "composed_tool", TRIAGE, dict(TOOL) | base, "seq:x")
         write_shadow_tool(env.root / "tools", fix.payload, fix.id)
@@ -555,7 +572,7 @@ def shadow_setup(env, old_mod, new_mod, composed=False, live=True, base_runs=Non
                 json.dumps(dict(spec, shadow_only=True)))
     else:
         fix = Fix("20261018-bbbb0001", "job_prompt", TRIAGE,
-                  {"prompt": "new prompt", "add_toolsets": []} | base, "seq:x")
+                  {"prompt": prompt, "add_toolsets": []} | base, "seq:x")
     add_record(env, FixRecord(fix.id, fix.kind, TRIAGE, "seq:x", "shadow_pending",
                               NOW - DAY - 3600, spend_usd=0.01, needs_restart=composed), fix)
     (env.root / "shadow_jobs.json").write_text(json.dumps({SHADOW_JOB: {
@@ -566,6 +583,39 @@ def shadow_setup(env, old_mod, new_mod, composed=False, live=True, base_runs=Non
     (shadow_dir / f"{sid(SHADOW_JOB, shadow_t)}.jsonl").write_text(
         "\n".join(json.dumps({"tool": MOD, "args": a}) for a in new_mod))
     return fix
+
+
+# --- harm checks ---------------------------------------------------------------------
+
+def passing_shadow(env, extra_calls=(), prompt="Fetch mail with tuned_x.",
+                   base_prompt="Triage the inbox."):
+    return shadow_setup(env, old_mod=[(MOD, {"message_id": "m2", "add_label_ids": ["TRASH"]}, "ok")],
+                        new_mod=[{"message_id": "m2", "add_label_ids": ["TRASH"]}],
+                        extra_calls=list(extra_calls), prompt=prompt,
+                        base_prompt=base_prompt)
+
+
+def test_shadow_that_looks_up_a_missing_tool_fails(env):
+    """Incident A at shadow time. Catches: harm not wired into evaluate_shadows."""
+    fix = passing_shadow(env, [("tool_describe", {}, UNKNOWN)])
+    run_cycle(env, FakeBridge(jobs=jobs()), NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert (rec.state, rec.reason) == ("shadow_failed", "harm: unknown_tool")
+
+
+def test_shadow_with_baseline_level_errors_goes_live(env):
+    """Two argument errors, as in an ordinary run. Catches: any error failing a shadow."""
+    fix = passing_shadow(env, [(GET, {}, ARG_ERR)] * 2)
+    run_cycle(env, FakeBridge(jobs=jobs()), NOW)
+    assert Ledger.load(env.root).get(fix.id).state == "trial"
+
+
+def test_harm_checks_switch_off(env, monkeypatch):
+    """Catches: policy.HARM_CHECKS ignored."""
+    monkeypatch.setattr(policy, "HARM_CHECKS", False)
+    fix = passing_shadow(env, [("tool_describe", {}, UNKNOWN)])
+    run_cycle(env, FakeBridge(jobs=jobs()), NOW)
+    assert Ledger.load(env.root).get(fix.id).state == "trial"
 
 
 def test_shadow_pass_applies_with_priced_baseline_cost(env):
@@ -944,7 +994,7 @@ def test_composed_shadow_restarted_in_its_scheduling_cycle_reaches_trial(env):
     assert (env.root / "tools" / "tuned_triage" / "program.py").exists()
     assert "shadow_only" not in json.loads(
         (env.root / "tools" / "tuned_triage" / "tool.json").read_text())
-    assert b2.jobs[TRIAGE]["prompt"] == "new prompt"
+    assert b2.jobs[TRIAGE]["prompt"] == splice("Triage the inbox.", "new prompt")
     assert "tuner" in b2.jobs[TRIAGE]["enabled_toolsets"]
 
 
@@ -1132,6 +1182,44 @@ def test_unexpected_error_after_drafting_still_records_the_spend(env, monkeypatc
     assert rec.spend_usd == pytest.approx(12_000 * FLAT_RATE / 1e6)
     assert report.spend_usd == pytest.approx(rec.spend_usd)
     assert (env.root / "outbox" / "weekly-2026-W43.txt").exists()
+
+
+def _limit_contexts(env, monkeypatch, bridge):
+    from hermes_tuner import cycle_draft
+    seen = []
+    monkeypatch.setattr(cycle_draft, "check_fix", lambda fix, ctx: seen.append(ctx) or [])
+    build(env, triage_runs())
+    run_cycle(env, bridge, NOW)
+    return seen
+
+
+def test_limits_receive_the_snapshot(env, monkeypatch):
+    """policy.EDITABLE_JOBS[TRIAGE] is "triage" (checked in the assert).
+    Catches: the registered tools or the job policy not passed to check_fix."""
+    assert policy.EDITABLE_JOBS[TRIAGE] == "triage"
+    tools = {"native": ["terminal"], "mcp": [GET], "mcp_complete": True}
+    (c,) = _limit_contexts(env, monkeypatch, FakeBridge(
+        jobs=jobs(), tools=tools, oneshot_script=[reply(JOB_PROMPT_REPLY)]))
+    assert (c.registered_tools, c.job_policy) == (frozenset({"terminal", GET}), "triage")
+    assert c.live_tools == frozenset()
+
+
+def test_limits_receive_live_composed_tools(env, monkeypatch):
+    """Catches: live_tools left at its empty default in _limits."""
+    from hermes_tuner import cycle as cycle_mod
+    monkeypatch.setattr(cycle_mod._Cycle, "_live_tools", lambda self: frozenset({"live_one"}))
+    (c,) = _limit_contexts(env, monkeypatch, FakeBridge(
+        jobs=jobs(), oneshot_script=[reply(JOB_PROMPT_REPLY)]))
+    assert c.live_tools == frozenset({"live_one"})
+
+
+def test_unreadable_tool_list_gives_none(env, monkeypatch):
+    """Catches: a bridge failure aborting drafting, or reported as an empty set."""
+    bridge = FakeBridge(jobs=jobs(), fail={"registered_tools"},
+                        oneshot_script=[reply(JOB_PROMPT_REPLY)])
+    (c,) = _limit_contexts(env, monkeypatch, bridge)
+    assert c.registered_tools is None
+    assert [r.state for r in Ledger.load(env.root).records] == ["shadow_pending"]
 
 
 # --- m3: a trial with no verdict after 21 days is rolled back ------------------------------
@@ -1989,7 +2077,7 @@ def test_default_replay_runner_is_the_plugin_relay_in_docker():
 COPY_TEXT = f"{RESULT_SENTINEL} body " + "y" * 800  # what every triage GET returned
 COPY = "payload.prompt: contains text copied from untrusted tool results"
 COPY_REPLY = {"kind": "job_prompt", "target": TRIAGE,
-              "payload": {"prompt": "Triage the inbox. " + COPY_TEXT, "add_toolsets": []}}
+              "payload": {"block": "Triage the inbox. " + COPY_TEXT, "add_toolsets": []}}
 
 
 def request_key(call):
@@ -2043,7 +2131,7 @@ def test_cycle_drafting_history_reaches_the_request(env):
     first, second = (json.loads(c[1][1]) for c in calls)
     assert first["history"] == []
     assert second["history"] == [{"kind": "job_prompt", "state": "rejected",
-                                  "reason_class": "copy", "fields": ["prompt"]}]
+                                  "reason_class": "copy", "fields": ["block"]}]
     assert "copied from" not in calls[1][1][1] and RESULT_SENTINEL not in calls[1][1][1]
 
 
@@ -2160,6 +2248,106 @@ def composed_trial(env):
     rec.live_from = NOW
     led.save()
     return fix, bridge
+
+
+def job_prompt_trial(env):
+    """A job_prompt fix (its prompt names tuned_x) taken to trial by the real cycle,
+    live from NOW."""
+    fix = passing_shadow(env)
+    bridge = FakeBridge(jobs=jobs())
+    run_cycle(env, bridge, NOW)
+    led = Ledger.load(env.root)
+    rec = led.get(fix.id)
+    assert rec.state == "trial", rec.reason
+    rec.live_from = NOW
+    led.save()
+    return fix, bridge
+
+
+def later_run(calls, day=1):
+    """One triage run `day` days after NOW with `calls` then one message read."""
+    t = NOW - 3 * 3600 + 7 * 3600 + day * DAY
+    return {"id": sid(TRIAGE, t), "source": "cron", "started_at": t, "cost": 0.04,
+            "in": 40_000, "out": 400,
+            "calls": list(calls) + [(GET, {"message_id": "m"}, "b")]}
+
+
+def test_job_prompt_trial_rolls_back_on_unknown_tool(env):
+    """Incident A: a live job_prompt fix whose first run looks up a missing tool.
+    Catches: harm checks still limited to composed tools and reducers."""
+    fix, bridge = job_prompt_trial(env)
+    env.db.unlink()
+    build(env, SETUP_SESSIONS[env.root] + [later_run([("tool_describe", {}, UNKNOWN)])])
+    run_cycle(env, bridge, NOW + 2 * DAY)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert (rec.state, rec.reason, rec.trial_runs) == (
+        "rolled_back", "harm: unknown_tool (early)", 1)
+    assert bridge.jobs[TRIAGE]["prompt"] == "Triage the inbox."
+
+
+@pytest.mark.parametrize("cal_status, rolled", [("ok", True), ("error", False)])
+def test_trial_run_failed_unless_another_job_failed_too(env, cal_status, rolled):
+    """Catches: run_failed rolling back during an outage that hit every job."""
+    fix, bridge = job_prompt_trial(env)
+    t = NOW - 3 * 3600 + 7 * 3600 + DAY
+    env.db.unlink()
+    build(env, SETUP_SESSIONS[env.root] + [later_run([])])
+    bridge.jobs[TRIAGE] |= {"last_status": "error", "last_run_at": iso(t + 60)}
+    bridge.jobs[CAL] |= {"last_status": cal_status, "last_run_at": iso(t - 3600)}
+    run_cycle(env, bridge, NOW + 2 * DAY)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert (rec.state == "rolled_back") is rolled
+    if rolled:
+        assert rec.reason == "harm: run_failed (early)"
+
+
+def test_trial_job_status_older_than_the_run_is_ignored(env):
+    """The job's error status predates the newest run, so it says nothing about it.
+    Catches: last_run_at not compared with the run's started_at."""
+    fix, bridge = job_prompt_trial(env)
+    t = NOW - 3 * 3600 + 7 * 3600 + DAY
+    env.db.unlink()
+    build(env, SETUP_SESSIONS[env.root] + [later_run([])])
+    bridge.jobs[TRIAGE] |= {"last_status": "error", "last_run_at": iso(t - 600)}
+    run_cycle(env, bridge, NOW + 2 * DAY)
+    assert Ledger.load(env.root).get(fix.id).state == "trial"
+
+
+def test_trial_harm_survives_job_status_failure(env):
+    """Review Focus 4. Catches: a list_jobs failure aborting judge_trials or
+    suppressing the result-based signals."""
+    fix, bridge = job_prompt_trial(env)
+    env.db.unlink()
+    build(env, SETUP_SESSIONS[env.root] + [later_run([("tool_describe", {}, UNKNOWN)])])
+    bridge.fail = {"list_jobs"}
+    report = run_cycle(env, bridge, NOW + 2 * DAY)
+    assert Ledger.load(env.root).get(fix.id).state == "rolled_back"
+    assert any(e.startswith(f"harm status {fix.id}:") for e in report.errors)
+
+
+def test_trial_ignores_a_stale_tool_the_fix_does_not_name(env):
+    """The 10-30..11-03 pattern: an old tool's "no longer available" results, in a
+    trial whose fix does not name it.
+    Catches: the trial path counting any unknown tool, not only one the fix names."""
+    fix, bridge = job_prompt_trial(env)
+    stale = '{"error": "tuned_old is no longer available"}'
+    env.db.unlink()
+    build(env, SETUP_SESSIONS[env.root] + [later_run([("tuned_old", {}, stale)])])
+    run_cycle(env, bridge, NOW + 2 * DAY)
+    assert Ledger.load(env.root).get(fix.id).state == "trial"
+
+
+def test_config_trial_ignores_harm(env):
+    """Three argument errors in a chat would trip self_inflicted_errors for a job fix.
+    Catches: harm applied to config or skill fixes, whose runs are every chat."""
+    fix = config_trial(env, applied_days_ago=2)
+    chat = {"id": "20261019_010000_ab12cd", "source": "telegram", "started_at": NOW - 2 * 3600,
+            "cost": 0.05, "in": 10_000, "out": 10,
+            "calls": [(GET, {}, ARG_ERR)] * 3}
+    build(env, [chat])
+    run_cycle(env, FakeBridge(jobs=jobs(), config={CFG_KEY: 0.7}), NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert rec.state == "trial" and not (rec.reason or "").startswith("harm:")
 
 
 def own_tool_runs(results_per_run, cost=0.04):
@@ -2349,7 +2537,9 @@ def test_history_failure_in_early_check_does_not_stop_judging(env, kind):
     assert led.get(fix.id).state == "trial"
     assert led.get(old.id).state == "rolled_back"
     assert led.get(old.id).reason == "no verdict in 21 days"
-    assert c.report.errors == [f"early check {fix.id}: HistoryUnavailable: database is locked"]
+    # the harm check reads the history first and fails the same way; both are logged
+    assert c.report.errors == [f"harm check {fix.id}: HistoryUnavailable: database is locked",
+                               f"early check {fix.id}: HistoryUnavailable: database is locked"]
 
 
 def test_trial_runs_written(env):
@@ -2493,10 +2683,232 @@ def test_cycle_does_not_count_the_job_prompt_as_copied(env):
     the_jobs = jobs()
     the_jobs[TRIAGE]["prompt"] = ECHOED_PROMPT
     edit = {"kind": "job_prompt", "target": TRIAGE,
-            "payload": {"prompt": ECHOED_PROMPT + " Skip mail already starred.",
-                        "add_toolsets": []}}
+            "payload": {"block": "Skip mail already starred.", "add_toolsets": []}}
     bridge = FakeBridge(jobs=the_jobs, oneshot_script=[reply(edit)])
     report = run_cycle(env, bridge, NOW)
     (rec,) = Ledger.load(env.root).records
     assert rec.state == "shadow_pending", rec.reason
     assert report.errors == []
+
+
+def test_registered_tools_cached_and_fail_soft(env):
+    """Catches: one bridge call per check instead of per cycle, or a BridgeError escaping.
+    """
+    from hermes_tuner.cycle import CycleReport, _Cycle
+    get = "mcp__google__get_events"
+    bridge = FakeBridge(jobs=jobs(),
+                        tools={"native": ["terminal"], "mcp": [get], "mcp_complete": True})
+    c = _Cycle(env, bridge, NOW, CycleReport())
+    assert c._registered_tools() == frozenset({"terminal", get})
+    assert c._registered_tools() == frozenset({"terminal", get})
+    assert [x for x in bridge.calls if x[0] == "registered_tools"] == [("registered_tools", ())]
+    assert c.registered_ok is True
+
+    bad = FakeBridge(jobs=jobs(), fail={"registered_tools"})
+    c = _Cycle(env, bad, NOW, CycleReport())
+    assert c._registered_tools() == frozenset()
+    assert c._registered_tools() == frozenset()
+    assert c.registered_ok is False
+    assert len([e for e in c.report.errors if e.startswith("registered_tools:")]) == 1
+    assert len([x for x in bad.calls if x[0] == "registered_tools"]) == 1
+
+
+def _unknown_tool_run(env):
+    fix, bridge = job_prompt_trial(env)
+    env.db.unlink()
+    build(env, SETUP_SESSIONS[env.root] + [later_run([("tool_describe", {}, UNKNOWN)])])
+    return fix, bridge
+
+
+def test_harm_classes_reach_the_drafting_request(env):
+    """A candidate whose last fix was rolled back for harm: the next request's history
+    names the harm class, not the reason text.
+    Catches: harm_* missing from REASON_CLASSES, so the class is dropped from history."""
+    build(env, triage_runs(days=range(-3, 13)))
+    heartbeat(env, NOW - 60)
+    run_cycle(env, FakeBridge(jobs=jobs(), oneshot_script=[reply(COPY_REPLY)]), NOW)
+    led = Ledger.load(env.root)
+    (rec,) = led.records
+    rec.state, rec.reason = "rolled_back", "harm: unknown_tool (early)"
+    led.save()
+    bridge = FakeBridge(jobs=jobs(), oneshot_script=[reply(COPY_REPLY)])
+    heartbeat(env, NOW + DAY - 60)
+    run_cycle(env, bridge, NOW + DAY)
+    (call,) = oneshots(bridge)
+    history = json.loads(call[1][1])["history"]
+    assert history[0]["reason_class"] == "harm_unknown_tool"
+    assert "unknown_tool (early)" not in call[1][1]
+
+
+def test_rollback_writes_one_outbox_line(env):
+    """Catches: no notice, a file name the listener's *.txt glob misses, or two lines."""
+    fix, bridge = _unknown_tool_run(env)
+    run_cycle(env, bridge, NOW + 2 * DAY)
+    out = env.root / "outbox"
+    assert [p.name for p in out.glob("rollback-*")] == [f"rollback-{fix.id}.txt"]
+    assert (out / f"rollback-{fix.id}.txt").read_text() == \
+        f"tuner rolled back {fix.id} (morning-briefing): harm: unknown_tool (early)\n"
+
+
+def test_owner_changed_writes_no_notice(env):
+    """Catches: a notice written for every _rollback call, not only a real rollback."""
+    fix, bridge = _unknown_tool_run(env)
+    bridge.jobs[TRIAGE]["prompt"] = "The owner rewrote this."
+    run_cycle(env, bridge, NOW + 2 * DAY)
+    assert Ledger.load(env.root).get(fix.id).state == "owner_changed"
+    assert list((env.root / "outbox").glob("rollback-*")) == []
+
+
+def test_dry_run_harm_rollback_writes_no_notice(env):
+    """Catches: dry run rolling back or writing the outbox."""
+    fix, bridge = _unknown_tool_run(env)
+    dry = CycleConfig(**{**env.__dict__, "dry_run": True})
+    report = run_cycle(dry, bridge, NOW + 2 * DAY)
+    assert Ledger.load(env.root).get(fix.id).state == "trial"
+    assert f"rollback {fix.id}" in report.planned
+    assert list((env.root / "outbox").glob("rollback-*")) == []
+
+
+# --- final review fixes -------------------------------------------------------------
+
+def test_trial_status_of_a_later_zero_call_run_is_not_blamed_on_the_earlier_run(env):
+    """Spec 2.1: a run with no tool calls is not harm. The day-1 run had calls; a
+    triage session 12 h later made none (an outage), and the job's error status is from
+    that one. Catches: job status applied to runs[-1] whenever last_run_at >= its start,
+    though a later run of the job, left out of runs for having no calls, is the one that
+    set it."""
+    fix, bridge = job_prompt_trial(env)
+    t = NOW - 3 * 3600 + 7 * 3600 + DAY
+    outage = {"id": sid(TRIAGE, t + 12 * 3600), "source": "cron", "started_at": t + 12 * 3600,
+              "cost": 0.0, "in": 100, "out": 0, "calls": []}
+    env.db.unlink()
+    build(env, SETUP_SESSIONS[env.root] + [later_run([]), outage])
+    bridge.jobs[TRIAGE] |= {"last_status": "error", "last_run_at": iso(t + 12 * 3600 + 60)}
+    bridge.jobs[CAL] |= {"last_status": "ok", "last_run_at": iso(t - 3600)}
+    run_cycle(env, bridge, NOW + 2 * DAY)
+    assert Ledger.load(env.root).get(fix.id).state == "trial"
+
+
+def test_trial_run_failed_when_the_other_jobs_error_is_outside_the_outage_window(env):
+    """Calendar-sync's error is more than OUTAGE_WINDOW_S before the triage run started,
+    so it is not the same outage. Catches: the abs(t - started_at) <= OUTAGE_WINDOW_S
+    clause deleted (any other job's error, however old, suppressing run_failed)."""
+    from hermes_tuner import harm
+    fix, bridge = job_prompt_trial(env)
+    t = NOW - 3 * 3600 + 7 * 3600 + DAY
+    env.db.unlink()
+    build(env, SETUP_SESSIONS[env.root] + [later_run([])])
+    bridge.jobs[TRIAGE] |= {"last_status": "error", "last_run_at": iso(t + 60)}
+    bridge.jobs[CAL] |= {"last_status": "error",
+                         "last_run_at": iso(t - harm.OUTAGE_WINDOW_S - 60)}
+    run_cycle(env, bridge, NOW + 2 * DAY)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert (rec.state, rec.reason) == ("rolled_back", "harm: run_failed (early)")
+
+
+@pytest.mark.parametrize("prompt, state, reason", [
+    # P2: the owner's text names tuned_x, the tuner notes block does not
+    (splice("Fetch mail with tuned_x.", "Skip mail already starred."), "trial", ""),
+    # P2: the block names tuned_x
+    (splice("Triage the inbox.", "Fetch mail with tuned_x."), "shadow_failed",
+     "harm: unknown_tool"),
+    # old format, as the live incident record 20261103-23272612: no markers, the whole
+    # prompt is tuner-written
+    ("Fetch mail with tuned_x.", "shadow_failed", "harm: unknown_tool")])
+def test_shadow_harm_reads_only_the_tuner_notes_block(env, prompt, state, reason):
+    """Spec 2.1: an unknown tool is harm only if it plausibly comes from the fix; 2.2:
+    the owner's text is not checked. Catches: the whole spliced prompt used as fix_text
+    (the first case fails); a leaf with a block dropped entirely (the second); a leaf
+    without markers contributing nothing (the third)."""
+    fix = passing_shadow(env, [("tool_describe", {}, UNKNOWN)], prompt=prompt)
+    run_cycle(env, FakeBridge(jobs=jobs()), NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert (rec.state, rec.reason) == (state, reason)
+
+
+def test_shadow_harm_ignores_the_owner_prompt_recorded_as_base(env):
+    """The fix payload records the job as drafted against under BASE_KEY; for a P2
+    prompt that is the owner's text, which here names tuned_x. Only the tuner notes
+    block is the fix's. Catches: _harm's walk reading the BASE_KEY entry as fix text."""
+    owner = "Fetch mail with tuned_x."
+    fix = passing_shadow(env, [("tool_describe", {}, UNKNOWN)],
+                         prompt=splice(owner, "Skip mail already starred."), base_prompt=owner)
+    live = jobs()
+    live[TRIAGE]["prompt"] = owner
+    run_cycle(env, FakeBridge(jobs=live), NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert (rec.state, rec.reason) == ("trial", "")
+
+
+NOT_DEFERRABLE_CORE = json.dumps({"error": "'terminal' is not a deferrable tool. If you see "
+                                           "it in the tools list already, call it directly."})
+
+
+@pytest.mark.parametrize("native, state, reason", [
+    (["terminal"], "trial", ""),
+    ([], "shadow_failed", "harm: unknown_tool")])
+def test_shadow_harm_excuses_registered_core_tools(env, native, state, reason):
+    """Hermes answers "not a deferrable tool" for core tools too; one the bridge lists as
+    registered is not an unknown tool even when the fix names it. Catches: the cycle not
+    passing _registered_tools() into RunEvidence.tools (the first case fails)."""
+    fix = passing_shadow(env, [("tool_describe", {}, NOT_DEFERRABLE_CORE)],
+                         prompt="Run terminal for the summary.")
+    tools = {"native": native, "mcp": [], "mcp_complete": True}
+    run_cycle(env, FakeBridge(jobs=jobs(), tools=tools), NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert (rec.state, rec.reason) == (state, reason)
+
+
+@pytest.mark.parametrize("tools", [{"native": None, "mcp": [], "mcp_complete": True},
+                                   {"native": ["terminal"], "mcp_complete": True}])
+def test_malformed_registered_listing_is_treated_as_unreadable(env, tools):
+    """Catches: a malformed bridge result (TypeError, KeyError) escaping _registered_tools,
+    or not logged once, or reported as a readable listing."""
+    from hermes_tuner.cycle import CycleReport, _Cycle
+    bridge = FakeBridge(jobs=jobs(), tools=tools)
+    c = _Cycle(env, bridge, NOW, CycleReport())
+    assert c._registered_tools() == frozenset()
+    assert c._registered_tools() == frozenset()
+    assert c.registered_ok is False
+    assert len([e for e in c.report.errors if e.startswith("registered_tools:")]) == 1
+    assert len([x for x in bridge.calls if x[0] == "registered_tools"]) == 1
+
+
+def test_empty_registered_listing_gives_an_empty_set(env, monkeypatch):
+    """A successful listing with no tools is known-empty, not unknown.
+    Catches: registered_tools passed as `registered or None` (an empty set becoming None)."""
+    tools = {"native": [], "mcp": [], "mcp_complete": True}
+    (c,) = _limit_contexts(env, monkeypatch, FakeBridge(
+        jobs=jobs(), tools=tools, oneshot_script=[reply(JOB_PROMPT_REPLY)]))
+    assert c.registered_tools == frozenset()
+    assert c.registered_tools is not None
+
+
+def test_history_failure_in_shadow_harm_check_is_logged_and_the_cycle_continues(env,
+                                                                                monkeypatch):
+    """History.call_results (a class attribute, patched on the class) raises for the
+    baseline sessions only; the shadow's own reads succeed, since _tool_check reads them
+    before the harm check. A second shadow_pending record, after the first in the ledger,
+    is still evaluated. Catches: HistoryUnavailable escaping evaluate_shadows (the second
+    record is not reached and the error is not the harm-check line), or the record failed
+    on harm when its baseline cannot be read."""
+    fix = passing_shadow(env, [("tool_describe", {}, UNKNOWN)])
+    shadow_id = sid(SHADOW_JOB, SHADOW_T)
+    real = History.call_results
+
+    def call_results(self, session_id):
+        if session_id != shadow_id:
+            raise HistoryUnavailable("database is locked")
+        return real(self, session_id)
+
+    monkeypatch.setattr(History, "call_results", call_results)
+    other = Fix("20261009-cccc0011", "job_prompt", CAL, {"prompt": "p", "add_toolsets": []},
+                "seq:cal")
+    add_record(env, FixRecord(other.id, other.kind, CAL, other.candidate_key,
+                              "shadow_pending", NOW - 10 * DAY), other)
+    report = run_cycle(env, FakeBridge(jobs=jobs()), NOW)
+    led = Ledger.load(env.root)
+    assert led.get(fix.id).state == "trial"
+    assert (led.get(other.id).state, led.get(other.id).reason) == (
+        "shadow_failed", "shadow did not run")
+    assert f"harm check {fix.id}: HistoryUnavailable: database is locked" in report.errors

@@ -19,6 +19,12 @@ measured cost. Anything that widens what Hermes can reach (a `new_reach` fix)
 is only proposed to you; it never applies without your reply. Once a week it
 writes one summary line, which the approvals bot sends.
 
+For job fixes (`job_prompt`, `composed_tool`, `reducer`) it also checks each
+shadow and trial run for harm (a tool that does not exist, a server cut off, many
+malformed calls, a failed run). A shadow that shows harm fails; a trial whose runs
+show harm is rolled back at the next cycle, and the approvals bot sends one line
+about it.
+
 ## Where state lives
 
 All under `~/.hermes/tuner/` (mode 700, files 600):
@@ -36,6 +42,7 @@ All under `~/.hermes/tuner/` (mode 700, files 600):
 | `shadow/<session>.jsonl` | what a shadow session tried to do (one intent per line) |
 | `proposals/<id>.json` | `new_reach` proposals waiting for your reply |
 | `outbox/weekly-<year>-W<week>.txt` | the weekly line waiting to be sent (renamed to `.sent` after) |
+| `outbox/rollback-<id>.txt` | one line about a rollback waiting to be sent, like the weekly line: `tuner rolled back <id> (<job name>): <reason>`. Written for every real rollback except `owner_changed`; a dry run writes none |
 | `.lock` | held while a cycle runs; a second run prints `already running` and exits |
 
 ## Read the ledger
@@ -51,7 +58,7 @@ with `date -d @1754400000`). States:
 | State | Meaning |
 |---|---|
 | `shadow_pending` | drafted; waiting for its shadow run to be compared |
-| `shadow_failed` | the shadow run did not match or did not run; nothing was applied. For a composed tool it also fails when the shadow never called the fix's tool (`shadow never called <tool>`) or any call to it failed (`<tool> failed N of M calls`). Any shadow fails when another composed tool that is not live served it (`shadow used <tool>, which is not live and not this fix's tool`) |
+| `shadow_failed` | the shadow run did not match or did not run; nothing was applied. For a composed tool it also fails when the shadow never called the fix's tool (`shadow never called <tool>`) or any call to it failed (`<tool> failed N of M calls`). A job fix whose shadow shows harm fails with `harm: <signal>` (see Harm checks below). Any shadow fails when another composed tool that is not live served it (`shadow used <tool>, which is not live and not this fix's tool`) |
 | `rejected` | the draft broke a rule; see `reason` |
 | `proposed` | `new_reach` change waiting for your `tool` or `drop` reply |
 | `approved` | you approved it; the next run applies it |
@@ -59,12 +66,48 @@ with `date -d @1754400000`). States:
 | `trial` | applied; its cost is being measured against the baseline |
 | `applied` | applied by an approved proposal |
 | `kept` | the trial saved enough; it stays |
-| `rolled_back` | undone, and `before.json` was restored exactly |
+| `rolled_back` | undone, and `before.json` was restored exactly. `reason` is `harm: <signal> (early)` when a trial run showed harm, and a rollback notice was written to `outbox/` |
 | `owner_changed` | the tuner wanted to undo it but you had changed the value since; it left your value alone (`reason` names which part) |
 | `bridge_error` | a Hermes call failed; nothing was left half-applied (`reason` has the error) |
 
 `trial`, `applied` and `shadow_pending` count as active; the tuner starts no
 second fix on a target that has one.
+
+## Harm checks and the tuner notes block
+
+Harm checks apply only to job fixes. Signals, per run:
+
+- `unknown_tool`: a tool call failed as unknown, the fix's own text names that tool, and it is neither registered in Hermes nor a live composed tool.
+- `server_tripped`: calls to an MCP server failed with tool errors, then the server was reported unreachable.
+- `self_inflicted_errors`: at least 3 malformed or failed calls, and an error share above twice the job's recent baseline plus 0.05.
+- `run_failed`: the job's last run ended in `error` or its delivery failed, and no other job failed within 6 hours of it.
+
+Google API failures (`API error in ...`) are outages and never count as harm.
+A shadow with a signal fails as `harm: <signal>`. A trial run with a signal rolls
+the fix back at the next cycle as `harm: <signal> (early)`, and the cycle writes
+`outbox/rollback-<id>.txt`. The drafting model sees these as the reason classes
+`harm_unknown_tool`, `harm_server_tripped`, `harm_self_inflicted_errors` and
+`harm_run_failed`, and is told not to repeat that design.
+
+Kill switch: `HARM_CHECKS` in `tuner/hermes_tuner/policy.py`. Set it to `False` to
+stop all harm checks. It is a code constant, so change it in a commit; the change
+takes effect when harness-pull deploys it.
+
+A job prompt edit may only add or replace one block at the end of the prompt,
+between these exact lines:
+
+```
+--- tuner notes (written by hermes-tuner; replaced on each edit) ---
+--- end tuner notes ---
+```
+
+The text outside the block must stay byte-identical, or the tuner rejects the
+draft. Fixes drafted before this rule (old format) are not affected.
+
+To edit a job prompt by hand, change only the text outside the markers. To remove
+the tuner's notes, delete from the blank line before the START line through the
+END line. Do not type either marker line in your own text: a stray copy makes
+every later tuner edit for that job fail closed.
 
 ## Roll back a fix by hand
 

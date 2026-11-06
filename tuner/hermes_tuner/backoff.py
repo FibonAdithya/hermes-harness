@@ -12,7 +12,7 @@ import json
 import re
 from typing import Literal
 
-from . import policy
+from . import harm, policy
 from .budget import DAY
 from .draft import HISTORY_LEN, top_fields
 from .ledger import FixRecord
@@ -32,6 +32,8 @@ REPLAY_OUTAGES = ("replay: history unavailable", "replay: no time left",
 def reason_class(rec: FixRecord) -> str:
     """The outcome class of a record; "" for records that are not failed drafts."""
     reason = rec.reason or ""
+    if reason.startswith("harm: ") and reason[6:].split(" ")[0] in harm.SIGNALS:
+        return f"harm_{reason[6:].split(' ')[0]}"
     if rec.state == "rejected":
         if COPY_TEXT in reason:
             return "copy"
@@ -107,9 +109,15 @@ def backoff(records: list[FixRecord], candidate_key: str, current_hash: str,
     return "ok"
 
 
+def _drafted_field(rec: FixRecord, field: str) -> str:
+    """The payload field the drafting model wrote for `field`: a job_prompt fix's model
+    writes "block", which the tuner splices into "prompt" before the copy check."""
+    return "block" if rec.kind == "job_prompt" and field == "prompt" else field
+
+
 def draft_history(records: list[FixRecord], candidate_key: str) -> list[dict]:
     """The candidate's last HISTORY_LEN outcomes, newest first, as class and field
-    names only: no ledger reason text."""
+    names only (the fields the model wrote): no ledger reason text."""
     return [{"kind": r.kind, "state": r.state, "reason_class": reason_class(r),
-             "fields": copy_fields(r)}
+             "fields": [_drafted_field(r, f) for f in copy_fields(r)]}
             for r in _newest_first(records, candidate_key)[:HISTORY_LEN]]

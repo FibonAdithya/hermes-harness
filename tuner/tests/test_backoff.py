@@ -24,6 +24,20 @@ def rej(kind, reason, t, ih=h, key=KEY):
     return rec(kind, "rejected", reason, t, ih, key)
 
 
+@pytest.mark.parametrize("state, reason, cls", [
+    ("rolled_back", "harm: unknown_tool (early)", "harm_unknown_tool"),
+    ("shadow_failed", "harm: server_tripped", "harm_server_tripped"),
+    ("rolled_back", "harm: self_inflicted_errors (early)", "harm_self_inflicted_errors"),
+    ("rolled_back", "harm: run_failed (early)", "harm_run_failed"),
+    ("rolled_back", "harm: bogus (early)", "trial"),
+    ("shadow_failed", "harm: bogus", "shadow"),
+    ("rolled_back", "trial: not cheaper than baseline", "trial")])
+def test_reason_class_maps_harm_reasons(state, reason, cls):
+    """Catches: harm reasons falling into the generic trial/shadow class, or an
+    unknown signal name becoming a class."""
+    assert reason_class(rec("job_prompt", state, reason, 1.0)) == cls
+
+
 # --- reason_class -----------------------------------------------------------------------
 
 @pytest.mark.parametrize("kind, state, reason, want", [
@@ -266,6 +280,19 @@ def test_draft_history_newest_three_with_class_and_fields_only():
         {"kind": "unparseable", "state": "rejected", "reason_class": "unparseable",
          "fields": []},
         {"kind": "job_prompt", "state": "rejected", "reason_class": "copy",
-         "fields": ["prompt"]},
+         "fields": ["block"]},
         {"kind": "job_prompt", "state": "kept", "reason_class": "", "fields": []},
     ]
+
+
+def test_draft_history_names_the_field_the_model_writes():
+    """A job_prompt fix's model writes payload.block; the tuner splices it into
+    payload.prompt, which the copy check names. A composed tool's model writes
+    job_prompt itself. Catches: "prompt" shown to the model for a job_prompt copy
+    rejection, the mapping applied to other kinds, or the ledger reason rewritten."""
+    jp = rej("job_prompt", f"payload.prompt: {COPY}; payload.add_toolsets[0]: {COPY}", 1.0)
+    ct = rej("composed_tool", f"payload.job_prompt: {COPY}; payload.prompt: {COPY}", 2.0)
+    assert [h["fields"] for h in draft_history([jp, ct], KEY)] == [
+        ["job_prompt", "prompt"], ["block", "add_toolsets"]]
+    assert jp.reason == f"payload.prompt: {COPY}; payload.add_toolsets[0]: {COPY}"
+    assert copy_fields(jp) == ["prompt", "add_toolsets"]

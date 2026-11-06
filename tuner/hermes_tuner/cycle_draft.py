@@ -28,6 +28,7 @@ from .ledger import (ACTIVE_STATES, APPLIED_STATES, BASE_KEY, FixRecord, _Failed
 from .limits import LimitContext, changeable_settings, check_fix
 from .measure import priced_cost
 from .model import Fix, Session
+from .prompt_block import with_prompt
 from .proposals import approved_callables, write_proposal
 from .replay import composed_gate, composed_monthly, replay_composed, search_reducer
 
@@ -353,6 +354,7 @@ class DraftSteps:
         if fix is None:
             self._spend_record(cand, spend, "unparseable", "unparseable draft")
             return spend, False
+        fix = with_prompt(fix, job)
         try:
             return self._act(cand, job, fix, spend, bundled)
         except Exception as exc:  # noqa: BLE001 - keep the spend, report, go on
@@ -567,12 +569,17 @@ class DraftSteps:
         tools_dir = self.root / "tools"
         existing = frozenset(p.name for p in tools_dir.iterdir() if p.is_dir()) \
             if tools_dir.is_dir() else frozenset()
+        registered = self._registered_tools()
         ctx = LimitContext(
             copy_index=self.copy_index(), scan=self.bridge.scan,
             bundled_skills=bundled or frozenset(), skills_root=Path(self.cfg.skills_root),
             approved_callables=approved_callables(self.root, self.cfg.broker_state),
             existing_tools=existing, config_settings=self._settings(),
-            trusted_texts=_job_texts(job))
+            trusted_texts=_job_texts(job),
+            job_prompt=job.get("prompt") if isinstance(job, dict) else None,
+            live_tools=self._live_tools(),
+            registered_tools=registered if self.registered_ok else None,
+            job_policy=policy.EDITABLE_JOBS.get(fix.target))
         return reasons + check_fix(fix, ctx)
 
     def _shadow(self, fix: Fix, job: dict | None, spend: float) -> bool:

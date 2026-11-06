@@ -115,6 +115,7 @@ class Bridge(Protocol):
     def config_settings(self, prefixes: list[str]) -> dict[str, Any]: ...
     def oneshot(self, instructions: str, user_input: str, max_tokens: int) -> dict: ...
     def pricing(self) -> dict: ...
+    def registered_tools(self) -> dict: ...
     def restart_gateway(self) -> None: ...
 
 
@@ -202,6 +203,10 @@ class HermesBridge:
         """The configured main model's list prices (see bridge_entry.pricing)."""
         return self._call("pricing")
 
+    def registered_tools(self):
+        """{"native", "mcp", "mcp_complete"} (see bridge_entry.registered_tools)."""
+        return self._call("registered_tools")
+
     def restart_gateway(self):
         try:
             p = self._run(["systemctl", "--user", "restart", "hermes-gateway"],
@@ -232,7 +237,10 @@ class FakeBridge:
                  oneshot_script: list[dict] | None = None, fail: set[str] | None = None,
                  scan: Callable[[str], list[str]] | None = None,
                  price: dict | None = None,
-                 string_default_keys: set[str] | None = None):
+                 string_default_keys: set[str] | None = None,
+                 tools: dict | None = None):
+        self.tools = copy.deepcopy(tools if tools is not None else
+                                   {"native": [], "mcp": [], "mcp_complete": False})
         self.string_default_keys = set(string_default_keys or ())
         self.price = copy.deepcopy(FAKE_PRICE if price is None else price)
         self.jobs = copy.deepcopy(jobs or {})
@@ -318,6 +326,10 @@ class FakeBridge:
     def pricing(self):
         self._enter("pricing")
         return copy.deepcopy(self.price)
+
+    def registered_tools(self):
+        self._enter("registered_tools")
+        return copy.deepcopy(self.tools)
 
     def restart_gateway(self):
         self._enter("restart_gateway")

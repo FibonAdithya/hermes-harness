@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
 
-from . import policy, trial
+from . import harm, policy, prompt_block, trial
 from .bridge import Bridge, BridgeError
 from .budget import DAY, JOB_KINDS, weekly_line
 from .cycle_draft import GLOBAL_KINDS, DraftSteps
@@ -141,11 +141,30 @@ class _Cycle(DraftSteps):
         self._config_settings: dict | None = None
         self._plugin_ok: bool | None = None
         self.pricing: Pricing | None = None
+        self._registered: frozenset[str] | None = None
+        self._jobs_cache: list[dict] | BridgeError | None = None
+        self.registered_ok: bool | None = None
 
     # --- plumbing -----------------------------------------------------------------
 
     def err(self, msg: str) -> None:
         self.report.errors.append(msg)
+
+    def _registered_tools(self) -> frozenset[str]:
+        """Registered native and MCP tool names, one bridge call per cycle. Empty on a
+        BridgeError or a malformed result (logged once); registered_ok says which."""
+        if self._registered is None:
+            try:
+                got = self.bridge.registered_tools()
+                self._registered = frozenset(got["native"]) | frozenset(got["mcp"])
+                self.registered_ok = True
+            except BridgeError as exc:
+                self.err(f"registered_tools: {exc}")
+                self._registered, self.registered_ok = frozenset(), False
+            except (KeyError, TypeError) as exc:
+                self.err(f"registered_tools: malformed result: {type(exc).__name__}")
+                self._registered, self.registered_ok = frozenset(), False
+        return self._registered
 
     def plan(self, msg: str) -> None:
         self.report.planned.append(msg)
@@ -340,6 +359,14 @@ class _Cycle(DraftSteps):
             if reason is not None:
                 self._shadow_failed(rec, reason)
                 continue
+            try:
+                sig = self._harm(rec, shadow, before=shadow.started_at)
+            except HistoryUnavailable as exc:
+                self.err(f"harm check {rec.id}: {type(exc).__name__}: {exc}")
+                sig = None
+            if sig is not None:
+                self._shadow_failed(rec, f"harm: {sig}")
+                continue
             old = next((s for s in by_start if s.job_id == live and s.calls
                         and s.started_at > shadow.started_at), None)
             if old is None:
@@ -389,6 +416,47 @@ class _Cycle(DraftSteps):
                 return "fix has no valid composed tool"
             own = files[0]["name"]
         return trial.tool_check(self.history.call_results(shadow.id), own, self._live_tools())
+
+    def _harm(self, rec: FixRecord, run: Session, before: float, status: str | None = None,
+              delivery_failed: bool = False, outage: bool = False) -> str | None:
+        """The first harm signal for `run` of job fix `rec`, or None. The baseline is the
+        target job's own runs (not shadows) that started in the BASELINE_DAYS before
+        `before`. Lets HistoryUnavailable propagate."""
+        if not policy.HARM_CHECKS or rec.kind not in JOB_KINDS:
+            return None
+        low = before - trial.BASELINE_DAYS * DAY
+        rates = tuple(
+            harm.error_rate(self.history.call_results(s.id)) for s in self.sessions
+            if s.job_id == rec.target and s.calls and s.job_id not in self.shadow_ids
+            and low <= s.started_at < before)
+        try:
+            payload = self.ledger.fix(rec.id).payload
+        except (OSError, ValueError, TypeError):
+            payload = None
+        leaves: list[str] = []
+
+        def walk(v: object) -> None:
+            # A spliced prompt (P2) is the owner's text plus the tuner notes block; only
+            # the block is the fix's. A prompt without the block (recorded before P2) is
+            # wholly tuner-written.
+            if isinstance(v, str):
+                block = prompt_block.block_text(v)
+                leaves.append(v if block is None else block)
+            elif isinstance(v, dict):
+                for k, x in v.items():
+                    if k != BASE_KEY:
+                        walk(x)
+            elif isinstance(v, (list, tuple)):
+                for x in v:
+                    walk(x)
+
+        walk(payload)
+        evidence = harm.RunEvidence(
+            results=tuple(self.history.call_results(run.id)), status=status,
+            delivery_failed=delivery_failed, fix_kind=rec.kind,
+            tools=self._live_tools() | self._registered_tools(), fix_text="\n".join(leaves))
+        found = harm.signals(evidence, harm.Baseline(error_rates=rates, outage=outage))
+        return found[0] if found else None
 
     def _reduced_in(self, fix_id: str, shadow: Session) -> bool:
         """True when the plugin logged a reduction (a line with "after") by fix
@@ -549,6 +617,10 @@ class _Cycle(DraftSteps):
                 rec.trial_runs = len(runs)
                 self.ledger.save()
             if rec.live_from is not None and rec.kind in JOB_KINDS:
+                sig = self._harm_in_trial(rec, runs)
+                if sig is not None:
+                    self._rollback(rec, f"harm: {sig} (early)", runs)
+                    continue
                 failures, calls, worse = self._early_failures(rec, runs)
                 if failures >= trial.EARLY_FAIL_MIN or (
                         calls > 0 and failures / calls >= trial.EARLY_FAIL_SHARE):
@@ -586,6 +658,59 @@ class _Cycle(DraftSteps):
         keep = ((lambda s: s.job_id == rec.target) if rec.kind in JOB_KINDS else _global_run)
         return [s for s in self.sessions if s.started_at > rec.live_from and s.calls
                 and s.job_id not in self.shadow_ids and keep(s)]
+
+    def _job_list(self) -> list[dict]:
+        """The bridge's job list, one call per cycle. A BridgeError is cached and
+        re-raised so each caller can log it against its own record."""
+        if self._jobs_cache is None:
+            try:
+                self._jobs_cache = [j for j in self.bridge.list_jobs() if isinstance(j, dict)]
+            except BridgeError as exc:
+                self._jobs_cache = exc
+        if isinstance(self._jobs_cache, BridgeError):
+            raise self._jobs_cache
+        return self._jobs_cache
+
+    def _harm_in_trial(self, rec: FixRecord, runs: list[Session]) -> str | None:
+        """The first harm signal over a job fix's trial `runs` (oldest first), or None.
+        Job status (from list_jobs, not get_job) applies only to the newest run, and only
+        once the job has run since that run started and no later run of the job (one
+        with no tool calls, left out of `runs`) could have set it. A bridge or state.db
+        failure is logged and leaves the signals that need no bridge, or none."""
+        if not runs or rec.live_from is None:
+            return None
+        jobs: list[dict] = []
+        try:
+            jobs = self._job_list()
+        except BridgeError as exc:
+            self.err(f"harm status {rec.id}: {exc}")
+        mine = next((j for j in jobs if j.get("id") == rec.target), None)
+        try:
+            for run in runs:
+                status, delivery_failed = None, False
+                if run is runs[-1] and mine is not None:
+                    ran = trial._epoch(mine.get("last_run_at"))
+                    if ran is not None and ran >= run.started_at \
+                            and not self._ran_again(rec.target, run.started_at, ran):
+                        status = mine.get("last_status")
+                        delivery_failed = bool(mine.get("last_delivery_error"))
+                outage = any(
+                    j.get("id") != rec.target and j.get("last_status") == "error"
+                    and (t := trial._epoch(j.get("last_run_at"))) is not None
+                    and abs(t - run.started_at) <= harm.OUTAGE_WINDOW_S for j in jobs)
+                sig = self._harm(rec, run, rec.live_from, status, delivery_failed, outage)
+                if sig is not None:
+                    return sig
+        except HistoryUnavailable as exc:
+            self.err(f"harm check {rec.id}: {type(exc).__name__}: {exc}")
+        return None
+
+    def _ran_again(self, job_id: str, after: float, until: float) -> bool:
+        """True when a session of job `job_id` (a live job, so never a shadow), with or
+        without tool calls, started in (after, until]: the job's last status may be that
+        run's."""
+        return any(s.job_id == job_id and after < s.started_at <= until
+                   for s in self.sessions)
 
     def _early_failures(self, rec: FixRecord, runs: list[Session]
                         ) -> tuple[int, int, tuple[float, float] | None]:
@@ -710,6 +835,16 @@ class _Cycle(DraftSteps):
             out.reason = reason
             self.restart_wanted |= out.needs_restart
         self.ledger.save()
+        if out.state == "rolled_back":
+            jobs = self._jobs_cache if isinstance(self._jobs_cache, list) else []
+            name = next((j.get("name") for j in jobs if j.get("id") == rec.target
+                         and isinstance(j.get("name"), str)), rec.target)
+            note = f"tuner rolled back {rec.id} ({name}): {out.reason}\n"
+            try:
+                atomic_write(self.root / "outbox" / f"rollback-{rec.id}.txt",
+                             note.encode("utf-8"))
+            except OSError as exc:
+                self.err(f"rollback notice {rec.id}: {type(exc).__name__}: {exc}")
         self.report.rolled_back.append(rec.id)
 
     # 4. proposals ----------------------------------------------------------------------
