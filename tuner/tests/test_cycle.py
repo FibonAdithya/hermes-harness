@@ -540,7 +540,7 @@ ARG_ERR = json.dumps({"error": "Error calling tool 'get_gmail_message_content': 
 
 def shadow_setup(env, old_mod, new_mod, composed=False, live=True, base_runs=None,
                  shadow_ids=("m1", "m2"), tool_results=(TOOL_OK,), extra_calls=(),
-                 legacy_tool=False, prompt="new prompt"):
+                 legacy_tool=False, prompt="new prompt", base_prompt="Triage the inbox."):
     """A shadow-pending triage fix whose shadow ran at 06:40 yesterday and (if `live`)
     a live run at 07:00. `composed`: a composed_tool fix needing a restart, with the
     tool dir written as at shadow scheduling, whose shadow called tuned_triage once per
@@ -562,7 +562,7 @@ def shadow_setup(env, old_mod, new_mod, composed=False, live=True, base_runs=Non
                                    (GET, {"message_id": "m2"}, "b")] + old_mod})
     build(env, sessions)
     SETUP_SESSIONS[env.root] = sessions
-    base = {"_base": {"prompt": "Triage the inbox.", "enabled_toolsets": ["google"]}}
+    base = {"_base": {"prompt": base_prompt, "enabled_toolsets": ["google"]}}
     if composed:
         fix = Fix("20261018-bbbb0002", "composed_tool", TRIAGE, dict(TOOL) | base, "seq:x")
         write_shadow_tool(env.root / "tools", fix.payload, fix.id)
@@ -587,10 +587,12 @@ def shadow_setup(env, old_mod, new_mod, composed=False, live=True, base_runs=Non
 
 # --- harm checks ---------------------------------------------------------------------
 
-def passing_shadow(env, extra_calls=(), prompt="Fetch mail with tuned_x."):
+def passing_shadow(env, extra_calls=(), prompt="Fetch mail with tuned_x.",
+                   base_prompt="Triage the inbox."):
     return shadow_setup(env, old_mod=[(MOD, {"message_id": "m2", "add_label_ids": ["TRASH"]}, "ok")],
                         new_mod=[{"message_id": "m2", "add_label_ids": ["TRASH"]}],
-                        extra_calls=list(extra_calls), prompt=prompt)
+                        extra_calls=list(extra_calls), prompt=prompt,
+                        base_prompt=base_prompt)
 
 
 def test_shadow_that_looks_up_a_missing_tool_fails(env):
@@ -2820,6 +2822,39 @@ def test_shadow_harm_reads_only_the_tuner_notes_block(env, prompt, state, reason
     without markers contributing nothing (the third)."""
     fix = passing_shadow(env, [("tool_describe", {}, UNKNOWN)], prompt=prompt)
     run_cycle(env, FakeBridge(jobs=jobs()), NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert (rec.state, rec.reason) == (state, reason)
+
+
+def test_shadow_harm_ignores_the_owner_prompt_recorded_as_base(env):
+    """The fix payload records the job as drafted against under BASE_KEY; for a P2
+    prompt that is the owner's text, which here names tuned_x. Only the tuner notes
+    block is the fix's. Catches: _harm's walk reading the BASE_KEY entry as fix text."""
+    owner = "Fetch mail with tuned_x."
+    fix = passing_shadow(env, [("tool_describe", {}, UNKNOWN)],
+                         prompt=splice(owner, "Skip mail already starred."), base_prompt=owner)
+    live = jobs()
+    live[TRIAGE]["prompt"] = owner
+    run_cycle(env, FakeBridge(jobs=live), NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert (rec.state, rec.reason) == ("trial", "")
+
+
+NOT_DEFERRABLE_CORE = json.dumps({"error": "'terminal' is not a deferrable tool. If you see "
+                                           "it in the tools list already, call it directly."})
+
+
+@pytest.mark.parametrize("native, state, reason", [
+    (["terminal"], "trial", ""),
+    ([], "shadow_failed", "harm: unknown_tool")])
+def test_shadow_harm_excuses_registered_core_tools(env, native, state, reason):
+    """Hermes answers "not a deferrable tool" for core tools too; one the bridge lists as
+    registered is not an unknown tool even when the fix names it. Catches: the cycle not
+    passing _registered_tools() into RunEvidence.tools (the first case fails)."""
+    fix = passing_shadow(env, [("tool_describe", {}, NOT_DEFERRABLE_CORE)],
+                         prompt="Run terminal for the summary.")
+    tools = {"native": native, "mcp": [], "mcp_complete": True}
+    run_cycle(env, FakeBridge(jobs=jobs(), tools=tools), NOW)
     rec = Ledger.load(env.root).get(fix.id)
     assert (rec.state, rec.reason) == (state, reason)
 
