@@ -20,7 +20,7 @@ export it fails with "Failed to connect to bus: No medium found".
 | droplet | `~/.local/bin/hermes-wiki-sync.sh` (symlink), pull-rebase then push | `droplet/hermes-wiki-sync.sh`, `droplet/wiki-git-sync.sh` |
 | droplet | `~/.hermes/scripts/wiki-worklist.py` (copy; Hermes only runs `--script` files from there), refreshed by `harness-pull` | `droplet/wiki-worklist.py` |
 | droplet | `~/.hermes/skills/wiki/delegate-with-context/` | `droplet/skills/delegate-with-context/` |
-| droplet | `wiki-curator` cron job, 03:00 | prompt in `droplet/wiki-curator-prompt.md` |
+| droplet | `wiki-curator` cron job, 01:00 (moved from 03:00 on 2026-11-09 so it ends before the tuner's 02:00–05:00 restart window) | prompt in `droplet/wiki-curator-prompt.md` |
 | laptop | `hermes-wiki` CLI, `wiki` MCP server, SessionEnd hook | `wiki/install-laptop.sh` |
 | box | wiki mirror and public export at `~/TIG/hermes-wiki-public` | `box/install.sh` |
 
@@ -124,7 +124,7 @@ Then wait for one droplet sync (up to 15 minutes, or
 ### 5. Droplet: create the curator
 
 ```bash
-hermes cron create "0 3 * * *" "$(cat ~/hermes-harness/droplet/wiki-curator-prompt.md)" --name wiki-curator --script wiki-worklist.py --deliver telegram:8887384436 --model deepseek/deepseek-v4-pro --provider nous
+hermes cron create "0 1 * * *" "$(cat ~/hermes-harness/droplet/wiki-curator-prompt.md)" --name wiki-curator --script wiki-worklist.py --deliver telegram:8887384436 --model deepseek/deepseek-v4-pro --provider nous
 ```
 
 Expected: the new job's id. Restrict its tools (`hermes cron create` has no
@@ -237,7 +237,7 @@ check (acceptance check 13).
 
 ## Day to day
 
-- **The curator's report** arrives on Telegram after 03:00 when it changed
+- **The curator's report** arrives on Telegram after 01:00 when it changed
   something. "Conflicts that need you" lists pages where two verified facts
   disagree; both are on the page with dates.
 - **Quarantined notes** are gone from `inbox/` but kept in git history:
