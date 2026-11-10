@@ -3003,3 +3003,52 @@ def test_chat_counts_against_global_while_a_job_change_is_on_trial(env):
     led = Ledger.load(env.root)
     assert led.get(cfg_fix.id).state == "rolled_back"
     assert led.get(fix.id).state == "trial"
+
+
+OUTSIDE_JOB = "aaaabbbbcccc"  # a cron job outside policy.EDITABLE_JOBS (OTHER is taken, l.1076)
+
+
+def global_trial_with_runs(env):
+    cfg_fix = config_trial(env, applied_days_ago=0)
+    t_cal = NOW - 3 * 3600 + 6 * 3600 + DAY     # day-1 calendar run, 06:00
+    cal = {"id": sid(CAL, t_cal), "source": "cron", "started_at": t_cal, "cost": 0.0,
+           "in": 10_000, "out": 10,
+           "calls": [("mcp__google__get_events", {"calendar_id": "primary"}, "events")]}
+    build(env, [cal, later_run([], day=1)])      # calendar (06:00) is never the last run
+    return cfg_fix, FakeBridge(jobs=jobs(), config={CFG_KEY: 0.7}), t_cal
+
+
+def test_global_trial_run_failed_reads_each_jobs_own_status(env):
+    """Calendar's run failed; triage's is fine.
+    Catches: status read only for rec.target (a config key, so never), or only for
+    the last run in list order."""
+    cfg_fix, bridge, t_cal = global_trial_with_runs(env)
+    bridge.jobs[CAL] |= {"last_status": "error", "last_run_at": iso(t_cal + 60)}
+    run_cycle(env, bridge, NOW + 2 * DAY)
+    rec = Ledger.load(env.root).get(cfg_fix.id)
+    assert (rec.state, rec.reason) == ("rolled_back", "harm: run_failed (early)")
+
+
+@pytest.mark.parametrize("other, rolled", [(CAL, True), (OUTSIDE_JOB, False)])
+def test_global_outage_only_from_jobs_outside_the_trial_set(env, other, rolled):
+    """Triage failed, and another job failed within the outage window.
+    Catches: calendar excusing triage under a global change, or no outage test at all."""
+    cfg_fix, bridge, t_cal = global_trial_with_runs(env)
+    t = NOW - 3 * 3600 + 7 * 3600 + DAY
+    bridge.jobs[TRIAGE] |= {"last_status": "error", "last_run_at": iso(t + 60)}
+    bridge.jobs.setdefault(other, jobs()[CAL] | {"id": other, "name": "other"})  # full job shape
+    bridge.jobs[other] |= {"last_status": "error", "last_run_at": iso(t + 120)}
+    run_cycle(env, bridge, NOW + 2 * DAY)
+    rec = Ledger.load(env.root).get(cfg_fix.id)
+    assert (rec.state == "rolled_back") is rolled
+
+
+def test_global_trial_harm_survives_job_status_failure(env):
+    """Review Focus 4. Catches: a list_jobs failure aborting the global check."""
+    cfg_fix = config_trial(env, applied_days_ago=0)
+    build(env, [chat(NOW + DAY, TRIPPED)])
+    bridge = FakeBridge(jobs=jobs(), config={CFG_KEY: 0.7})
+    bridge.fail = {"list_jobs"}
+    report = run_cycle(env, bridge, NOW + 2 * DAY)
+    assert Ledger.load(env.root).get(cfg_fix.id).state == "rolled_back"
+    assert any(e.startswith(f"harm status {cfg_fix.id}:") for e in report.errors)

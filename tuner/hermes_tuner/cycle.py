@@ -692,9 +692,12 @@ class _Cycle(DraftSteps):
         """The first harm signal over a fix's trial `runs` (oldest first), or None. For a
         config or skill fix, runs owned by a live job change are skipped first: that
         change is blamed for them (_owned_by_job_change).
-        Job status (from list_jobs, not get_job) applies only to the newest run, and only
-        once the job has run since that run started and no later run of the job (one
-        with no tool calls, left out of `runs`) could have set it. A bridge or state.db
+        Job status (from list_jobs, not get_job) applies only to a job's newest run in
+        `runs` (a job fix: its target's; a config or skill fix: each editable job's own),
+        and only once the job has run since that run started and no later run of the job
+        (one with no tool calls, left out of `runs`) could have set it. Outage means a
+        job in error outside the change's own jobs (its target; for a config or skill
+        fix, every editable job). A bridge or state.db
         failure is logged and leaves the signals that need no bridge, or none."""
         if rec.kind in GLOBAL_KINDS:
             runs = [r for r in runs if not self._owned_by_job_change(r)]
@@ -705,18 +708,29 @@ class _Cycle(DraftSteps):
             jobs = self._job_list()
         except BridgeError as exc:
             self.err(f"harm status {rec.id}: {exc}")
-        mine = next((j for j in jobs if j.get("id") == rec.target), None)
+        by_id = {j.get("id"): j for j in jobs}
+        is_global = rec.kind in GLOBAL_KINDS
+        # Jobs a change on trial may be blamed for: its own target, or any editable job.
+        own = set(policy.EDITABLE_JOBS) if is_global else {rec.target}
+        newest: dict[str, Session] = {}
+        for r in runs:
+            if r.job_id in own and (r.job_id not in newest
+                                    or r.started_at >= newest[r.job_id].started_at):
+                newest[r.job_id] = r
         try:
             for run in runs:
                 status, delivery_failed = None, False
-                if run is runs[-1] and mine is not None:
+                jid = run.job_id if is_global else rec.target
+                mine = by_id.get(jid) if jid in own else None
+                if mine is not None and (newest.get(jid) is run if is_global
+                                         else run is runs[-1]):
                     ran = trial._epoch(mine.get("last_run_at"))
                     if ran is not None and ran >= run.started_at \
-                            and not self._ran_again(rec.target, run.started_at, ran):
+                            and not self._ran_again(jid, run.started_at, ran):
                         status = mine.get("last_status")
                         delivery_failed = bool(mine.get("last_delivery_error"))
                 outage = any(
-                    j.get("id") != rec.target and j.get("last_status") == "error"
+                    j.get("id") not in own and j.get("last_status") == "error"
                     and (t := trial._epoch(j.get("last_run_at"))) is not None
                     and abs(t - run.started_at) <= harm.OUTAGE_WINDOW_S for j in jobs)
                 sig = self._harm(rec, run, rec.live_from, status, delivery_failed, outage)
