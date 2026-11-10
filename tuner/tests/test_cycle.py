@@ -1,6 +1,7 @@
 """The daily cycle, end to end on a real temp state.db, a FakeBridge and a tmp root."""
 from __future__ import annotations
 
+import base64
 import fcntl
 import gzip
 import json
@@ -3052,3 +3053,45 @@ def test_global_trial_harm_survives_job_status_failure(env):
     report = run_cycle(env, bridge, NOW + 2 * DAY)
     assert Ledger.load(env.root).get(cfg_fix.id).state == "rolled_back"
     assert any(e.startswith(f"harm status {cfg_fix.id}:") for e in report.errors)
+
+
+def skill_trial(env, applied_days_ago=0):
+    """A skill change on trial: the file holds the new text; before.json holds the old."""
+    skill = env.skills_root / "notes" / "SKILL.md"
+    skill.parent.mkdir(exist_ok=True)
+    old, new = "---\nname: notes\n---\nold\n", "---\nname: notes\n---\nnew\n"
+    skill.write_text(new)
+    fix = Fix("20261011-dddd0002", "skill", "notes", {"path": "notes/SKILL.md", "text": new},
+              "skill_load:notes")
+    led = add_record(env, FixRecord(fix.id, "skill", "notes", fix.candidate_key, "trial",
+                                    NOW - applied_days_ago * DAY,
+                                    applied_at=NOW - applied_days_ago * DAY,
+                                    live_from=NOW - applied_days_ago * DAY,
+                                    baseline_runs=[brk(0.10)] * 20), fix)
+    vdir = led.version_dir(fix.id)
+    (vdir / "before.json").write_text(json.dumps({
+        "file": str(skill), "mode": 0o644, "b64": base64.b64encode(old.encode()).decode()}))
+    (vdir / "after.json").write_text(json.dumps({"file": str(skill), "text": new}))
+    return fix, skill, old
+
+
+def test_skill_trial_rolls_back_on_a_harmful_chat(env):
+    """A chat whose MCP server tripped, after a skill change went live.
+    Catches: harm checks limited to JOB_KINDS | {"config"} instead of GLOBAL_KINDS."""
+    fix, skill, old = skill_trial(env)
+    build(env, [chat(NOW + DAY, TRIPPED)])
+    run_cycle(env, FakeBridge(jobs=jobs()), NOW + 2 * DAY)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert (rec.state, rec.reason) == ("rolled_back", "harm: server_tripped (early)")
+    assert skill.read_text() == old
+
+
+def test_skill_trial_harm_leaves_an_owner_edit_alone(env):
+    """Spec 7: the harm rollback of a skill the owner edited since apply is owner_changed.
+    Catches: the early-harm path bypassing the owner-change check for skills."""
+    fix, skill, old = skill_trial(env)
+    skill.write_text("---\nname: notes\n---\nowner's own edit\n")
+    build(env, [chat(NOW + DAY, TRIPPED)])
+    run_cycle(env, FakeBridge(jobs=jobs()), NOW + 2 * DAY)
+    assert Ledger.load(env.root).get(fix.id).state == "owner_changed"
+    assert skill.read_text() == "---\nname: notes\n---\nowner's own edit\n"

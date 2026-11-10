@@ -75,16 +75,22 @@ second fix on a target that has one.
 
 ## Harm checks and the tuner notes block
 
-Harm checks apply only to job fixes. Signals, per run:
+Harm checks apply to job fixes and to config and skill fixes on trial. Shadows
+exist only for job fixes. While a job fix on job J is live, J's runs are judged
+only against the job fix; they count against a config or skill fix again once the
+job fix is kept or rolled back. Signals, per run:
 
 - `unknown_tool`: a tool call failed as unknown, the fix's own text names that tool, and it is neither registered in Hermes nor a live composed tool.
 - `server_tripped`: calls to an MCP server failed with tool errors, then the server was reported unreachable.
-- `self_inflicted_errors`: at least 3 malformed or failed calls, and an error share above twice the job's recent baseline plus 0.05.
-- `run_failed`: the job's last run ended in `error` or its delivery failed, and no other job failed within 6 hours of it.
+- `self_inflicted_errors`: at least 3 malformed or failed calls, and an error share above twice the baseline plus 0.05. The baseline is per group,
+  over the 28 days before the fix went live: for a job fix, the target job's runs;
+  for a config or skill fix, chats are judged against chats and each editable job
+  against its own runs.
+- `run_failed`: the job's last run ended in `error` or its delivery failed, and no other job failed within 6 hours of it. For a config or skill fix, each editable job's own last status applies to that job's newest trial run, and only jobs outside the editable set (triage, calendar) count as an outage.
 
 Google API failures (`API error in ...`) are outages and never count as harm.
-A shadow with a signal fails as `harm: <signal>`. A trial run with a signal rolls
-the fix back at the next cycle as `harm: <signal> (early)`, and the cycle writes
+A shadow with a signal fails as `harm: <signal>`. One live run with a signal, under a job, config or
+skill fix on trial, rolls the fix back at the next cycle as `harm: <signal> (early)`, and the cycle writes
 `outbox/rollback-<id>.txt`. The drafting model sees these as the reason classes
 `harm_unknown_tool`, `harm_server_tripped`, `harm_self_inflicted_errors` and
 `harm_run_failed`, and is told not to repeat that design.
