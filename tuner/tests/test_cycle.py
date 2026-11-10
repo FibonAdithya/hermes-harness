@@ -2957,3 +2957,49 @@ def test_history_failure_in_shadow_harm_check_is_logged_and_the_cycle_continues(
     assert (led.get(other.id).state, led.get(other.id).reason) == (
         "shadow_failed", "shadow did not run")
     assert f"harm check {fix.id}: HistoryUnavailable: database is locked" in report.errors
+
+
+TRIPPED = [(GET, {}, ARG_ERR), (GET, {}, DOWN)]  # server_tripped, no baseline needed
+
+
+def both_on_trial(env):
+    fix, bridge = job_prompt_trial(env)       # job change on triage, live from NOW
+    cfg_fix = config_trial(env, applied_days_ago=0)   # config change, live from NOW
+    bridge.config[CFG_KEY] = 0.7  # keep plugins.enabled, which the FakeBridge wrapper sets
+    return fix, cfg_fix, bridge
+
+
+@pytest.mark.parametrize("new_bad_run", [False, True], ids=["no_new_bad_run", "new_bad_run"])
+def test_job_change_first_when_both_on_trial(env, new_bad_run):
+    """Day 1: a tripped triage run, both changes live. Only the job change goes.
+    Day 3, after it went: the config goes only if triage is still bad.
+    Catches: no skip (config goes on day 1); a skip keyed on the job change's state at
+    cycle time (config goes on day 3 for the day-1 run); skipping triage forever."""
+    fix, cfg_fix, bridge = both_on_trial(env)
+    env.db.unlink()
+    build(env, SETUP_SESSIONS[env.root] + [later_run(TRIPPED, day=1)])
+    run_cycle(env, bridge, NOW + 2 * DAY)
+    led = Ledger.load(env.root)
+    assert (led.get(fix.id).state, led.get(fix.id).reason) == (
+        "rolled_back", "harm: server_tripped (early)")
+    assert led.get(cfg_fix.id).state == "trial"
+    env.db.unlink()
+    build(env, SETUP_SESSIONS[env.root] + [later_run(TRIPPED, day=1)]
+          + ([later_run(TRIPPED, day=3)] if new_bad_run else []))
+    run_cycle(env, bridge, NOW + 4 * DAY)
+    rec = Ledger.load(env.root).get(cfg_fix.id)
+    if new_bad_run:
+        assert (rec.state, rec.reason) == ("rolled_back", "harm: server_tripped (early)")
+    else:
+        assert rec.state == "trial"
+
+
+def test_chat_counts_against_global_while_a_job_change_is_on_trial(env):
+    """Catches: skipping every run while any job change is live."""
+    fix, cfg_fix, bridge = both_on_trial(env)
+    env.db.unlink()
+    build(env, SETUP_SESSIONS[env.root] + [chat(NOW + DAY, TRIPPED)])
+    run_cycle(env, bridge, NOW + 2 * DAY)
+    led = Ledger.load(env.root)
+    assert led.get(cfg_fix.id).state == "rolled_back"
+    assert led.get(fix.id).state == "trial"

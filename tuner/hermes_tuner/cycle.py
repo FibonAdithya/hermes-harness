@@ -689,11 +689,15 @@ class _Cycle(DraftSteps):
         return self._jobs_cache
 
     def _harm_in_trial(self, rec: FixRecord, runs: list[Session]) -> str | None:
-        """The first harm signal over a job fix's trial `runs` (oldest first), or None.
+        """The first harm signal over a fix's trial `runs` (oldest first), or None. For a
+        config or skill fix, runs owned by a live job change are skipped first: that
+        change is blamed for them (_owned_by_job_change).
         Job status (from list_jobs, not get_job) applies only to the newest run, and only
         once the job has run since that run started and no later run of the job (one
         with no tool calls, left out of `runs`) could have set it. A bridge or state.db
         failure is logged and leaves the signals that need no bridge, or none."""
+        if rec.kind in GLOBAL_KINDS:
+            runs = [r for r in runs if not self._owned_by_job_change(r)]
         if not runs or rec.live_from is None:
             return None
         jobs: list[dict] = []
@@ -721,6 +725,15 @@ class _Cycle(DraftSteps):
         except HistoryUnavailable as exc:
             self.err(f"harm check {rec.id}: {type(exc).__name__}: {exc}")
         return None
+
+    def _owned_by_job_change(self, run: Session) -> bool:
+        """True when a job change on the run's job was live when the run started and was
+        not decided before it: that change is blamed for the run, not a global one.
+        Judged on the run's time, never on the change's current state."""
+        return any(j.kind in JOB_KINDS and j.target == run.job_id
+                   and j.live_from is not None and j.live_from < run.started_at
+                   and (j.decided_at is None or j.decided_at > run.started_at)
+                   for j in self.ledger.records)
 
     def _ran_again(self, job_id: str, after: float, until: float) -> bool:
         """True when a session of job `job_id` (a live job, so never a shadow), with or
