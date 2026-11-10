@@ -66,6 +66,12 @@ def _global_run(s: Session) -> bool:
     return s.source == "telegram" or s.job_id in policy.EDITABLE_JOBS
 
 
+def _run_group(s: Session) -> str:
+    """The group whose runs set a global fix's harm baseline: all chats are one group,
+    each job is its own."""
+    return "chat" if s.source == "telegram" else s.job_id or ""
+
+
 @dataclass(frozen=True)
 class CycleConfig:
     root: Path
@@ -419,15 +425,25 @@ class _Cycle(DraftSteps):
 
     def _harm(self, rec: FixRecord, run: Session, before: float, status: str | None = None,
               delivery_failed: bool = False, outage: bool = False) -> str | None:
-        """The first harm signal for `run` of job fix `rec`, or None. The baseline is the
-        target job's own runs (not shadows) that started in the BASELINE_DAYS before
-        `before`. Lets HistoryUnavailable propagate."""
-        if not policy.HARM_CHECKS or rec.kind not in JOB_KINDS:
+        """The first harm signal for `run` of fix `rec` (a job, config or skill fix), or
+        None. The baseline is runs (not shadows) that started in the BASELINE_DAYS before
+        `before`: the target job's own for a job fix; for a config or skill fix, the runs
+        in the same group as `run` (all chats, or one job). Lets HistoryUnavailable
+        propagate."""
+        if not policy.HARM_CHECKS or rec.kind not in JOB_KINDS | GLOBAL_KINDS:
             return None
         low = before - trial.BASELINE_DAYS * DAY
+        if rec.kind in JOB_KINDS:
+            def same(s: Session) -> bool:
+                return s.job_id == rec.target
+        else:
+            group = _run_group(run)
+
+            def same(s: Session) -> bool:
+                return _global_run(s) and _run_group(s) == group
         rates = tuple(
             harm.error_rate(self.history.call_results(s.id)) for s in self.sessions
-            if s.job_id == rec.target and s.calls and s.job_id not in self.shadow_ids
+            if same(s) and s.calls and s.job_id not in self.shadow_ids
             and low <= s.started_at < before)
         try:
             payload = self.ledger.fix(rec.id).payload
@@ -616,11 +632,12 @@ class _Cycle(DraftSteps):
             if rec.live_from is not None and rec.trial_runs != len(runs) and not self.dry:
                 rec.trial_runs = len(runs)
                 self.ledger.save()
-            if rec.live_from is not None and rec.kind in JOB_KINDS:
+            if rec.live_from is not None and rec.kind in JOB_KINDS | GLOBAL_KINDS:
                 sig = self._harm_in_trial(rec, runs)
                 if sig is not None:
                     self._rollback(rec, f"harm: {sig} (early)", runs)
                     continue
+            if rec.live_from is not None and rec.kind in JOB_KINDS:
                 failures, calls, worse = self._early_failures(rec, runs)
                 if failures >= trial.EARLY_FAIL_MIN or (
                         calls > 0 and failures / calls >= trial.EARLY_FAIL_SHARE):

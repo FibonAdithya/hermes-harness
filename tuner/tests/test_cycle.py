@@ -537,6 +537,9 @@ UNKNOWN = json.dumps({"error": "'mcp__google__tuned_x' is not a deferrable tool.
 ARG_ERR = json.dumps({"error": "Error calling tool 'get_gmail_message_content': "
                                "expected_sha256 and page_size require page_offset."})
 
+DOWN = json.dumps({"error": "MCP server 'google' is unreachable after 3 consecutive failures. "
+                            "Auto-retry available in ~58s."})
+
 
 def shadow_setup(env, old_mod, new_mod, composed=False, live=True, base_runs=None,
                  shadow_ids=("m1", "m2"), tool_results=(TOOL_OK,), extra_calls=(),
@@ -2337,17 +2340,59 @@ def test_trial_ignores_a_stale_tool_the_fix_does_not_name(env):
     assert Ledger.load(env.root).get(fix.id).state == "trial"
 
 
-def test_config_trial_ignores_harm(env):
-    """Three argument errors in a chat would trip self_inflicted_errors for a job fix.
-    Catches: harm applied to config or skill fixes, whose runs are every chat."""
+def test_config_trial_rolls_back_on_a_harmful_chat(env):
+    """One chat with three self-inflicted errors under a config change on trial.
+    Catches: harm checks still limited to JOB_KINDS (in judge_trials or _harm)."""
     fix = config_trial(env, applied_days_ago=2)
-    chat = {"id": "20261019_010000_ab12cd", "source": "telegram", "started_at": NOW - 2 * 3600,
-            "cost": 0.05, "in": 10_000, "out": 10,
-            "calls": [(GET, {}, ARG_ERR)] * 3}
-    build(env, [chat])
+    bad_chat = {"id": "20261019_010000_ab12cd", "source": "telegram", "started_at": NOW - 2 * 3600,
+            "cost": 0.05, "in": 10_000, "out": 10, "calls": [(GET, {}, ARG_ERR)] * 3}
+    build(env, [bad_chat])
     run_cycle(env, FakeBridge(jobs=jobs(), config={CFG_KEY: 0.7}), NOW)
     rec = Ledger.load(env.root).get(fix.id)
-    assert rec.state == "trial" and not (rec.reason or "").startswith("harm:")
+    assert (rec.state, rec.reason) == ("rolled_back", "harm: self_inflicted_errors (early)")
+
+
+def chat(t, calls):
+    return {"id": datetime.fromtimestamp(t, timezone.utc).strftime("%Y%m%d_%H%M%S") + "_c0ffee",
+            "source": "telegram", "started_at": t, "cost": 0.0, "in": 10_000, "out": 10,
+            "calls": calls}
+
+
+NOISY = [(GET, {}, ARG_ERR)] * 3 + [(GET, {"message_id": "m"}, "b")]  # error rate 0.75
+
+
+@pytest.mark.parametrize("trial_run, rolled", [("chat", False), ("triage", True)])
+def test_global_harm_baseline_is_per_group(env, trial_run, rolled):
+    """Chats before go-live erred at 0.75; triage runs at 0. The same 0.75 run after
+    go-live is normal for a chat and harmful for triage.
+    Catches: one baseline over all global runs (the chat fires), or a baseline keyed
+    on rec.target (empty for a config change, so the chat fires)."""
+    fix = config_trial(env, applied_days_ago=0)  # live from NOW
+    before = [chat(NOW - d * DAY, NOISY) for d in range(1, 6)] + triage_runs(days=range(1, 13))
+    t = NOW + DAY
+    after = (chat(t, NOISY) if trial_run == "chat" else
+             {"id": sid(TRIAGE, t), "source": "cron", "started_at": t, "cost": 0.0,
+              "in": 10_000, "out": 10, "calls": NOISY})
+    build(env, before + [after])
+    run_cycle(env, FakeBridge(jobs=jobs(), config={CFG_KEY: 0.7}), NOW + 2 * DAY)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert (rec.state == "rolled_back") is rolled
+    if rolled:
+        assert rec.reason == "harm: self_inflicted_errors (early)"
+
+
+def test_shadow_harm_baseline_is_the_target_jobs_runs(env):
+    """Review Focus 1. Triage runs err at 0.5; a shadow at 0.6 is ordinary for triage.
+    Catches: a per-group baseline applied to job kinds (a shadow's group is the shadow
+    job, so its baseline is empty and it fails)."""
+    noisy = [r | {"calls": r["calls"] + [(GET, {}, ARG_ERR)] * 3} for r in triage_runs(range(2, 30))]
+    fix = shadow_setup(env, old_mod=[(MOD, {"message_id": "m2", "add_label_ids": ["TRASH"]}, "ok")],
+                       new_mod=[{"message_id": "m2", "add_label_ids": ["TRASH"]}],
+                       base_runs=noisy, extra_calls=[(GET, {}, ARG_ERR)] * 3,
+                       prompt="Fetch mail with tuned_x.")
+    run_cycle(env, FakeBridge(jobs=jobs()), NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert rec.state == "trial", rec.reason
 
 
 def own_tool_runs(results_per_run, cost=0.04):
