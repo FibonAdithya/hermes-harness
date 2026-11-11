@@ -218,10 +218,13 @@ container that opens a pull request closing it.
 
 - **Reply `solo` or `drop`.** fleet cannot run here: the repository has no task
   classes, role prompts or packet schemas, and `fleet plan` stops at policy
-  load. The box refuses both ways of starting it. A `task` reply answers
-  "hermes-harness has no fleet role prompts, so fleet cannot run there; its
-  tasks are solo only", the issue stays in triage, and it is announced again
-  with a new code. `run_fleet("hermes-harness")` is refused with the same text.
+  load. The box refuses the two ways a reply or Hermes can start it. A `task`
+  reply answers "hermes-harness has no fleet role prompts, so fleet cannot run
+  there; its tasks are solo only", the issue stays in triage, and it is
+  announced again with a new code. `run_fleet("hermes-harness")` is refused
+  with the same text. The night timer is not checked: `fleet-night.timer`
+  starts fleet in whatever `[fleet] repo` in `~/nights/config.toml` names, so
+  keep that on a repository fleet can run on.
 - **Filing through Hermes.** `file_task("hermes-harness", title, body, area, "patch")`,
   with an area from the ownership map.
 - **Filing by hand.** Put `fleet:triage`, one `area:<area>` and one

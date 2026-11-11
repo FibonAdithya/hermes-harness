@@ -135,6 +135,45 @@ def test_slug_reads_fleet_toml(tmp_path):
         tasklib.slug(d)
 
 
+def _target(tmp_path, toml, files=()):
+    d = tmp_path / "r"
+    d.mkdir()
+    if toml is not None:
+        (d / "fleet.toml").write_text(toml)
+    for rel in files:
+        (d / rel).parent.mkdir(parents=True, exist_ok=True)
+        (d / rel).write_text("x\n")
+    return d
+
+
+def test_require_role_prompts_reads_the_directory_fleet_toml_names(tmp_path):
+    # A prompt under .agents/roles does not count when fleet.toml names another directory.
+    d = _target(tmp_path, '[policy]\nroles = "prompts"\n', [".agents/roles/implementer.md"])
+    with pytest.raises(TaskError, match="solo only"):
+        tasklib.require_role_prompts(d)
+    (d / "prompts").mkdir()
+    (d / "prompts" / "implementer.md").write_text("x\n")
+    tasklib.require_role_prompts(d)
+
+
+def test_require_role_prompts_counts_only_md_files_directly_in_the_directory(tmp_path):
+    # fleet.policy.known_roles globs *.md there, so nothing else lets fleet load its policy.
+    d = _target(tmp_path, '[policy]\nroles = ".agents/roles"\n',
+                [".agents/roles/.gitkeep", ".agents/roles/notes.txt", ".agents/roles/old/implementer.md"])
+    with pytest.raises(TaskError, match="solo only"):
+        tasklib.require_role_prompts(d)
+
+
+@pytest.mark.parametrize("toml", [None, "not toml [", '[repo]\nslug = "o/r"\n', '[policy]\nownership = "o.md"\n',
+                                  "[policy]\nroles = 5\n"])
+def test_require_role_prompts_refuses_when_fleet_toml_names_no_roles_directory(tmp_path, toml):
+    # fleet indexes policy["roles"] when it loads fleet.toml. Prompts that exist on
+    # disk do not help a repository whose fleet.toml does not name their directory.
+    d = _target(tmp_path, toml, ["README.md", ".agents/roles/implementer.md"])
+    with pytest.raises(TaskError, match="solo only"):
+        tasklib.require_role_prompts(d)
+
+
 def test_fleet_repos_are_discovered_not_listed(tmp_path):
     for name, has in (("a", True), ("b", False), ("c", True)):
         (tmp_path / "TIG" / name).mkdir(parents=True)
