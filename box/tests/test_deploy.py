@@ -25,7 +25,7 @@ def commit(repo, install_rc=0, msg="c"):
     return git(repo, "rev-parse", "HEAD")
 
 
-def setup(tmp_path):
+def make_repos(tmp_path):
     """origin (bare), an upstream working copy that pushes to it, and the box's clone at ~/TIG/hermes-harness."""
     origin, up, home = tmp_path / "origin.git", tmp_path / "up", tmp_path / "home"
     subprocess.run(["git", "init", "-q", "--bare", "-b", "master", str(origin)], check=True)
@@ -44,7 +44,7 @@ def run(home, args, path=None):
 
 
 def test_deploys_the_approved_commit(tmp_path):
-    up, home, box, _ = setup(tmp_path)
+    up, home, box, _ = make_repos(tmp_path)
     want = commit(up, msg="second")
     rc, out = run(home, {"sha": want})
     assert (rc, out) == (0, {"deployed": want})
@@ -54,7 +54,7 @@ def test_deploys_the_approved_commit(tmp_path):
 
 
 def test_refuses_when_master_has_moved_past_the_approved_commit(tmp_path):
-    up, home, box, first = setup(tmp_path)
+    up, home, box, first = make_repos(tmp_path)
     approved = commit(up, msg="approved")
     moved = commit(up, msg="merged after approval")
     rc, out = run(home, {"sha": approved})
@@ -66,7 +66,7 @@ def test_refuses_when_master_has_moved_past_the_approved_commit(tmp_path):
 
 def test_a_merge_after_the_master_check_is_not_deployed(tmp_path):
     """Master moves between the verb's check and its reset: the approved commit is still what lands."""
-    up, home, box, _ = setup(tmp_path)
+    up, home, box, _ = make_repos(tmp_path)
     approved = commit(up, msg="approved")
     later = up / "later"
     later.write_text("x")
@@ -87,7 +87,7 @@ def test_a_merge_after_the_master_check_is_not_deployed(tmp_path):
 
 
 def test_refuses_anything_but_a_full_sha(tmp_path):
-    _, home, box, first = setup(tmp_path)
+    _, home, box, first = make_repos(tmp_path)
     for args in ({}, {"sha": first[:12]}, {"sha": "master"}, {"sha": first.upper()}, {"sha": ["x"]}):
         rc, out = run(home, args)
         assert rc == 2 and out["error"] == "deploy needs the approved 40-character commit sha", args
@@ -95,7 +95,7 @@ def test_refuses_anything_but_a_full_sha(tmp_path):
 
 
 def test_install_failure_is_a_refusal_and_leaves_no_stamp(tmp_path):
-    up, home, _, _ = setup(tmp_path)
+    up, home, _, _ = make_repos(tmp_path)
     want = commit(up, install_rc=1, msg="broken install")
     rc, out = run(home, {"sha": want})
     assert rc == 2
