@@ -86,7 +86,19 @@ def _check_config(payload: dict, settings: Mapping[str, Any]) -> list[str]:
         return [reason]
     if key not in settings:
         return [f"config key {key!r} is not an existing Hermes setting"]
+    current, value = settings[key], payload["value"]
+    if _value_kind(value) != _value_kind(current):
+        return [f"config value for {key!r} must be {type(current).__name__}, "
+                f"got {type(value).__name__}"]
     return []
+
+
+def _value_kind(value: object) -> type:
+    """What a config value's type is compared by: int and float are one numeric kind (a
+    float setting may take 5); bool stays apart from both."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float
+    return type(value)
 
 
 def _check_job_target(fix: Fix) -> list[str]:
