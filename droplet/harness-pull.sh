@@ -44,3 +44,15 @@ if [ -f "$wl_dst" ] && [ -f "$wl_src" ] && ! cmp -s "$wl_src" "$wl_dst"; then
   install -m 644 "$wl_src" "$wl_dst"
   echo "wiki worklist updated"
 fi
+
+# Already-read scripts for the email jobs: one copy per job, named
+# already-read-<job id>.py (the job id is in the name; see runbooks/email-jobs.md).
+# Each installed copy is refreshed when the repo version changes; no copy is created.
+ar_src="$HOME/hermes-harness/droplet/already-read.py"
+for ar_dst in "$HOME"/.hermes/scripts/already-read-*.py; do
+  [ -f "$ar_dst" ] && [ -f "$ar_src" ] || continue
+  if ! cmp -s "$ar_src" "$ar_dst"; then
+    install -m 644 "$ar_src" "$ar_dst"
+    echo "updated $(basename "$ar_dst")"
+  fi
+done
