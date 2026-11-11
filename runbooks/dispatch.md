@@ -146,8 +146,10 @@ ssh tig-adi 'systemctl --user list-timers --no-pager'                          #
 ssh tig-adi 'systemctl --user stop night-<id>.service'                         # kill a night; status becomes killed
 ```
 
-- **A verb is missing.** It is a file in `box/verbs` on `master`; `harness-pull`
-  installs `master` every 15 minutes. `journalctl --user -u harness-pull -n 20`.
+- **A verb is missing.** It is a file in `box/verbs` on `master`, and it reaches
+  the box only with a deploy you approved (see Deploys above).
+  `cat ~/.local/share/harness-deployed.sha` on the box is the installed commit.
+  `harness-pull.timer` is installed on the box but disabled.
 - **Nothing ran last night.** `systemctl --user list-timers` shows whether the
   timers are enabled; they ship disabled. `~/nights/config.toml` holds the
   inputs; an empty Talos queue is a `skipped` night, not an error.
@@ -205,3 +207,68 @@ ssh tig-adi 'systemctl --user stop night-<id>.service'                         #
 - Add `FibonAdithya/fleet` to broker.json `repos`, so `solo` can run on fleet issues.
 - Do not deploy fleet near 23:00 UTC. `deploy_fleet` refuses only while a night is running;
   nothing locks against a night that is starting.
+
+## hermes-harness as a task target
+
+`hermes-harness` has a `fleet.toml` and an ownership map
+(`docs/agent/ownership.md`), so the task path above works on its own issues: a
+`fleet:triage` issue is announced, and `solo NNNN` starts one `run_task`
+container that opens a pull request closing it.
+
+- **Reply `solo` or `drop`, never `task`.** fleet cannot run here: the
+  repository has no task classes, role prompts or packet schemas, and
+  `fleet plan` stops at policy load. A `task` reply leaves the issue
+  `fleet:ready` with nothing able to run it. To undo one, on GitHub remove
+  `fleet:ready` and `fleet:auto-ok` and add `fleet:triage`; it is announced
+  again with a new code.
+- **Filing through Hermes.** `file_task("hermes-harness", title, body, area, "patch")`,
+  with an area from the ownership map.
+- **Filing by hand.** Put `fleet:triage`, one `area:<area>` and one
+  `class:<class>` label on an issue. Its announcement reads `[manual]`.
+- **One issue is one change.** The body is the whole brief the container gets:
+  what is wrong, where (`file:line`), and how to tell it is fixed. A list of
+  findings (#20 and #30 are two) is not a task, and at over 3500 characters is
+  offered `drop` only. File each item you want done as its own issue.
+- **A task that ends in seconds.** `night_log(<id>)` showing
+  `401 OAuth access token has been revoked` means the box's Claude login has
+  lapsed (seen on 2026-09-28). Log in again with `ssh -t tig-adi claude`. Then,
+  on the issue, remove `fleet:human` and `fleet:solo` and add `fleet:triage`,
+  and reply to the new announcement. The doctor does not watch task nights, so
+  nothing files this for you.
+- **A new top-level directory** needs a row in the ownership map in the same
+  pull request; `box/tests/test_fleet_target.py` fails until it has one.
+
+### One-time setup
+
+In this order. Each deploy is the gate in Deploys above: Hermes asks, you read
+the commit and reply.
+
+1. fleet on the box at a commit whose `fleet.policy` has `area_names`
+   (`main` since fleet PR #12). `file_task` refuses every repository until
+   then. `request_deploy(<fleet main sha>, "fleet")`, reply
+   `deploy fleet <prefix>`, then `deploy_fleet()`. A first deploy needs no
+   stamp: with `~/.local/share/fleet-deployed.sha` absent the verb rolls back
+   to the checkout's current commit if `make check` is red.
+2. The `hermes-harness` commit that added `fleet.toml` on the box:
+   `request_deploy(<master sha>)`, reply `deploy <prefix>`, `deploy_harness()`.
+3. The labels, from a laptop checkout of `hermes-harness` at that commit, with
+   a fleet checkout at `main` beside it:
+
+   ```bash
+   uv run --project ~/TIG/fleet python -P -c "
+   from fleet.config import load_config
+   from fleet.gh import RealGh
+   from fleet.labels import static_vocabulary
+   from fleet.policy import area_names
+   cfg = load_config()
+   gh = RealGh(cfg.repo_slug)
+   for name in sorted(static_vocabulary(cfg.max_attempts, cfg.max_fix_passes, cfg.max_rebases, area_names(cfg))):
+       gh.ensure_label(name)
+       print(name)
+   "
+   ```
+
+   It prints 26 labels: nine `area:`, four `class:` and thirteen `fleet:`.
+   `source:hermes`, `fleet:solo` and `fleet:dropped` are created on first use.
+4. Check: `ssh tig-adi 'echo "{}" | SSH_ORIGINAL_COMMAND=list_triage ~/.local/bin/dispatch'`
+   lists `hermes-harness` under `repos_ok`.
