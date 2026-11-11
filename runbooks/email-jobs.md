@@ -52,7 +52,7 @@ for id in 3bc4e11d29b1 cc68e24f21cd; do
   install -m 644 droplet/already-read.py ~/.hermes/scripts/already-read-"$id".py
   ~/.hermes/hermes-agent/venv/bin/python ~/.hermes/scripts/already-read-"$id".py | head -1
   # Written only once, so re-running this step keeps the original prompt.
-  [ -e ~/prompt-"$id".before.txt ] || python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); jobs=d.get("jobs", d) if isinstance(d, dict) else d; sys.stdout.write(next(j["prompt"] for j in jobs if j["id"] == sys.argv[2]))' ~/.hermes/cron/jobs.json "$id" > ~/prompt-"$id".before.txt
+  [ -e ~/prompt-"$id".before-already-read.txt ] || python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); jobs=d.get("jobs", d) if isinstance(d, dict) else d; sys.stdout.write(next(j["prompt"] for j in jobs if j["id"] == sys.argv[2]))' ~/.hermes/cron/jobs.json "$id" > ~/prompt-"$id".before-already-read.txt
 done
 hermes cron edit 3bc4e11d29b1 --script already-read-3bc4e11d29b1.py --prompt "$(cat droplet/prompts/morning-briefing.md)"
 hermes cron edit cc68e24f21cd --script already-read-cc68e24f21cd.py --prompt "$(cat droplet/prompts/calendar-sync.md)"
@@ -60,9 +60,10 @@ hermes cron edit cc68e24f21cd --script already-read-cc68e24f21cd.py --prompt "$(
 
 Expected: each script prints one line, `Already-read emails for cron job <id>:
 N message ids ...` (2026-11-11: 122 for the briefing, 53 for calendar sync).
-`~/prompt-<id>.before.txt` is the rollback copy; the step never overwrites one
-that exists. `harness-pull` refreshes the
-installed copies when `droplet/already-read.py` changes on master; it never
+`~/prompt-<id>.before-already-read.txt` is the rollback copy; the step never
+overwrites one that exists. (`~/prompt-<id>.before.txt` is a different file: the
+wiki rollout's rollback copy, from `runbooks/wiki.md`.) `harness-pull` refreshes
+the installed copies when `droplet/already-read.py` changes on master; it never
 creates one.
 
 ## Check
@@ -94,7 +95,7 @@ briefing has the "Still in inbox from earlier days" table.
 
 ```bash
 for id in 3bc4e11d29b1 cc68e24f21cd; do
-  hermes cron edit "$id" --script "" --prompt "$(cat ~/prompt-"$id".before.txt)"
+  hermes cron edit "$id" --script "" --prompt "$(cat ~/prompt-"$id".before-already-read.txt)"
 done
 ```
 
