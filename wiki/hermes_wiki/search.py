@@ -1,4 +1,6 @@
 """Filtered search and read over the wiki's pages."""
+import re
+from datetime import date
 from pathlib import Path
 
 from .pages import Page, iter_pages, links, resolve, valid_name
@@ -20,6 +22,19 @@ def _as_list(v) -> list[str]:
 def _updated(meta: dict | None) -> str:
     v = (meta or {}).get("updated")
     return v if isinstance(v, str) else ""
+
+
+def _check_date(name: str, v) -> None:
+    """Raise ValueError unless `v` is empty or a real calendar date written as YYYY-MM-DD."""
+    if v is None or v == "":
+        return
+    bad = ValueError(f"{name} must be a date written as YYYY-MM-DD, got {v!r}")
+    if not isinstance(v, str) or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", v):
+        raise bad
+    try:
+        date.fromisoformat(v)
+    except ValueError:
+        raise bad from None
 
 
 def _passes(page: Page, tags, type, repos, updated_after) -> bool:
@@ -50,6 +65,7 @@ def search(
     limit: int = 10,
     public_only: bool = False,
 ) -> list[dict]:
+    _check_date("updated_after", updated_after)
     terms = [t.lower() for t in query.split()]
     hits = []
     allowed = load_tags(root)

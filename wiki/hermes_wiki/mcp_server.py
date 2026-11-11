@@ -36,9 +36,12 @@ def make_tools(cfg: WikiConfig, now=time.time, publisher=notes.publish) -> dict[
     ) -> str:
         """Search wiki pages by words in the body, optionally filtered by tags, type, repos or an updated-after date (YYYY-MM-DD). Returns JSON hits with page name, type, tags and matching lines."""
         warn = _warning()
-        hits = search_mod.search(
-            cfg.root, query, tags, type, repos, updated_after, limit, public_only=cfg.public_only
-        )
+        try:
+            hits = search_mod.search(
+                cfg.root, query, tags, type, repos, updated_after, limit, public_only=cfg.public_only
+            )
+        except ValueError as e:
+            return warn + _err(e)
         return warn + json.dumps(hits)
 
     def read(page: str, follow_links: bool = False) -> str:
