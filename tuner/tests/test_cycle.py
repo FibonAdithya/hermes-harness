@@ -1,6 +1,7 @@
 """The daily cycle, end to end on a real temp state.db, a FakeBridge and a tmp root."""
 from __future__ import annotations
 
+import base64
 import fcntl
 import gzip
 import json
@@ -536,6 +537,9 @@ UNKNOWN = json.dumps({"error": "'mcp__google__tuned_x' is not a deferrable tool.
                                "the spelling against tool_search."})
 ARG_ERR = json.dumps({"error": "Error calling tool 'get_gmail_message_content': "
                                "expected_sha256 and page_size require page_offset."})
+
+DOWN = json.dumps({"error": "MCP server 'google' is unreachable after 3 consecutive failures. "
+                            "Auto-retry available in ~58s."})
 
 
 def shadow_setup(env, old_mod, new_mod, composed=False, live=True, base_runs=None,
@@ -2337,17 +2341,59 @@ def test_trial_ignores_a_stale_tool_the_fix_does_not_name(env):
     assert Ledger.load(env.root).get(fix.id).state == "trial"
 
 
-def test_config_trial_ignores_harm(env):
-    """Three argument errors in a chat would trip self_inflicted_errors for a job fix.
-    Catches: harm applied to config or skill fixes, whose runs are every chat."""
+def test_config_trial_rolls_back_on_a_harmful_chat(env):
+    """One chat with three self-inflicted errors under a config change on trial.
+    Catches: harm checks still limited to JOB_KINDS (in judge_trials or _harm)."""
     fix = config_trial(env, applied_days_ago=2)
-    chat = {"id": "20261019_010000_ab12cd", "source": "telegram", "started_at": NOW - 2 * 3600,
-            "cost": 0.05, "in": 10_000, "out": 10,
-            "calls": [(GET, {}, ARG_ERR)] * 3}
-    build(env, [chat])
+    bad_chat = {"id": "20261019_010000_ab12cd", "source": "telegram", "started_at": NOW - 2 * 3600,
+            "cost": 0.05, "in": 10_000, "out": 10, "calls": [(GET, {}, ARG_ERR)] * 3}
+    build(env, [bad_chat])
     run_cycle(env, FakeBridge(jobs=jobs(), config={CFG_KEY: 0.7}), NOW)
     rec = Ledger.load(env.root).get(fix.id)
-    assert rec.state == "trial" and not (rec.reason or "").startswith("harm:")
+    assert (rec.state, rec.reason) == ("rolled_back", "harm: self_inflicted_errors (early)")
+
+
+def chat(t, calls):
+    return {"id": datetime.fromtimestamp(t, timezone.utc).strftime("%Y%m%d_%H%M%S") + "_c0ffee",
+            "source": "telegram", "started_at": t, "cost": 0.0, "in": 10_000, "out": 10,
+            "calls": calls}
+
+
+NOISY = [(GET, {}, ARG_ERR)] * 3 + [(GET, {"message_id": "m"}, "b")]  # error rate 0.75
+
+
+@pytest.mark.parametrize("trial_run, rolled", [("chat", False), ("triage", True)])
+def test_global_harm_baseline_is_per_group(env, trial_run, rolled):
+    """Chats before go-live erred at 0.75; triage runs at 0. The same 0.75 run after
+    go-live is normal for a chat and harmful for triage.
+    Catches: one baseline over all global runs (the chat fires), or a baseline keyed
+    on rec.target (empty for a config change, so the chat fires)."""
+    fix = config_trial(env, applied_days_ago=0)  # live from NOW
+    before = [chat(NOW - d * DAY, NOISY) for d in range(1, 6)] + triage_runs(days=range(1, 13))
+    t = NOW + DAY
+    after = (chat(t, NOISY) if trial_run == "chat" else
+             {"id": sid(TRIAGE, t), "source": "cron", "started_at": t, "cost": 0.0,
+              "in": 10_000, "out": 10, "calls": NOISY})
+    build(env, before + [after])
+    run_cycle(env, FakeBridge(jobs=jobs(), config={CFG_KEY: 0.7}), NOW + 2 * DAY)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert (rec.state == "rolled_back") is rolled
+    if rolled:
+        assert rec.reason == "harm: self_inflicted_errors (early)"
+
+
+def test_shadow_harm_baseline_is_the_target_jobs_runs(env):
+    """Review Focus 1. Triage runs err at 0.5; a shadow at 0.6 is ordinary for triage.
+    Catches: a per-group baseline applied to job kinds (a shadow's group is the shadow
+    job, so its baseline is empty and it fails)."""
+    noisy = [r | {"calls": r["calls"] + [(GET, {}, ARG_ERR)] * 3} for r in triage_runs(range(2, 30))]
+    fix = shadow_setup(env, old_mod=[(MOD, {"message_id": "m2", "add_label_ids": ["TRASH"]}, "ok")],
+                       new_mod=[{"message_id": "m2", "add_label_ids": ["TRASH"]}],
+                       base_runs=noisy, extra_calls=[(GET, {}, ARG_ERR)] * 3,
+                       prompt="Fetch mail with tuned_x.")
+    run_cycle(env, FakeBridge(jobs=jobs()), NOW)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert rec.state == "trial", rec.reason
 
 
 def own_tool_runs(results_per_run, cost=0.04):
@@ -2912,3 +2958,140 @@ def test_history_failure_in_shadow_harm_check_is_logged_and_the_cycle_continues(
     assert (led.get(other.id).state, led.get(other.id).reason) == (
         "shadow_failed", "shadow did not run")
     assert f"harm check {fix.id}: HistoryUnavailable: database is locked" in report.errors
+
+
+TRIPPED = [(GET, {}, ARG_ERR), (GET, {}, DOWN)]  # server_tripped, no baseline needed
+
+
+def both_on_trial(env):
+    fix, bridge = job_prompt_trial(env)       # job change on triage, live from NOW
+    cfg_fix = config_trial(env, applied_days_ago=0)   # config change, live from NOW
+    bridge.config[CFG_KEY] = 0.7  # keep plugins.enabled, which the FakeBridge wrapper sets
+    return fix, cfg_fix, bridge
+
+
+@pytest.mark.parametrize("new_bad_run", [False, True], ids=["no_new_bad_run", "new_bad_run"])
+def test_job_change_first_when_both_on_trial(env, new_bad_run):
+    """Day 1: a tripped triage run, both changes live. Only the job change goes.
+    Day 3, after it went: the config goes only if triage is still bad.
+    Catches: no skip (config goes on day 1); a skip keyed on the job change's state at
+    cycle time (config goes on day 3 for the day-1 run); skipping triage forever."""
+    fix, cfg_fix, bridge = both_on_trial(env)
+    env.db.unlink()
+    build(env, SETUP_SESSIONS[env.root] + [later_run(TRIPPED, day=1)])
+    run_cycle(env, bridge, NOW + 2 * DAY)
+    led = Ledger.load(env.root)
+    assert (led.get(fix.id).state, led.get(fix.id).reason) == (
+        "rolled_back", "harm: server_tripped (early)")
+    assert led.get(cfg_fix.id).state == "trial"
+    env.db.unlink()
+    build(env, SETUP_SESSIONS[env.root] + [later_run(TRIPPED, day=1)]
+          + ([later_run(TRIPPED, day=3)] if new_bad_run else []))
+    run_cycle(env, bridge, NOW + 4 * DAY)
+    rec = Ledger.load(env.root).get(cfg_fix.id)
+    if new_bad_run:
+        assert (rec.state, rec.reason) == ("rolled_back", "harm: server_tripped (early)")
+    else:
+        assert rec.state == "trial"
+
+
+def test_chat_counts_against_global_while_a_job_change_is_on_trial(env):
+    """Catches: skipping every run while any job change is live."""
+    fix, cfg_fix, bridge = both_on_trial(env)
+    env.db.unlink()
+    build(env, SETUP_SESSIONS[env.root] + [chat(NOW + DAY, TRIPPED)])
+    run_cycle(env, bridge, NOW + 2 * DAY)
+    led = Ledger.load(env.root)
+    assert led.get(cfg_fix.id).state == "rolled_back"
+    assert led.get(fix.id).state == "trial"
+
+
+OUTSIDE_JOB = "aaaabbbbcccc"  # a cron job outside policy.EDITABLE_JOBS (OTHER is taken, l.1076)
+
+
+def global_trial_with_runs(env):
+    cfg_fix = config_trial(env, applied_days_ago=0)
+    t_cal = NOW - 3 * 3600 + 6 * 3600 + DAY     # day-1 calendar run, 06:00
+    cal = {"id": sid(CAL, t_cal), "source": "cron", "started_at": t_cal, "cost": 0.0,
+           "in": 10_000, "out": 10,
+           "calls": [("mcp__google__get_events", {"calendar_id": "primary"}, "events")]}
+    build(env, [cal, later_run([], day=1)])      # calendar (06:00) is never the last run
+    return cfg_fix, FakeBridge(jobs=jobs(), config={CFG_KEY: 0.7}), t_cal
+
+
+def test_global_trial_run_failed_reads_each_jobs_own_status(env):
+    """Calendar's run failed; triage's is fine.
+    Catches: status read only for rec.target (a config key, so never), or only for
+    the last run in list order."""
+    cfg_fix, bridge, t_cal = global_trial_with_runs(env)
+    bridge.jobs[CAL] |= {"last_status": "error", "last_run_at": iso(t_cal + 60)}
+    run_cycle(env, bridge, NOW + 2 * DAY)
+    rec = Ledger.load(env.root).get(cfg_fix.id)
+    assert (rec.state, rec.reason) == ("rolled_back", "harm: run_failed (early)")
+
+
+@pytest.mark.parametrize("other, rolled", [(CAL, True), (OUTSIDE_JOB, False)])
+def test_global_outage_only_from_jobs_outside_the_trial_set(env, other, rolled):
+    """Triage failed, and another job failed within the outage window.
+    Catches: calendar excusing triage under a global change, or no outage test at all."""
+    cfg_fix, bridge, t_cal = global_trial_with_runs(env)
+    t = NOW - 3 * 3600 + 7 * 3600 + DAY
+    bridge.jobs[TRIAGE] |= {"last_status": "error", "last_run_at": iso(t + 60)}
+    bridge.jobs.setdefault(other, jobs()[CAL] | {"id": other, "name": "other"})  # full job shape
+    bridge.jobs[other] |= {"last_status": "error", "last_run_at": iso(t + 120)}
+    run_cycle(env, bridge, NOW + 2 * DAY)
+    rec = Ledger.load(env.root).get(cfg_fix.id)
+    assert (rec.state == "rolled_back") is rolled
+
+
+def test_global_trial_harm_survives_job_status_failure(env):
+    """Review Focus 4. Catches: a list_jobs failure aborting the global check."""
+    cfg_fix = config_trial(env, applied_days_ago=0)
+    build(env, [chat(NOW + DAY, TRIPPED)])
+    bridge = FakeBridge(jobs=jobs(), config={CFG_KEY: 0.7})
+    bridge.fail = {"list_jobs"}
+    report = run_cycle(env, bridge, NOW + 2 * DAY)
+    assert Ledger.load(env.root).get(cfg_fix.id).state == "rolled_back"
+    assert any(e.startswith(f"harm status {cfg_fix.id}:") for e in report.errors)
+
+
+def skill_trial(env, applied_days_ago=0):
+    """A skill change on trial: the file holds the new text; before.json holds the old."""
+    skill = env.skills_root / "notes" / "SKILL.md"
+    skill.parent.mkdir(exist_ok=True)
+    old, new = "---\nname: notes\n---\nold\n", "---\nname: notes\n---\nnew\n"
+    skill.write_text(new)
+    fix = Fix("20261011-dddd0002", "skill", "notes", {"path": "notes/SKILL.md", "text": new},
+              "skill_load:notes")
+    led = add_record(env, FixRecord(fix.id, "skill", "notes", fix.candidate_key, "trial",
+                                    NOW - applied_days_ago * DAY,
+                                    applied_at=NOW - applied_days_ago * DAY,
+                                    live_from=NOW - applied_days_ago * DAY,
+                                    baseline_runs=[brk(0.10)] * 20), fix)
+    vdir = led.version_dir(fix.id)
+    (vdir / "before.json").write_text(json.dumps({
+        "file": str(skill), "mode": 0o644, "b64": base64.b64encode(old.encode()).decode()}))
+    (vdir / "after.json").write_text(json.dumps({"file": str(skill), "text": new}))
+    return fix, skill, old
+
+
+def test_skill_trial_rolls_back_on_a_harmful_chat(env):
+    """A chat whose MCP server tripped, after a skill change went live.
+    Catches: harm checks limited to JOB_KINDS | {"config"} instead of GLOBAL_KINDS."""
+    fix, skill, old = skill_trial(env)
+    build(env, [chat(NOW + DAY, TRIPPED)])
+    run_cycle(env, FakeBridge(jobs=jobs()), NOW + 2 * DAY)
+    rec = Ledger.load(env.root).get(fix.id)
+    assert (rec.state, rec.reason) == ("rolled_back", "harm: server_tripped (early)")
+    assert skill.read_text() == old
+
+
+def test_skill_trial_harm_leaves_an_owner_edit_alone(env):
+    """Spec 7: the harm rollback of a skill the owner edited since apply is owner_changed.
+    Catches: the early-harm path bypassing the owner-change check for skills."""
+    fix, skill, old = skill_trial(env)
+    skill.write_text("---\nname: notes\n---\nowner's own edit\n")
+    build(env, [chat(NOW + DAY, TRIPPED)])
+    run_cycle(env, FakeBridge(jobs=jobs()), NOW + 2 * DAY)
+    assert Ledger.load(env.root).get(fix.id).state == "owner_changed"
+    assert skill.read_text() == "---\nname: notes\n---\nowner's own edit\n"

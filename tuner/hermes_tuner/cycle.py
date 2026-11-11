@@ -66,6 +66,12 @@ def _global_run(s: Session) -> bool:
     return s.source == "telegram" or s.job_id in policy.EDITABLE_JOBS
 
 
+def _run_group(s: Session) -> str:
+    """The group whose runs set a global fix's harm baseline: all chats are one group,
+    each job is its own."""
+    return "chat" if s.source == "telegram" else s.job_id or ""
+
+
 @dataclass(frozen=True)
 class CycleConfig:
     root: Path
@@ -419,15 +425,25 @@ class _Cycle(DraftSteps):
 
     def _harm(self, rec: FixRecord, run: Session, before: float, status: str | None = None,
               delivery_failed: bool = False, outage: bool = False) -> str | None:
-        """The first harm signal for `run` of job fix `rec`, or None. The baseline is the
-        target job's own runs (not shadows) that started in the BASELINE_DAYS before
-        `before`. Lets HistoryUnavailable propagate."""
-        if not policy.HARM_CHECKS or rec.kind not in JOB_KINDS:
+        """The first harm signal for `run` of fix `rec` (a job, config or skill fix), or
+        None. The baseline is runs (not shadows) that started in the BASELINE_DAYS before
+        `before`: the target job's own for a job fix; for a config or skill fix, the runs
+        in the same group as `run` (all chats, or one job). Lets HistoryUnavailable
+        propagate."""
+        if not policy.HARM_CHECKS or rec.kind not in JOB_KINDS | GLOBAL_KINDS:
             return None
         low = before - trial.BASELINE_DAYS * DAY
+        if rec.kind in JOB_KINDS:
+            def same(s: Session) -> bool:
+                return s.job_id == rec.target
+        else:
+            group = _run_group(run)
+
+            def same(s: Session) -> bool:
+                return _global_run(s) and _run_group(s) == group
         rates = tuple(
             harm.error_rate(self.history.call_results(s.id)) for s in self.sessions
-            if s.job_id == rec.target and s.calls and s.job_id not in self.shadow_ids
+            if same(s) and s.calls and s.job_id not in self.shadow_ids
             and low <= s.started_at < before)
         try:
             payload = self.ledger.fix(rec.id).payload
@@ -616,11 +632,12 @@ class _Cycle(DraftSteps):
             if rec.live_from is not None and rec.trial_runs != len(runs) and not self.dry:
                 rec.trial_runs = len(runs)
                 self.ledger.save()
-            if rec.live_from is not None and rec.kind in JOB_KINDS:
+            if rec.live_from is not None and rec.kind in JOB_KINDS | GLOBAL_KINDS:
                 sig = self._harm_in_trial(rec, runs)
                 if sig is not None:
                     self._rollback(rec, f"harm: {sig} (early)", runs)
                     continue
+            if rec.live_from is not None and rec.kind in JOB_KINDS:
                 failures, calls, worse = self._early_failures(rec, runs)
                 if failures >= trial.EARLY_FAIL_MIN or (
                         calls > 0 and failures / calls >= trial.EARLY_FAIL_SHARE):
@@ -672,11 +689,18 @@ class _Cycle(DraftSteps):
         return self._jobs_cache
 
     def _harm_in_trial(self, rec: FixRecord, runs: list[Session]) -> str | None:
-        """The first harm signal over a job fix's trial `runs` (oldest first), or None.
-        Job status (from list_jobs, not get_job) applies only to the newest run, and only
-        once the job has run since that run started and no later run of the job (one
-        with no tool calls, left out of `runs`) could have set it. A bridge or state.db
+        """The first harm signal over a fix's trial `runs` (oldest first), or None. For a
+        config or skill fix, runs owned by a live job change are skipped first: that
+        change is blamed for them (_owned_by_job_change).
+        Job status (from list_jobs, not get_job) applies only to a job's newest run in
+        `runs` (a job fix: its target's; a config or skill fix: each editable job's own),
+        and only once the job has run since that run started and no later run of the job
+        (one with no tool calls, left out of `runs`) could have set it. Outage means a
+        job in error outside the change's own jobs (its target; for a config or skill
+        fix, every editable job). A bridge or state.db
         failure is logged and leaves the signals that need no bridge, or none."""
+        if rec.kind in GLOBAL_KINDS:
+            runs = [r for r in runs if not self._owned_by_job_change(r)]
         if not runs or rec.live_from is None:
             return None
         jobs: list[dict] = []
@@ -684,18 +708,29 @@ class _Cycle(DraftSteps):
             jobs = self._job_list()
         except BridgeError as exc:
             self.err(f"harm status {rec.id}: {exc}")
-        mine = next((j for j in jobs if j.get("id") == rec.target), None)
+        by_id = {j.get("id"): j for j in jobs}
+        is_global = rec.kind in GLOBAL_KINDS
+        # Jobs a change on trial may be blamed for: its own target, or any editable job.
+        own = set(policy.EDITABLE_JOBS) if is_global else {rec.target}
+        newest: dict[str, Session] = {}
+        for r in runs:
+            if r.job_id in own and (r.job_id not in newest
+                                    or r.started_at >= newest[r.job_id].started_at):
+                newest[r.job_id] = r
         try:
             for run in runs:
                 status, delivery_failed = None, False
-                if run is runs[-1] and mine is not None:
+                jid = run.job_id if is_global else rec.target
+                mine = by_id.get(jid) if jid in own else None
+                if mine is not None and (newest.get(jid) is run if is_global
+                                         else run is runs[-1]):
                     ran = trial._epoch(mine.get("last_run_at"))
                     if ran is not None and ran >= run.started_at \
-                            and not self._ran_again(rec.target, run.started_at, ran):
+                            and not self._ran_again(jid, run.started_at, ran):
                         status = mine.get("last_status")
                         delivery_failed = bool(mine.get("last_delivery_error"))
                 outage = any(
-                    j.get("id") != rec.target and j.get("last_status") == "error"
+                    j.get("id") not in own and j.get("last_status") == "error"
                     and (t := trial._epoch(j.get("last_run_at"))) is not None
                     and abs(t - run.started_at) <= harm.OUTAGE_WINDOW_S for j in jobs)
                 sig = self._harm(rec, run, rec.live_from, status, delivery_failed, outage)
@@ -704,6 +739,15 @@ class _Cycle(DraftSteps):
         except HistoryUnavailable as exc:
             self.err(f"harm check {rec.id}: {type(exc).__name__}: {exc}")
         return None
+
+    def _owned_by_job_change(self, run: Session) -> bool:
+        """True when a job change on the run's job was live when the run started and was
+        not decided before it: that change is blamed for the run, not a global one.
+        Judged on the run's time, never on the change's current state."""
+        return any(j.kind in JOB_KINDS and j.target == run.job_id
+                   and j.live_from is not None and j.live_from < run.started_at
+                   and (j.decided_at is None or j.decided_at > run.started_at)
+                   for j in self.ledger.records)
 
     def _ran_again(self, job_id: str, after: float, until: float) -> bool:
         """True when a session of job `job_id` (a live job, so never a shadow), with or
