@@ -1,0 +1,24 @@
+# hermes-harness as a task target on the box. The box's file_task and
+# list_triage verbs act only on a repository under ~/TIG that has this file, and
+# read its areas from the ownership map named below.
+#
+# fleet itself cannot run here. Nothing exists yet at the task_classes, roles
+# and schemas paths, so `fleet plan` and `fleet run` stop when they load the
+# policy, and the box refuses `task` and run_fleet for this repository
+# (tasklib.require_role_prompts). A task here is approved with `solo`: one
+# run_task container, one pull request. runbooks/dispatch.md, "hermes-harness
+# as a task target", has the procedure.
+#
+# Keep all four [policy] keys. fleet reads each one when it loads this file,
+# before it looks at what they point to; without one, file_task refuses this
+# repository.
+
+[repo]
+slug = "FibonAdithya/hermes-harness"
+integration_branch = "integration"
+
+[policy]
+ownership = "docs/agent/ownership.md"
+task_classes = "docs/agent/task-classes.md"
+roles = ".agents/roles"
+schemas = ".agents/schemas"

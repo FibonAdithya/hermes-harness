@@ -14,6 +14,8 @@ home = Path(os.environ.get("HOME", "/home/adi"))
 try:
     repo = tasklib.repo_dir(home, a.get("repo", ""))
     slug = tasklib.slug(repo)
+    if a.get("mode") == "fleet":
+        tasklib.require_role_prompts(repo)
     out = tasklib.approve(tasklib.real_gh, slug, int(a.get("number", 0)), str(a.get("hash", "")), a.get("mode", ""))
 except (ValueError, TypeError) as exc:
     sys.exit(boxlib.refuse(str(exc)))
