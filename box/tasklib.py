@@ -71,6 +71,23 @@ def slug(repo: Path) -> str:
     return s
 
 
+def require_role_prompts(repo: Path) -> None:
+    """Refuse a repository fleet cannot run on.
+
+    fleet stops at policy load when the roles directory named in fleet.toml holds
+    no prompt (fleet.policy.known_roles). A night started there fails at once, and
+    the doctor files that failure against fleet; an issue approved with `task`
+    there waits for a night that cannot run. file_task, list_triage and `solo`
+    need none of this, so such a repository's tasks are solo only."""
+    repo = Path(repo)
+    try:
+        roles = tomllib.loads((repo / "fleet.toml").read_text())["policy"]["roles"]
+    except (OSError, KeyError, TypeError, tomllib.TOMLDecodeError):
+        roles = None
+    if not isinstance(roles, str) or not any((repo / roles).glob("*.md")):
+        raise TaskError(f"{repo.name} has no fleet role prompts, so fleet cannot run there; its tasks are solo only")
+
+
 def fleet_areas(repo: Path, home: Path) -> frozenset[str]:
     """The target's areas, read by fleet's own parser (fleet.policy.area_names).
 

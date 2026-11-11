@@ -146,8 +146,9 @@ ssh tig-adi 'systemctl --user list-timers --no-pager'                          #
 ssh tig-adi 'systemctl --user stop night-<id>.service'                         # kill a night; status becomes killed
 ```
 
-- **A verb is missing.** It is a file in `box/verbs` on `master`, and it reaches
-  the box only with a deploy you approved (see Deploys above).
+- **A verb is missing.** It is a file in `box/verbs` on `master`. It reaches the
+  box with a deploy you approved (see Deploys above), or when you run
+  `systemctl --user start harness-pull.service` there by hand.
   `cat ~/.local/share/harness-deployed.sha` on the box is the installed commit.
   `harness-pull.timer` is installed on the box but disabled.
 - **Nothing ran last night.** `systemctl --user list-timers` shows whether the
@@ -215,12 +216,12 @@ ssh tig-adi 'systemctl --user stop night-<id>.service'                         #
 `fleet:triage` issue is announced, and `solo NNNN` starts one `run_task`
 container that opens a pull request closing it.
 
-- **Reply `solo` or `drop`, never `task`.** fleet cannot run here: the
-  repository has no task classes, role prompts or packet schemas, and
-  `fleet plan` stops at policy load. A `task` reply leaves the issue
-  `fleet:ready` with nothing able to run it. To undo one, on GitHub remove
-  `fleet:ready` and `fleet:auto-ok` and add `fleet:triage`; it is announced
-  again with a new code.
+- **Reply `solo` or `drop`.** fleet cannot run here: the repository has no task
+  classes, role prompts or packet schemas, and `fleet plan` stops at policy
+  load. The box refuses both ways of starting it. A `task` reply answers
+  "hermes-harness has no fleet role prompts, so fleet cannot run there; its
+  tasks are solo only", the issue stays in triage, and it is announced again
+  with a new code. `run_fleet("hermes-harness")` is refused with the same text.
 - **Filing through Hermes.** `file_task("hermes-harness", title, body, area, "patch")`,
   with an area from the ownership map.
 - **Filing by hand.** Put `fleet:triage`, one `area:<area>` and one
@@ -251,24 +252,49 @@ the commit and reply.
    to the checkout's current commit if `make check` is red.
 2. The `hermes-harness` commit that added `fleet.toml` on the box:
    `request_deploy(<master sha>)`, reply `deploy <prefix>`, `deploy_harness()`.
-3. The labels, from a laptop checkout of `hermes-harness` at that commit, with
-   a fleet checkout at `main` beside it:
-
-   ```bash
-   uv run --project ~/TIG/fleet python -P -c "
-   from fleet.config import load_config
-   from fleet.gh import RealGh
-   from fleet.labels import static_vocabulary
-   from fleet.policy import area_names
-   cfg = load_config()
-   gh = RealGh(cfg.repo_slug)
-   for name in sorted(static_vocabulary(cfg.max_attempts, cfg.max_fix_passes, cfg.max_rebases, area_names(cfg))):
-       gh.ensure_label(name)
-       print(name)
-   "
-   ```
-
-   It prints 26 labels: nine `area:`, four `class:` and thirteen `fleet:`.
-   `source:hermes`, `fleet:solo` and `fleet:dropped` are created on first use.
-4. Check: `ssh tig-adi 'echo "{}" | SSH_ORIGINAL_COMMAND=list_triage ~/.local/bin/dispatch'`
+3. `solo` is refused unless `FibonAdithya/hermes-harness` is in `repos` in the
+   droplet's broker config. Check it (this prints the list and nothing else
+   from that file):
+   `ssh hermes-vm "python3 -c 'import json, os; print(json.load(open(os.path.expanduser(\"~/.hermes/broker/broker.json\")))[\"repos\"])'"`
+4. Seed the labels (block A below), from a laptop checkout of `hermes-harness`
+   at the deployed commit.
+5. Check the box reads this repository's areas with fleet's own parser (block B
+   below). Nothing is filed: the area is refused before any call to GitHub.
+6. Check `ssh tig-adi 'echo "{}" | SSH_ORIGINAL_COMMAND=list_triage ~/.local/bin/dispatch'`
    lists `hermes-harness` under `repos_ok`.
+
+Block A. `~/TIG/fleet` is the laptop's fleet checkout, at `main`. As written it
+only prints: the repository it would write to and 26 label names (nine `area:`,
+four `class:`, thirteen `fleet:`). Run it again with `SEED=1` in front to create
+them. `source:hermes`, `fleet:solo` and `fleet:dropped` are created on first use.
+
+```bash
+uv run --project ~/TIG/fleet python -P - <<'PY'
+import os
+from fleet.config import load_config
+from fleet.gh import RealGh
+from fleet.labels import static_vocabulary
+from fleet.policy import area_names
+
+cfg = load_config()
+assert cfg.repo_slug == "FibonAdithya/hermes-harness", f"run this from a hermes-harness checkout, not {cfg.repo_slug}"
+names = sorted(static_vocabulary(cfg.max_attempts, cfg.max_fix_passes, cfg.max_rebases, area_names(cfg)))
+print(f"{len(names)} labels for {cfg.repo_slug}:", *names)
+if os.environ.get("SEED") == "1":
+    gh = RealGh(cfg.repo_slug)
+    for name in names:
+        gh.ensure_label(name)
+    print("created")
+PY
+```
+
+Block B. The reply should be an error that ends
+`(have: box, broker, docs, droplet, executor, friends, repo, tuner, wiki)`.
+"hermes-harness has no fleet.toml" means step 2 has not happened, and
+"could not read hermes-harness's areas" means step 1 has not.
+
+```bash
+ssh tig-adi 'SSH_ORIGINAL_COMMAND=file_task ~/.local/bin/dispatch' <<'JSON'
+{"repo": "hermes-harness", "title": "t", "body": "b", "area": "nonexistent", "cls": "patch"}
+JSON
+```

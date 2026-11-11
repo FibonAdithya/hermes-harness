@@ -22,17 +22,26 @@ sys.stdout.write(out); sys.stderr.write(err); sys.exit(rc)
 UV_SHIM = '#!/bin/sh\necho \'["daemon", "docs"]\'\n'
 
 
-def home_with_repo(tmp_path, name="fleet-fixture", slug="FibonAdithya/fleet-fixture"):
+SYSTEMD_RUN_SHIM = '#!/bin/sh\nprintf "%s\\n" "$*" >> "$HOME/systemd-run.log"\n'
+
+
+def home_with_repo(tmp_path, name="fleet-fixture", slug="FibonAdithya/fleet-fixture", role_prompts=True):
+    """A box home with one fleet target. role_prompts=False is a repository like
+    hermes-harness: a fleet.toml naming a roles directory that holds no prompt."""
     home = tmp_path / "home"
     d = home / "TIG" / name
     d.mkdir(parents=True)
-    (d / "fleet.toml").write_text(f'[repo]\nslug = "{slug}"\n')
+    (d / "fleet.toml").write_text(f'[repo]\nslug = "{slug}"\n[policy]\nroles = ".agents/roles"\n')
+    if role_prompts:
+        (d / ".agents" / "roles").mkdir(parents=True)
+        (d / ".agents" / "roles" / "implementer.md").write_text("prompt\n")
     (home / "TIG" / "notfleet").mkdir()
     shims = tmp_path / "bin"
     shims.mkdir()
     (shims / "gh").write_text(SHIM)
     (shims / "uv").write_text(UV_SHIM)
-    for s in ("gh", "uv"):
+    (shims / "systemd-run").write_text(SYSTEMD_RUN_SHIM)
+    for s in ("gh", "uv", "systemd-run"):
         (shims / s).chmod(0o755)
     return home, shims
 
@@ -127,3 +136,33 @@ def test_file_task_refuses_cleanly_when_uv_is_missing(tmp_path):
     env = _no_path_env(home, tmp_path / "no_uv")
     rc, out = run_bare("file_task", env, {"repo": "fleet-fixture", "title": "t", "body": "b", "area": "docs", "cls": "patch"})
     assert rc == 2 and "cannot run uv" in out["error"]
+
+
+def _labels(home, number):
+    return {x["name"] for x in json.load(open(home / "gh.json"))["issues"][str(number)]["labels"]}
+
+
+def test_task_is_refused_where_fleet_cannot_run_and_solo_still_works(tmp_path):
+    home, shims = home_with_repo(tmp_path, name="solo-only", slug="FibonAdithya/solo-only", role_prompts=False)
+    rc, out = run("file_task", home, shims, {"repo": "solo-only", "title": "t", "body": "b", "area": "docs", "cls": "patch"})
+    assert rc == 0
+    [issue] = run("list_triage", home, shims, {})[1]["issues"]
+    args = {"repo": "solo-only", "number": 1, "hash": issue["hash"]}
+    rc, out = run("approve_task", home, shims, {**args, "mode": "fleet"})
+    assert rc == 2 and "solo only" in out["error"]
+    assert "fleet:triage" in _labels(home, 1) and "fleet:ready" not in _labels(home, 1)
+    rc, out = run("approve_task", home, shims, {**args, "mode": "solo"})
+    assert rc == 0 and out["title"] == "t"
+    assert {"fleet:human", "fleet:solo"} <= _labels(home, 1) and "fleet:triage" not in _labels(home, 1)
+
+
+def test_run_fleet_starts_a_night_only_where_fleet_can_run(tmp_path):
+    home, shims = home_with_repo(tmp_path, name="solo-only", slug="FibonAdithya/solo-only", role_prompts=False)
+    rc, out = run("run_fleet", home, shims, {"repo": "solo-only", "hours": 1})
+    assert rc == 2 and "solo only" in out["error"]
+    assert not (home / "systemd-run.log").exists() and not (home / "nights").exists()
+
+    home, shims = home_with_repo(tmp_path / "second")
+    rc, out = run("run_fleet", home, shims, {"repo": "fleet-fixture", "hours": 1})
+    assert rc == 0 and out["id"].startswith("fleet-")
+    assert f"--unit=night-{out['id']}" in (home / "systemd-run.log").read_text()
