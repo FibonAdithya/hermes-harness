@@ -56,3 +56,13 @@ for ar_dst in "$HOME"/.hermes/scripts/already-read-*.py; do
     echo "updated $(basename "$ar_dst")"
   fi
 done
+
+# Owner reminder helper: ~/.local/bin/remind-owner is a link into the checkout, so it
+# follows master without a copy step. Made once here; a link already in place is left alone.
+ro_src="$HOME/hermes-harness/droplet/remind-owner.sh"
+ro_dst="$HOME/.local/bin/remind-owner"
+if [ -f "$ro_src" ] && [ "$(readlink "$ro_dst" 2>/dev/null || true)" != "$ro_src" ]; then
+  mkdir -p "$(dirname "$ro_dst")"
+  ln -sfn "$ro_src" "$ro_dst"
+  echo "linked remind-owner"
+fi
