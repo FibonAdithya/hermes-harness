@@ -77,7 +77,7 @@ def reach(change, why="needed"):
 
 def test_config_key_must_be_allowlisted(tmp_path):
     c = ctx(tmp_path)
-    assert check_fix(cfg("tools.tool_search.enabled", True), c) == []
+    assert check_fix(cfg("tools.tool_search.enabled", "off"), c) == []
     assert check_fix(cfg("display.foo"), c)
     assert check_fix(cfg("mcp_servers.google.tools.include"), c)
     assert check_fix(cfg("terminal.backend"), c)
@@ -86,8 +86,8 @@ def test_config_key_must_be_allowlisted(tmp_path):
 def test_forbidden_beats_allowlist(tmp_path, monkeypatch):
     monkeypatch.setattr(policy, "CONFIG_ALLOW_PREFIXES", ("",))
     c = ctx(tmp_path, config_settings={"mcp_servers.x": 1, "display.foo": 1})
-    assert check_fix(cfg("mcp_servers.x"), c)
-    assert check_fix(cfg("display.foo"), c) == []
+    assert check_fix(cfg("mcp_servers.x", 2), c)
+    assert check_fix(cfg("display.foo", 2), c) == []
 
 
 def test_config_key_must_be_an_existing_setting(tmp_path):
@@ -97,6 +97,34 @@ def test_config_key_must_be_an_existing_setting(tmp_path):
     assert reasons == ["config key 'tools.tool_search.cache_schemas' is not an existing "
                        "Hermes setting"]
     assert check_fix(cfg("compression.threshold", 0.6), ctx(tmp_path)) == []
+
+
+@pytest.mark.parametrize("key,value,reason", [
+    ("compression.threshold", "banana", "must be float, got str"),
+    ("compression.enabled", "auto", "must be bool, got str"),
+    ("compression.threshold", True, "must be float, got bool"),
+    ("compression.enabled", 1, "must be bool, got int"),
+    ("tools.tool_search.enabled", False, "must be str, got bool"),
+])
+def test_config_value_must_keep_the_current_type(tmp_path, key, value, reason):
+    """Issue #23: the drafting instructions say keep the current value's type, and
+    nothing enforced it. Catches: a value of another type accepted, or bool taken as a
+    number."""
+    c = ctx(tmp_path, config_settings={"compression.enabled": True,
+                                       "compression.threshold": 0.5,
+                                       "tools.tool_search.enabled": "auto"})
+    assert check_fix(cfg(key, value), c) == [f"config value for {key!r} {reason}"]
+
+
+def test_config_value_int_and_float_are_one_type(tmp_path):
+    """Catches: 5 refused for a float setting, or 0.5 for an int one."""
+    c = ctx(tmp_path, config_settings={"compression.threshold": 0.5,
+                                       "compression.enabled": True,
+                                       "tools.tool_search.threshold_pct": 5})
+    assert check_fix(cfg("compression.threshold", 0.6), c) == []
+    assert check_fix(cfg("compression.threshold", 5), c) == []
+    assert check_fix(cfg("tools.tool_search.threshold_pct", 7.5), c) == []
+    assert check_fix(cfg("compression.enabled", False), c) == []
 
 
 def test_no_known_settings_rejects_every_config_fix(tmp_path):
