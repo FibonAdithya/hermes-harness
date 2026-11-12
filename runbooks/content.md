@@ -25,8 +25,8 @@ Hermes starts content jobs on the box with `run_task`, using the `content-job` s
 ## Use
 
 1. Ask Hermes for interview questions for a post, with a skeleton or a topic. Hermes picks a slug and tells you.
-2. Hermes starts the questions run (20 minutes), reports the task id and posts the questions. Answer either on the GitHub pull request, or by replying to Hermes with each answer after its question number and the source after the answer.
-3. Merge the pull request and tell Hermes. Hermes starts the draft run (90 minutes). A reply you sent Hermes goes into the draft prompt unchanged; the box copies it into `interview.md` and drops any answer that is not your words (`scripts/answers_guard.py` in the content-pipeline repository).
+2. Hermes starts the questions run (20 minutes), reports the task id and posts the questions. Answer either on the GitHub pull request, or by replying to Hermes: start each answer on a new line with its question number (`1.`), and put its source after the label `Source:`.
+3. Merge the pull request and tell Hermes. Hermes starts the draft run (90 minutes). A reply you sent Hermes goes into the draft prompt unchanged, and `scripts/answers.py` in the content-pipeline repository copies each numbered answer into `interview.md`. A reply without question numbers, or one that numbers a question twice, is not used; the draft pull request lists anything that was not placed.
 4. A final message that starts with `REFUSED:` is relayed as it is.
 
 Each run needs a live grant for the box. Hermes calls `request_access` when there is none.
