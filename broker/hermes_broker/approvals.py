@@ -20,6 +20,7 @@ from typing import Callable
 import httpx
 
 from .grants import DEPLOY_GRANT_MINUTES, GrantStore
+from .prod import Prod
 from .proposals import ProposalStore, change_hash, record_approval, record_drop, safe_id
 from .tasks import TaskStore
 
@@ -74,8 +75,33 @@ def parse_command(update: dict, owner_id: int) -> tuple[str, str] | None:
     return None
 
 
-def handle(store: GrantStore, verb: str, arg: str, now: float) -> str:
-    """Apply one parsed owner command; return the reply to send."""
+def _tell_hermes(prod: Prod | None, title: str) -> str:
+    """Prod Hermes about a grant just written; return the line to add to the reply.
+
+    The grant stands whatever happens here, so a prod that fails or raises only
+    changes what the owner is told. Callers build `title` from the box, the
+    minutes and the commit only, never from the request's reason: the reason is
+    text the agent wrote, and this line reaches it looking like the owner's word.
+    """
+    if prod is None:
+        return ""
+    try:
+        told = prod(title)
+    except Exception:
+        logger.exception("prod failed")
+        told = False
+    if told:
+        # "is being told": the task is completed, the gateway delivers it next.
+        return "\nHermes is being told and should continue shortly."
+    return "\nCould not tell Hermes. Message it yourself to continue."
+
+
+def handle(store: GrantStore, verb: str, arg: str, now: float, prod: Prod | None = None) -> str:
+    """Apply one parsed owner command; return the reply to send.
+
+    `prod`, when given, is called once for each grant issued, with the line of
+    text Hermes is to be woken with (see prod.py).
+    """
     if verb == "revoke":
         store.revoke(None)
         logger.info("all grants revoked by owner")
@@ -94,7 +120,9 @@ def handle(store: GrantStore, verb: str, arg: str, now: float) -> str:
         # sha was granted for `target`: approve_deploy only grants on a target match,
         # so there is no need to re-read the grant to learn its target.
         what = sha if target == "harness" else f"{target} {sha}"
-        return f"Deploy of {what} to tig-server approved for {DEPLOY_GRANT_MINUTES} min."
+        tool = "deploy_harness" if target == "harness" else "deploy_fleet"
+        told = _tell_hermes(prod, f"Owner approved deploying {target} {sha[:12]}. Call {tool} now.")
+        return f"Deploy of {what} to tig-server approved for {DEPLOY_GRANT_MINUTES} min.{told}"
     reason = store.pending_reason(arg)
     box = store.approve(arg, now)
     if box is None:
@@ -102,7 +130,8 @@ def handle(store: GrantStore, verb: str, arg: str, now: float) -> str:
         return "No pending request with that code."
     minutes = int((store.expires_at(box) - now) / 60)
     logger.info("granted %s for %s minutes", box, minutes)
-    return f"Granted {box} for {minutes} min.\nFor: {reason}"
+    told = _tell_hermes(prod, f"Owner approved {box} for {minutes} min. Continue what you requested it for.")
+    return f"Granted {box} for {minutes} min.\nFor: {reason}{told}"
 
 
 TASK_VERBS = ("task", "solo", "drop")
@@ -380,6 +409,7 @@ def _dispatch(
     now_fn: Callable[[], float],
     proposals: ProposalStore | None = None,
     state_dir: Path | None = None,
+    prod: Prod | None = None,
 ) -> str | None:
     """Route one parsed update to its handler; None means nothing to send.
 
@@ -387,7 +417,9 @@ def _dispatch(
     `date`), not by when this loop gets around to processing it: the announcer tick
     can hold the loop for up to 120s (list_triage's own timeout), and
     REQUEST_TTL_SECONDS is also 120s, so processing-time expiry would spuriously
-    reject a reply the owner sent in time. Task replies use 7-day codes, so
+    reject a reply the owner sent in time. A prod after a grant holds the loop as
+    well, for up to five of prod.STEP_TIMEOUT (75s), and a reply queued behind it
+    (a `revoke`, say) waits that long. Task replies use 7-day codes, so
     processing time is fine there, and a broken handler must not take the listener
     down with it.
     """
@@ -413,7 +445,7 @@ def _dispatch(
             logger.exception("handle_task failed")
             return f"task reply failed: {exc}"
     sent_at = float((update.get("message") or {}).get("date") or now_fn())
-    return handle(store, verb, arg, sent_at)
+    return handle(store, verb, arg, sent_at, prod)
 
 
 def run_listener(
@@ -427,11 +459,14 @@ def run_listener(
     proposals: ProposalStore | None = None,
     tuner_dir: Path | None = None,
     state_dir: Path | None = None,
+    prod: Prod | None = None,
+    transport: httpx.BaseTransport | None = None,
 ) -> None:
+    """Poll the approvals chat forever. `transport` replaces the network in tests."""
     offset = 0
     last_announce = 0.0
     last_tuner = 0.0
-    with httpx.Client() as client:
+    with httpx.Client(transport=transport) as client:
         announcer = None
         tuner_announcer = None
         if tasks is not None and call is not None:
@@ -457,7 +492,7 @@ def run_listener(
 
             for update in updates:
                 offset = max(offset, update.get("update_id", 0) + 1)
-                reply = _dispatch(update, owner_id, store, tasks, call, repos, time.time, proposals, state_dir)
+                reply = _dispatch(update, owner_id, store, tasks, call, repos, time.time, proposals, state_dir, prod)
                 if reply is not None:
                     _send(client, token, owner_id, reply)
             now = time.time()
