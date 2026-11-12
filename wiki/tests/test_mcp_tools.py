@@ -32,6 +32,12 @@ def test_tools_wrap_errors(cfg):
     assert "boom-message" in out["error"]
 
 
+def test_search_tool_reports_bad_updated_after(cfg):
+    out = json.loads(make_tools(cfg)["search"](updated_after="yesterday"))
+    assert "updated_after" in out["error"] and "'yesterday'" in out["error"]
+    assert any(h["page"] == "beta" for h in json.loads(make_tools(cfg)["search"](updated_after="2026-10-10")))
+
+
 def test_public_only_applies_to_tools(cfg):
     open_tools = make_tools(cfg)
     assert any(h["page"] == "gamma" for h in json.loads(open_tools["search"]()))
