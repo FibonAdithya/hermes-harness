@@ -91,7 +91,8 @@ def _tell_hermes(prod: Prod | None, title: str) -> str:
         logger.exception("prod failed")
         told = False
     if told:
-        return "\nHermes has been told and will continue."
+        # "is being told": the task is completed, the gateway delivers it next.
+        return "\nHermes is being told and should continue shortly."
     return "\nCould not tell Hermes. Message it yourself to continue."
 
 
@@ -416,7 +417,9 @@ def _dispatch(
     `date`), not by when this loop gets around to processing it: the announcer tick
     can hold the loop for up to 120s (list_triage's own timeout), and
     REQUEST_TTL_SECONDS is also 120s, so processing-time expiry would spuriously
-    reject a reply the owner sent in time. Task replies use 7-day codes, so
+    reject a reply the owner sent in time. A prod after a grant holds the loop as
+    well, for up to five of prod.STEP_TIMEOUT (75s), and a reply queued behind it
+    (a `revoke`, say) waits that long. Task replies use 7-day codes, so
     processing time is fine there, and a broken handler must not take the listener
     down with it.
     """
@@ -457,11 +460,13 @@ def run_listener(
     tuner_dir: Path | None = None,
     state_dir: Path | None = None,
     prod: Prod | None = None,
+    transport: httpx.BaseTransport | None = None,
 ) -> None:
+    """Poll the approvals chat forever. `transport` replaces the network in tests."""
     offset = 0
     last_announce = 0.0
     last_tuner = 0.0
-    with httpx.Client() as client:
+    with httpx.Client(transport=transport) as client:
         announcer = None
         tuner_announcer = None
         if tasks is not None and call is not None:

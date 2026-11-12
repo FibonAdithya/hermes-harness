@@ -34,7 +34,7 @@ not work; type it.
 
 On `approve <code>` and on `deploy <prefix>` the approvals bot tells the
 assistant, so you do not have to message it. Its reply to you ends with
-`Hermes has been told and will continue.` Within about 5 seconds the main bot
+`Hermes is being told and should continue shortly.` Within about 5 seconds the main bot
 posts a notice in the main chat (`✔ Kanban t_1a2b3c4d done — Owner approved …`)
 and the assistant takes a turn there, with the conversation so far, on a
 message that reads:
@@ -49,18 +49,28 @@ asked. `task`, `solo`, `drop`, `tool` and `revoke` send nothing.
 
 It works through a Hermes kanban task that exists only to complete
 (`broker/hermes_broker/prod.py` explains why). The task grants nothing: the
-tools still read `grants.json`. Each one is archived at the next approval.
+tools still read `grants.json`. A later approval archives each task once it is
+an hour old.
 
-If the reply ends with `Could not tell Hermes. Message it yourself to continue.`
-the grant was still issued; say anything to the assistant in the main chat and
-it carries on. Then find the step that failed:
+Two ways it can fail, and in both the grant was still issued; say anything to
+the assistant in the main chat and it carries on.
+
+- The reply ends with `Could not tell Hermes. Message it yourself to continue.`
+  A command the bot ran failed.
+- The reply says Hermes is being told, but the assistant has not taken a turn
+  after half a minute. The bot's commands worked and the gateway did not
+  deliver: it is stopped, or its kanban notifier is off.
 
 ```bash
-journalctl --user -u hermes-approvals -n 30 | grep prod     # which command, and its error
-hermes kanban list --session approvals-prod                 # tasks left behind, if any
-hermes kanban notify-list                                   # should be empty between approvals
-grep 'kanban notifier' ~/.hermes/logs/gateway.log | tail    # "woke agent for t_..." on success
+journalctl --user -u hermes-approvals -n 30 | grep prod     # which command failed, and its error
+grep 'kanban notifier' ~/.hermes/logs/gateway.log | tail    # "woke agent for t_..." for each delivery
+hermes kanban notify-list                                   # a row here long after an approval is a prod not yet delivered
+hermes kanban list --session approvals-prod                 # the prod tasks not yet archived; recent ones are expected
 ```
+
+The bot runs these commands before it replies, so a reply can take a few
+seconds longer than it used to, and up to 75 seconds if Hermes's CLI hangs. A
+`revoke` sent in that time is handled when the commands finish.
 
 **After a Hermes upgrade**, approve one request and check that the assistant
 continues by itself. The prod depends on three things in Hermes, last checked on

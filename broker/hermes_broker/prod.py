@@ -29,6 +29,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Callable, Mapping
 
@@ -43,7 +44,13 @@ HERMES_BIN = Path("/home/hermes/.local/bin/hermes")
 SESSION = "approvals-prod"
 # The wake message shows this much of a title (gateway/kanban_watchers.py).
 TITLE_CHARS = 120
-STEP_TIMEOUT = 30
+# Each step took under a second when measured; a prod holds the listener loop
+# for at most five of these.
+STEP_TIMEOUT = 15
+# A prod task is archived by a later prod once it is this old. Until then the
+# gateway may still have it to deliver (two approvals sent back to back, or a
+# gateway that was restarting), so it is left alone.
+TIDY_AFTER = 3600
 
 # argv: title, session id. Prints the new task id on the last line.
 CREATE_SCRIPT = """\
@@ -66,11 +73,14 @@ def make_prod(
     hermes_bin: Path = HERMES_BIN,
     run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
     environ: Mapping[str, str] | None = None,
+    clock: Callable[[], float] = time.time,
 ) -> Prod:
     """A function that prods Hermes in the owner's Telegram DM with one line of text.
 
-    It returns True once the gateway has been handed the prod, False if any step
-    failed. It never raises: a grant already written must not be lost to it.
+    It returns True once the task is completed, which is when the gateway picks
+    it up; that the gateway then delivered it is not checked. It returns False if
+    creating, subscribing or completing failed. Tidying up afterwards cannot
+    change the result.
     """
     python = str(Path(hermes_dir) / "venv" / "bin" / "python")
     hermes = str(hermes_bin)
@@ -81,7 +91,8 @@ def make_prod(
         env = {k: v for k, v in base.items() if k not in _NOT_INHERITED}
         try:
             done = run(cmd, capture_output=True, text=True, timeout=STEP_TIMEOUT, cwd=cwd, env=env)
-        except (OSError, subprocess.SubprocessError) as exc:
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            # ValueError: output that is not UTF-8 raises UnicodeDecodeError.
             logger.warning("prod: %s did not run: %s", step, exc)
             return None
         if done.returncode != 0:
@@ -89,21 +100,30 @@ def make_prod(
             return None
         return done.stdout or ""
 
+    def is_old(row: dict, now: float) -> bool:
+        """True only for a creation time that can be read and is TIDY_AFTER or more ago."""
+        created = row.get("created_at")
+        if isinstance(created, bool) or not isinstance(created, (int, float)):
+            return False
+        return now - created >= TIDY_AFTER
+
     def tidy(keep: str) -> None:
-        """Archive earlier prod tasks. `keep` is the one just completed: the
-        gateway may not have delivered it yet."""
+        """Archive prod tasks at least TIDY_AFTER old. Never `keep`, the one just
+        completed, whatever age the listing gives it."""
         listed = call("list", [hermes, "kanban", "list", "--session", SESSION, "--json"])
         if listed is None:
             return
         try:
             rows = json.loads(listed)
         except ValueError:
-            return
+            rows = None
         if not isinstance(rows, list):
+            logger.warning("prod: the task listing was not a JSON list; nothing archived")
             return
+        now = clock()
         old = [row["id"] for row in rows
                if isinstance(row, dict) and isinstance(row.get("id"), str)
-               and _TASK_ID.fullmatch(row["id"]) and row["id"] != keep]
+               and _TASK_ID.fullmatch(row["id"]) and row["id"] != keep and is_old(row, now)]
         if old:
             call("archive", [hermes, "kanban", "archive", *old])
 

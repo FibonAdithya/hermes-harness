@@ -69,12 +69,12 @@ def _prod_wiring(cfg: BrokerConfig, run=subprocess.run) -> Prod:
     return make_prod(cfg.owner_telegram_id, run=run)
 
 
-def main() -> None:
+def main(listener=run_listener, run=subprocess.run) -> None:
     configure_logging()
     cfg = load_config(Path(os.environ["HERMES_BROKER_CONFIG"]))
     tasks, call = _task_wiring(cfg)
     proposals, tuner_dir = _proposal_wiring(cfg)
-    run_listener(
+    listener(
         GrantStore(cfg.state_dir / "grants.json"),
         cfg.approvals_bot_token,
         cfg.owner_telegram_id,
@@ -84,7 +84,7 @@ def main() -> None:
         proposals=proposals,
         tuner_dir=tuner_dir,
         state_dir=cfg.state_dir,
-        prod=_prod_wiring(cfg),
+        prod=_prod_wiring(cfg, run=run),
     )
 
 
