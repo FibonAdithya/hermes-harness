@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import TextIO
@@ -13,6 +14,7 @@ from . import box
 from .approvals import Call, run_listener
 from .config import BrokerConfig, load_config
 from .grants import GrantStore
+from .prod import Prod, make_prod
 from .proposals import ProposalStore
 from .tasks import TaskStore
 
@@ -62,6 +64,11 @@ def _proposal_wiring(cfg: BrokerConfig) -> tuple[ProposalStore, Path]:
     return ProposalStore(cfg.state_dir / "proposals.json"), cfg.tuner_dir
 
 
+def _prod_wiring(cfg: BrokerConfig, run=subprocess.run) -> Prod:
+    """Grants are announced to Hermes in the owner's own Telegram chat with it."""
+    return make_prod(cfg.owner_telegram_id, run=run)
+
+
 def main() -> None:
     configure_logging()
     cfg = load_config(Path(os.environ["HERMES_BROKER_CONFIG"]))
@@ -77,6 +84,7 @@ def main() -> None:
         proposals=proposals,
         tuner_dir=tuner_dir,
         state_dir=cfg.state_dir,
+        prod=_prod_wiring(cfg),
     )
 
 

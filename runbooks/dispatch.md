@@ -30,6 +30,45 @@ assistant: `systemctl --user start harness-pull.service` here, by hand.
 Forwarded messages are ignored by design. If you forward yourself a code it will
 not work; type it.
 
+### What happens after you approve
+
+On `approve <code>` and on `deploy <prefix>` the approvals bot tells the
+assistant, so you do not have to message it. Its reply to you ends with
+`Hermes has been told and will continue.` Within about 5 seconds the main bot
+posts a notice in the main chat (`✔ Kanban t_1a2b3c4d done — Owner approved …`)
+and the assistant takes a turn there, with the conversation so far, on a
+message that reads:
+
+```
+[kanban] Task t_1a2b3c4d completed.
+Title: Owner approved tig-server for 30 min. Continue what you requested it for.
+```
+
+The message always goes to your own chat with the main bot, whichever session
+asked. `task`, `solo`, `drop`, `tool` and `revoke` send nothing.
+
+It works through a Hermes kanban task that exists only to complete
+(`broker/hermes_broker/prod.py` explains why). The task grants nothing: the
+tools still read `grants.json`. Each one is archived at the next approval.
+
+If the reply ends with `Could not tell Hermes. Message it yourself to continue.`
+the grant was still issued; say anything to the assistant in the main chat and
+it carries on. Then find the step that failed:
+
+```bash
+journalctl --user -u hermes-approvals -n 30 | grep prod     # which command, and its error
+hermes kanban list --session approvals-prod                 # tasks left behind, if any
+hermes kanban notify-list                                   # should be empty between approvals
+grep 'kanban notifier' ~/.hermes/logs/gateway.log | tail    # "woke agent for t_..." on success
+```
+
+**After a Hermes upgrade**, approve one request and check that the assistant
+continues by itself. The prod depends on three things in Hermes, last checked on
+v0.19.0: `hermes_cli.kanban_db.create_task` accepts `session_id`; the gateway's
+kanban notifier is on (`kanban.dispatch_in_gateway`, on by default); and
+`hermes kanban` still has `notify-subscribe`, `complete`, `list --session` and
+`archive`.
+
 ## Inspecting state
 
 ```bash
@@ -117,6 +156,8 @@ systemctl --user start hermes-repo-sync.service    # refresh now
 - `deploy_harness` without an approved deploy, or a second time on one
   approval → `LOCKED: no approved deploy`.
 - A cron job asking for access → it gets a code nobody approves, then `LOCKED`.
+  If you do approve one, the grant is issued, but the message that follows goes
+  to your main chat, not to the cron job's session.
 - `curl` from inside the agent's sandbox → no network, by design. Check the right
   container: names are hashes, and the `prompt-backend-probe` one is on `bridge`
   on purpose. Use
