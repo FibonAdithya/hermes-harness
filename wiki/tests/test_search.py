@@ -38,6 +38,21 @@ def test_type_and_updated_after(root):
     assert "delta" not in names(sr.search(root, "", type="decision"))
 
 
+@pytest.mark.parametrize("bad", ["yesterday", "2026-13-45", "10/11/2026", "2026-02-30", "20261010"])
+def test_updated_after_must_be_a_date(root, bad):
+    with pytest.raises(ValueError) as e:
+        sr.search(root, "", updated_after=bad)
+    assert "updated_after" in str(e.value) and repr(bad) in str(e.value)
+
+
+def test_updated_after_valid_or_empty(root):
+    assert names(sr.search(root, "", updated_after="2026-10-10")) == ["beta"]
+    everything = names(sr.search(root, ""))
+    assert len(everything) > 1
+    assert names(sr.search(root, "", updated_after=None)) == everything
+    assert names(sr.search(root, "", updated_after="")) == everything
+
+
 def test_repos_filter_is_any_of(root, tmp_path):
     extra = {"r1": "---\ntype: topic\ntags: [ops]\nrepos: [x, y]\n---\nbody\n"}
     r = build_wiki(tmp_path / "w", extra_pages=extra)

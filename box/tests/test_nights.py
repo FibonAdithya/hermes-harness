@@ -9,6 +9,17 @@ import boxlib
 VERBS = Path(__file__).resolve().parents[1] / "verbs"
 
 
+def _stub_systemctl(tmp_path, state="active"):
+    """A `systemctl` that answers `is-active` with `state`, so the test does not
+    ask the host's systemd (or fail where there is none)."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    ctl = bin_dir / "systemctl"
+    ctl.write_text(f"#!/bin/sh\ncase \"$2\" in is-active) echo {state}; [ {state} = active ] && exit 0; exit 3;; esac\nexit 0\n")
+    ctl.chmod(0o755)
+    return bin_dir
+
+
 def test_night_id_shape_and_validation():
     import calendar
 
@@ -25,7 +36,8 @@ def test_two_ids_differ():
     assert boxlib.new_night_id("talos", now=1.0) != boxlib.new_night_id("talos", now=1.0)
 
 
-def test_status_reads_every_night(tmp_path):
+def test_status_reads_every_night(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", f"{_stub_systemctl(tmp_path)}:/usr/bin:/bin")
     root = tmp_path / "nights"
     a = boxlib.night_dir(root, "fleet-20260924-2300-aaaa")
     b = boxlib.night_dir(root, "talos-20260924-2301-bbbb")

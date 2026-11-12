@@ -19,7 +19,7 @@ def commit(up, check_rc=0, msg="c"):
     return git(up, "rev-parse", "HEAD")
 
 
-def setup(tmp_path):
+def make_repos(tmp_path):
     origin, up, home = tmp_path / "origin.git", tmp_path / "up", tmp_path / "home"
     subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
     subprocess.run(["git", "clone", "-q", str(origin), str(up)], check=True, capture_output=True)
@@ -52,7 +52,7 @@ def running_night(home, name="fleet-20260926-2300-ab12"):
 
 
 def test_deploys_a_green_main_commit(tmp_path):
-    up, home, box, _, shims = setup(tmp_path)
+    up, home, box, _, shims = make_repos(tmp_path)
     want = commit(up, msg="second")
     rc, out = run(home, shims, {"sha": want, "target": "fleet"})
     assert (rc, out) == (0, {"deployed": want, "target": "fleet"})
@@ -63,7 +63,7 @@ def test_deploys_a_green_main_commit(tmp_path):
 
 def test_refuses_while_any_fleet_night_runs(tmp_path):
     """Any repo's fleet night: the daemon for fleet-fixture runs from ~/TIG/fleet too."""
-    up, home, box, first, shims = setup(tmp_path)
+    up, home, box, first, shims = make_repos(tmp_path)
     want = commit(up, msg="second")
     running_night(home)
     rc, out = run(home, shims, {"sha": want, "target": "fleet"}, SYSTEMCTL_STATE="active")
@@ -72,7 +72,7 @@ def test_refuses_while_any_fleet_night_runs(tmp_path):
 
 
 def test_refuses_when_main_moved(tmp_path):
-    up, home, box, first, shims = setup(tmp_path)
+    up, home, box, first, shims = make_repos(tmp_path)
     approved = commit(up, msg="approved")
     commit(up, msg="later")
     rc, out = run(home, shims, {"sha": approved, "target": "fleet"})
@@ -81,7 +81,7 @@ def test_refuses_when_main_moved(tmp_path):
 
 
 def test_a_red_commit_is_rolled_back_to_the_deployed_one(tmp_path):
-    up, home, box, first, shims = setup(tmp_path)
+    up, home, box, first, shims = make_repos(tmp_path)
     red = commit(up, check_rc=1, msg="red")
     rc, out = run(home, shims, {"sha": red, "target": "fleet"})
     assert rc == 2 and f"make check failed at {red[:12]}" in out["error"] and "checked red" in out["error"]
@@ -90,7 +90,7 @@ def test_a_red_commit_is_rolled_back_to_the_deployed_one(tmp_path):
 
 
 def test_unknown_target_refused(tmp_path):
-    _, home, _, first, shims = setup(tmp_path)
+    _, home, _, first, shims = make_repos(tmp_path)
     rc, out = run(home, shims, {"sha": first, "target": "droplet"})
     assert rc == 2 and out["error"] == "deploy target must be harness or fleet"
 
@@ -108,7 +108,7 @@ def _flaky_uv(fail_on_call: int, message: str) -> str:
 
 
 def test_uv_sync_failure_is_labeled_and_rolled_back(tmp_path):
-    up, home, box, first, shims = setup(tmp_path)
+    up, home, box, first, shims = make_repos(tmp_path)
     want = commit(up, msg="second")
     (shims / "uv").write_text(_flaky_uv(1, "uv sync exploded"))
     (shims / "uv").chmod(0o755)
@@ -118,7 +118,7 @@ def test_uv_sync_failure_is_labeled_and_rolled_back(tmp_path):
 
 
 def test_rollback_failure_is_reported(tmp_path):
-    up, home, box, first, shims = setup(tmp_path)
+    up, home, box, first, shims = make_repos(tmp_path)
     red = commit(up, check_rc=1, msg="red")
     # 1st uv sync call is install(red)'s -- let it pass so make check is what fails there;
     # 2nd uv sync call is the rollback's -- make that one explode.
