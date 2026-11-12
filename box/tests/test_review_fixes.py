@@ -43,7 +43,8 @@ def test_running_night_without_a_unit_is_stale(tmp_path, monkeypatch):
 
 
 # I3: started is when the night started, not when it finished.
-def test_started_does_not_move_when_the_night_finishes(tmp_path):
+def test_started_does_not_move_when_the_night_finishes(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", _fake_systemctl(tmp_path, ["night-task-20260924-0100-cafe"]) + ":/usr/bin:/bin")
     root = tmp_path / "nights"
     d = boxlib.night_dir(root, "task-20260924-0100-cafe")
     d.mkdir(parents=True)
