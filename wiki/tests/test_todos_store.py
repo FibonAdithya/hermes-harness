@@ -68,8 +68,35 @@ def test_five_conflicts_give_up(cfg, sleeps):  # off-by-one on ATTEMPTS
 def test_put_timeout_not_retried(cfg, sleeps):  # spec 6; catches blind retry
     st = FakeStore(gets=[(fix(), "s1")] * 2, puts=[todos.WriteUncertain(), None])
     with pytest.raises(todos.TodoError, match="may or may not") as e:
-        todos.cmd_add(cfg, st, "T", [], sleep=sleeps.append)
+        todos.cmd_add(cfg, st, "T", [], sleep=sleeps.append, new_id=lambda: "abcdef")
     assert e.value.code == 1 and len(st.puts) == 1
+    assert "item abcdef may or may not" in str(e.value)
+
+
+def test_done_put_timeout_names_the_id(cfg, sleeps):
+    st = FakeStore(gets=[(one_item(), "s1")], puts=[todos.WriteUncertain()])
+    with pytest.raises(todos.TodoError) as e:
+        todos.cmd_done(cfg, st, "111111", sleep=sleeps.append)
+    assert e.value.code == 1 and "item 111111 may or may not" in str(e.value)
+
+
+def test_get_store_error_is_exit_1_for_list_and_add(cfg, sleeps):  # other GitHub failure -> 1
+    class RaisingGet(FakeStore):
+        def get(self, path):
+            raise todos.StoreError("boom")
+
+    for call in (lambda: todos.cmd_list(cfg, RaisingGet([], []), False),
+                 lambda: todos.cmd_add(cfg, RaisingGet([], []), "T", [], sleep=sleeps.append)):
+        with pytest.raises(todos.TodoError, match="^GitHub: boom") as e:
+            call()
+        assert e.value.code == 1
+
+
+def test_put_store_error_is_exit_1(cfg, sleeps):
+    st = FakeStore(gets=[(fix(), "s1")], puts=[todos.StoreError("boom")])
+    with pytest.raises(todos.TodoError, match="^GitHub: boom") as e:
+        todos.cmd_add(cfg, st, "T", [], sleep=sleeps.append)
+    assert e.value.code == 1
 
 
 def test_secret_title_makes_no_store_call(cfg, sleeps):  # spec 7; catches scan after write / scan skipped

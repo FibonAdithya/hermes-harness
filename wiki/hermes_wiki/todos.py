@@ -178,7 +178,7 @@ def list_items(text: str, include_done: bool) -> list[Item]:
         return []
     out = []
     for i in range(sec[0] + 1, sec[1]):
-        m = _ITEM.match(lines[i].rstrip("\n"))
+        m = _ITEM.match(lines[i].rstrip("\r\n"))
         if not m:
             continue
         done = m.group(1) in "xX"
@@ -276,7 +276,8 @@ def store_for(cfg: WikiConfig, run) -> GhContents | DryContents:
     return GhContents(cfg.repo, cfg.gh, run)
 
 
-def update(store, edit: Callable[[str], tuple[str, str] | None], *, sleep) -> bool:
+def update(store, edit: Callable[[str], tuple[str, str] | None], *, sleep,
+           item_id: Callable[[], str] = lambda: "") -> bool:
     for attempt in range(ATTEMPTS):
         try:
             got = store.get(PATH)
@@ -298,8 +299,10 @@ def update(store, edit: Callable[[str], tuple[str, str] | None], *, sleep) -> bo
                     f"todos.md kept changing; gave up after {ATTEMPTS} attempts") from None
             sleep(0.5 * 2 ** attempt + random.uniform(0, 0.5))
         except WriteUncertain:
+            iid = item_id()
+            what = f"item {iid}" if iid else "the write"
             raise TodoError(
-                "timed out writing todos.md; the write may or may not have landed") from None
+                f"timed out writing todos.md; {what} may or may not have landed") from None
         except StoreError as e:
             raise TodoError(f"GitHub: {e}") from None
     raise AssertionError("unreachable")
@@ -319,7 +322,7 @@ def cmd_add(cfg: WikiConfig, store, title: str, details: list[str], *,
         landed[:] = [item_id]
         return new_text, f"todo: add {item_id}"
 
-    update(store, edit, sleep=sleep)
+    update(store, edit, sleep=sleep, item_id=lambda: landed[0] if landed else "")
     return landed[0]
 
 
@@ -328,7 +331,7 @@ def cmd_done(cfg: WikiConfig, store, item_id: str, *, sleep=time.sleep) -> bool:
         new_text = tick_item(text, item_id)
         return None if new_text is None else (new_text, f"todo: done {item_id}")
 
-    return update(store, edit, sleep=sleep)
+    return update(store, edit, sleep=sleep, item_id=lambda: item_id)
 
 
 def cmd_list(cfg: WikiConfig, store, include_done: bool) -> list[Item]:

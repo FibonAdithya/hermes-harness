@@ -88,9 +88,11 @@ def test_done_then_done_again(env, monkeypatch, capsys):
     item_id = capsys.readouterr().out.strip()
     assert cli.main(["todo", "done", item_id, "--config", conf]) == 0
     assert f"- [x] T (" in env.dry.read_text(encoding="utf-8")
-    capsys.readouterr()
+    assert capsys.readouterr().out == ""
     assert cli.main(["todo", "done", item_id, "--config", conf]) == 0
-    assert "already done" in capsys.readouterr().err
+    cap = capsys.readouterr()
+    assert cap.out == ""
+    assert "already done" in cap.err
     assert cli.main(["todo", "done", "ffffff", "--config", conf]) == 1
 
 

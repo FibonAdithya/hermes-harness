@@ -67,6 +67,16 @@ def test_done_ignores_indented_lines():  # Review Focus 4
     with pytest.raises(todos.TodoError):
         todos.tick_item(old, "abc123")
 
+def test_done_with_two_matching_lines_is_refused():  # catches ticking the first of several matches
+    old = with_section("- [ ] A (2026-11-12, claude-box, id 111111)\n- [ ] B (2026-11-12, claude-box, id 111111)\n")
+    with pytest.raises(todos.TodoError) as e:
+        todos.tick_item(old, "111111")
+    assert e.value.code == 1
+
+def test_list_parses_crlf_item_line():  # catches a trailing \r breaking the title/id match
+    old = with_section("- [ ] One (2026-11-12, claude-box, id 111111)\r\n")
+    assert todos.list_items(old, True) == [todos.Item(id="111111", title="One", done=False)]
+
 def test_done_already_ticked_returns_none():  # catches rewriting a ticked item / failing on it
     assert todos.tick_item(with_section("- [x] Old (2026-11-12, claude-box, id 111111)\n"), "111111") is None
 
