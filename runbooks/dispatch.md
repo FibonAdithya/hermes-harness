@@ -24,6 +24,26 @@ for one deploy within 10 minutes. If `master` has moved on by the time it runs,
 the box refuses and the assistant has to ask again. A `tig-server` grant does
 not allow a deploy.
 
+The bot also asks by itself when the box is behind `master`. It looks once the
+`master` commit is at least 30 minutes old, sends no ask when the diff between the
+box's commit and `master` touches only `docs/` (the check uses `git diff
+--no-renames`, so moving a file into `docs/` still asks), and asks once per
+`master` commit. The ask is valid for 24 hours. The reply is the same
+`deploy <prefix>`, typed after reading the commits. For an ask the bot sent
+itself, the listener runs the deploy with no grant and replies
+`tig-server: deployed <sha12>`, or the box's error text. An agent's
+`request_deploy` replaces a pending auto-ask; an auto-ask never replaces an
+agent's request. `harness-pull` defers the approvals restart while a deploy runs
+(a record in `<state_dir>/deploy_ask.json` younger than 20 minutes). The box
+refuses a second deploy while one runs (`~/.local/share/deploy.lock`, reply
+`a deploy is already running`). If a deploy fails on the box (for example
+`install.sh failed`), the bot does not ask again for the same `master` commit:
+retry with `request_deploy` or wait for the next merge.
+
+First time only: the box needs one deploy through `request_deploy` to install the
+`deployed` verb. Until then the listener cannot read the box's commit, logs one
+warning an hour (with the box's error text) and asks nothing.
+
 The droplet (the broker and this approvals bot) is never deployed by the
 assistant: `systemctl --user start harness-pull.service` here, by hand.
 
