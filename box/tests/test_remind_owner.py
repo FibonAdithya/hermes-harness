@@ -145,6 +145,17 @@ def test_cancel_refuses_null_script_and_unknown_id(tmp_path):
     assert calls == [] and calls2 == []
 
 
+def test_cancel_refuses_near_miss_script_names(tmp_path):  # catches fullmatch -> search/match
+    for n, name in enumerate(["remind-notes.sh", "xremind-20261113094637-5830.sh"]):
+        d = tmp_path / str(n)
+        d.mkdir()
+        r, calls, scripts = _run(d, args=("--cancel", "j1"), jobs=_jobs(("j1", name)),
+                                 extra=[(name, 5)])
+        assert r.returncode == 1, name
+        assert calls == []
+        assert name in _names(scripts)
+
+
 def test_cancel_keeps_files_when_remove_fails(tmp_path):
     jobs = _jobs(("j1", R1 + ".sh"))
     r, calls, scripts = _run(tmp_path, args=("--cancel", "j1"), jobs=jobs,
