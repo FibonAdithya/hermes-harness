@@ -1,3 +1,4 @@
+import json
 import pytest
 from hermes_broker.grants import GrantStore, BOXES, REQUEST_TTL_SECONDS
 
@@ -221,3 +222,102 @@ def test_a_deploy_reply_sent_before_the_request_existed_is_refused_and_the_reque
     store.create_deploy_request(sha, now=1000.0, target="fleet")
     assert store.approve_deploy(sha[:7], now=999.0, target="fleet") is None
     assert store.approve_deploy(sha[:7], now=1001.0, target="fleet") == sha
+
+
+SHA = "4774e2314f46" + "0" * 28
+
+
+def test_auto_request_is_valid_for_24h(store):
+    store.create_deploy_request(SHA, now=0.0, ttl_seconds=86400, origin="auto")
+    assert store.approve_auto_deploy("4774e23", now=23 * 3600) == SHA
+    store.create_deploy_request(SHA, now=0.0, ttl_seconds=86400, origin="auto")
+    assert store.approve_auto_deploy("4774e23", now=25 * 3600) is None
+
+
+def test_agent_request_still_expires_at_120s(store):
+    store.create_deploy_request(SHA, now=0.0)
+    assert store.approve_deploy("4774e23", now=121.0) is None
+    store.create_deploy_request(SHA, now=0.0)
+    assert store.approve_deploy("4774e23", now=119.0) == SHA
+
+
+def test_auto_approval_writes_no_grant(store):
+    store.create_deploy_request(SHA, now=0.0, ttl_seconds=86400, origin="auto")
+    assert store.approve_auto_deploy("4774e23", now=10.0) == SHA
+    data = json.loads(store.path.read_text())
+    assert "deploy" not in data["grants"] and "pending_deploy" not in data
+    assert store.take_deploy_grant(now=11.0) is None
+
+
+def test_approve_deploy_refuses_an_auto_request(store):
+    store.create_deploy_request(SHA, now=0.0, ttl_seconds=86400, origin="auto")
+    assert store.approve_deploy("4774e23", now=10.0) is None
+    assert store.pending_deploy_origin(10.0) == "auto"
+
+
+def test_approve_auto_deploy_refuses_an_agent_request(store):
+    store.create_deploy_request(SHA, now=0.0)
+    assert store.approve_auto_deploy("4774e23", now=10.0) is None
+    assert store.pending_deploy_origin(10.0) == "agent"
+
+
+def test_auto_wrong_target_or_prefix_keeps_it_pending(store):
+    store.create_deploy_request(SHA, now=0.0, ttl_seconds=86400, origin="auto")
+    assert store.approve_auto_deploy("4774e23", now=10.0, target="fleet") is None
+    assert store.approve_auto_deploy("deadbee", now=10.0) is None
+    assert store.approve_auto_deploy("4774e23", now=10.0) == SHA
+
+
+def test_auto_prefix_is_lowercased_and_needs_seven_chars(store):
+    store.create_deploy_request(SHA, now=0.0, ttl_seconds=86400, origin="auto")
+    assert store.approve_auto_deploy("4774e2", now=10.0) is None
+    assert store.approve_auto_deploy("4774E23", now=10.0) == SHA
+
+
+def test_auto_reply_sent_before_the_request_existed_is_refused(store):
+    store.create_deploy_request(SHA, now=100.0, ttl_seconds=86400, origin="auto")
+    assert store.approve_auto_deploy("4774e23", now=99.0) is None
+    assert store.pending_deploy_origin(101.0) == "auto"
+
+
+def test_expired_auto_request_is_popped(store):
+    store.create_deploy_request(SHA, now=0.0, ttl_seconds=86400, origin="auto")
+    assert store.approve_auto_deploy("4774e23", now=86401.0) is None
+    assert "pending_deploy" not in json.loads(store.path.read_text())
+
+
+def test_record_without_origin_is_agent(store):
+    store.path.write_text(json.dumps({"pending": {}, "grants": {}, "pending_deploy": {
+        "sha": SHA, "target": "harness", "created_at": 0, "expires_at": 120}}))
+    assert store.pending_deploy_origin(10.0) == "agent"
+    assert store.approve_auto_deploy("4774e23", now=10.0) is None
+    assert store.approve_deploy("4774e23", now=10.0) == SHA
+
+
+def test_pending_deploy_origin_none_when_absent_or_expired(store):
+    assert store.pending_deploy_origin(0.0) is None
+    store.create_deploy_request(SHA, now=0.0)
+    assert store.pending_deploy_origin(121.0) is None
+
+
+@pytest.mark.parametrize("setup, busy", [
+    ("agent_harness", True), ("agent_fleet", True), ("auto", False),
+    ("grant", True), ("nothing", False)])
+def test_deploy_slot_busy(store, setup, busy):
+    if setup == "agent_harness":
+        store.create_deploy_request(SHA, 0.0)
+    elif setup == "agent_fleet":
+        store.create_deploy_request(SHA, 0.0, target="fleet")
+    elif setup == "auto":
+        store.create_deploy_request(SHA, 0.0, ttl_seconds=86400, origin="auto")
+    elif setup == "grant":
+        store.create_deploy_request(SHA, 0.0)
+        assert store.approve_deploy("4774e23", now=1.0) == SHA
+    assert store.deploy_slot_busy(50.0) is busy
+    if busy:
+        assert store.deploy_slot_busy(10_000.0) is False
+
+
+def test_unknown_origin_rejected(store):
+    with pytest.raises(ValueError):
+        store.create_deploy_request(SHA, now=0.0, origin="owner")

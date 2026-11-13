@@ -19,6 +19,7 @@ from typing import Callable
 
 import httpx
 
+from .deploy_ask import DEPLOY_BUSY, STATE_FILE, DeployAnnouncer, DeployAskState, DeployRunner
 from .grants import DEPLOY_GRANT_MINUTES, GrantStore
 from .prod import Prod
 from .proposals import ProposalStore, change_hash, record_approval, record_drop, safe_id
@@ -96,7 +97,8 @@ def _tell_hermes(prod: Prod | None, title: str) -> str:
     return "\nCould not tell Hermes. Message it yourself to continue."
 
 
-def handle(store: GrantStore, verb: str, arg: str, now: float, prod: Prod | None = None) -> str:
+def handle(store: GrantStore, verb: str, arg: str, now: float, prod: Prod | None = None,
+           runner: DeployRunner | None = None) -> str:
     """Apply one parsed owner command; return the reply to send.
 
     `prod`, when given, is called once for each grant issued, with the line of
@@ -112,6 +114,17 @@ def handle(store: GrantStore, verb: str, arg: str, now: float, prod: Prod | None
         target, sep, prefix = arg.partition(":")
         if not sep:
             target, prefix = "harness", target
+        if store.pending_deploy_origin(now) == "auto":
+            if runner is None:
+                return "Auto deploys are not wired in this listener."
+            if runner.busy():
+                return DEPLOY_BUSY
+            sha = store.approve_auto_deploy(prefix, now, target)
+            if sha is None:
+                logger.info("rejected deploy prefix")
+                return f"No pending {target} deploy of a commit starting {prefix}."
+            logger.info("auto deploy of %s approved", sha)
+            return f"Deploy of {sha} to tig-server approved.\n" + runner.start(sha)
         sha = store.approve_deploy(prefix, now, target=target)
         if sha is None:
             logger.info("rejected deploy prefix")
@@ -410,6 +423,7 @@ def _dispatch(
     proposals: ProposalStore | None = None,
     state_dir: Path | None = None,
     prod: Prod | None = None,
+    runner: DeployRunner | None = None,
 ) -> str | None:
     """Route one parsed update to its handler; None means nothing to send.
 
@@ -445,7 +459,7 @@ def _dispatch(
             logger.exception("handle_task failed")
             return f"task reply failed: {exc}"
     sent_at = float((update.get("message") or {}).get("date") or now_fn())
-    return handle(store, verb, arg, sent_at, prod)
+    return handle(store, verb, arg, sent_at, prod, runner=runner)
 
 
 def run_listener(
@@ -460,15 +474,27 @@ def run_listener(
     tuner_dir: Path | None = None,
     state_dir: Path | None = None,
     prod: Prod | None = None,
+    harness_checkout: Path | None = None,
     transport: httpx.BaseTransport | None = None,
 ) -> None:
     """Poll the approvals chat forever. `transport` replaces the network in tests."""
     offset = 0
     last_announce = 0.0
     last_tuner = 0.0
+    last_deploy_ask = 0.0
     with httpx.Client(transport=transport) as client:
         announcer = None
         tuner_announcer = None
+        deploy_announcer = None
+        runner = None
+        if call is not None and state_dir is not None and harness_checkout is not None:
+            # The runner's worker thread sends through this same client; httpx's pool is thread-safe.
+            def send(text: str) -> bool:
+                return _send(client, token, owner_id, text)
+
+            deploy_state = DeployAskState(Path(state_dir) / STATE_FILE)
+            runner = DeployRunner(call, send, deploy_state)
+            deploy_announcer = DeployAnnouncer(store, deploy_state, runner, call, send, harness_checkout)
         if tasks is not None and call is not None:
             announcer = Announcer(tasks, store, call, lambda text: _send(client, token, owner_id, text),
                                   proposals=proposals)
@@ -492,7 +518,8 @@ def run_listener(
 
             for update in updates:
                 offset = max(offset, update.get("update_id", 0) + 1)
-                reply = _dispatch(update, owner_id, store, tasks, call, repos, time.time, proposals, state_dir, prod)
+                reply = _dispatch(update, owner_id, store, tasks, call, repos, time.time, proposals, state_dir, prod,
+                                 runner)
                 if reply is not None:
                     _send(client, token, owner_id, reply)
             now = time.time()
@@ -509,3 +536,9 @@ def run_listener(
                     tuner_announcer.tick(now)
                 except Exception:
                     logger.exception("tuner announcer tick failed")
+            if deploy_announcer is not None and now - last_deploy_ask >= ANNOUNCE_EVERY:
+                last_deploy_ask = now
+                try:
+                    deploy_announcer.tick(now)
+                except Exception:
+                    logger.exception("deploy announcer tick failed")

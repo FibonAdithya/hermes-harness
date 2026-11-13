@@ -1,4 +1,5 @@
 """The deploy verb: install exactly the approved commit, and only while it is master."""
+import fcntl
 import json
 import os
 import shutil
@@ -39,7 +40,7 @@ def make_repos(tmp_path):
 
 def run(home, args, path=None):
     env = {"HOME": str(home), "PATH": path or os.environ["PATH"]}
-    proc = subprocess.run([str(VERB)], input=json.dumps(args).encode(), env=env, capture_output=True, check=False)
+    proc = subprocess.run([str(VERB)], input=json.dumps(args).encode(), env=env, capture_output=True, check=False, timeout=30)
     return proc.returncode, json.loads(proc.stdout)
 
 
@@ -101,3 +102,26 @@ def test_install_failure_is_a_refusal_and_leaves_no_stamp(tmp_path):
     assert rc == 2
     assert out["error"] == "install.sh failed at " + want[:12] + ": docker build of hermes-exec failed"
     assert not (home / ".local/share/harness-deployed.sha").exists()
+
+
+def test_refuses_while_another_deploy_holds_the_lock(tmp_path):
+    up, home, box, first = make_repos(tmp_path)
+    want = commit(up, msg="second")
+    shim = tmp_path / "shim"; shim.mkdir()
+    log = tmp_path / "git.log"
+    real = shutil.which("git")
+    (shim / "git").write_text(f'#!/bin/sh\necho "$*" >> "{log}"\nexec "{real}" "$@"\n')
+    (shim / "git").chmod(0o755)
+    lock = home / ".local/share/deploy.lock"; lock.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock, "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        rc, out = run(home, {"sha": want}, path=f"{shim}:{os.environ['PATH']}")
+    assert (rc, out) == (2, {"error": "a deploy is already running"})
+    assert not log.exists()  # no git command ran
+    assert git(box, "rev-parse", "HEAD") == first
+
+
+def test_lock_is_released_after_a_deploy(tmp_path):
+    up, home, _, _ = make_repos(tmp_path)
+    a = commit(up, msg="a"); assert run(home, {"sha": a})[0] == 0
+    b = commit(up, msg="b"); assert run(home, {"sha": b}) == (0, {"deployed": b})

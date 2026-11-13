@@ -6,6 +6,7 @@ target is "harness" (hermes-harness master, deployed to ~/TIG/hermes-harness) or
 owner approved; it is installed only if it is still the target's tracked branch
 tip, so a merge landing after the approval is never deployed under it.
 """
+import fcntl
 import json
 import os
 import re
@@ -96,6 +97,15 @@ def deploy_fleet(home: Path, sha: str) -> None:
     stamp.write_text(sha)
     print(json.dumps({"deployed": sha, "target": "fleet"}))
 
+
+# One deploy at a time, whoever asked; the lock lives until this process exits.
+lock_path = home / ".local" / "share" / "deploy.lock"
+lock_path.parent.mkdir(parents=True, exist_ok=True)
+lock_fh = open(lock_path, "w")
+try:
+    fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    sys.exit(boxlib.refuse("a deploy is already running"))
 
 if target == "fleet":
     deploy_fleet(home, sha)

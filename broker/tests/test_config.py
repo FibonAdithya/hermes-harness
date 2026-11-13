@@ -61,3 +61,17 @@ def test_broker_config_constructs_without_tuner_dir(tmp_path):
     from hermes_broker.config import BrokerConfig
     cfg = BrokerConfig(1, "t", (), {}, tmp_path)
     assert cfg.tuner_dir == Path("/home/hermes/.hermes/tuner")
+
+
+def test_harness_checkout_defaults_to_home(tmp_path):
+    from pathlib import Path
+    assert load_config(write(tmp_path)).harness_checkout == Path.home() / "hermes-harness"
+
+
+def test_harness_checkout_can_be_configured(tmp_path):
+    assert load_config(write(tmp_path, harness_checkout=str(tmp_path / "hh"))).harness_checkout == tmp_path / "hh"
+
+
+def test_harness_checkout_expands_tilde(tmp_path):
+    from pathlib import Path
+    assert load_config(write(tmp_path, harness_checkout="~/x")).harness_checkout == Path.home() / "x"

@@ -22,6 +22,9 @@ DEPLOY = "deploy"
 DEPLOY_GRANT_MINUTES = 10
 MIN_SHA_PREFIX = 7
 DEPLOY_TARGETS = ("harness", "fleet")
+# "agent": requested through the broker, approved into a grant Hermes consumes.
+# "auto": asked by the approvals listener itself, approved and deployed by it.
+DEPLOY_ORIGINS = ("agent", "auto")
 
 
 def _created_at(req: dict[str, Any]) -> float:
@@ -116,19 +119,40 @@ class GrantStore:
 
     # ---- deploys -----------------------------------------------------
 
-    def create_deploy_request(self, sha: str, now: float, target: str = "harness") -> None:
+    def create_deploy_request(self, sha: str, now: float, target: str = "harness", *,
+                              ttl_seconds: float = REQUEST_TTL_SECONDS,
+                              origin: str = "agent") -> None:
         if target not in DEPLOY_TARGETS:
             raise ValueError(f"unknown deploy target: {target}")
+        if origin not in DEPLOY_ORIGINS:
+            raise ValueError(f"unknown deploy origin: {origin}")
         data = self._read()
-        data["pending_deploy"] = {"sha": sha, "target": target, "created_at": now,
-                                  "expires_at": now + REQUEST_TTL_SECONDS}
+        data["pending_deploy"] = {"sha": sha, "target": target, "origin": origin,
+                                  "created_at": now, "expires_at": now + ttl_seconds}
         self._write(data)
 
-    def approve_deploy(self, prefix: str, now: float, target: str = "harness") -> str | None:
-        """Grant the pending deploy if `prefix` starts its commit and `target` matches the
-        request's own target. A mismatch on either -- wrong prefix, or an owner naming the
-        wrong target -- keeps the request pending rather than granting it."""
+    def pending_deploy_origin(self, now: float) -> str | None:
+        req = self._read().get("pending_deploy")
+        if req is None or req["expires_at"] <= now:
+            return None
+        return req.get("origin", "agent")
+
+    def deploy_slot_busy(self, now: float) -> bool:
+        """True if an unexpired non-auto pending deploy or a live deploy grant (either
+        target) exists; an auto-ask must not displace either."""
         data = self._read()
+        req = data.get("pending_deploy")
+        if req is not None and req["expires_at"] > now and req.get("origin", "agent") != "auto":
+            return True
+        grant = data["grants"].get(DEPLOY)
+        return grant is not None and grant["expires_at"] > now
+
+    def _take_pending_deploy(self, data: dict[str, Any], prefix: str, now: float,
+                             target: str, origin: str) -> dict[str, Any] | None:
+        """The pending deploy request, popped from `data` (the caller writes), if it is
+        live, of this origin, for this target, and `prefix` starts its commit. Expiry pops
+        it and writes; any other mismatch -- reply sent before the request existed, wrong
+        target, wrong prefix -- leaves it pending."""
         req = data.get("pending_deploy")
         if req is None:
             return None
@@ -138,14 +162,35 @@ class GrantStore:
             return None
         if now < _created_at(req):  # sent before the request existed (see approve)
             return None
+        if req.get("origin", "agent") != origin:
+            return None
         if req.get("target", "harness") != target:
             return None
         prefix = prefix.lower()
         if len(prefix) < MIN_SHA_PREFIX or not req["sha"].startswith(prefix):
             return None
-        data.pop("pending_deploy")
+        return data.pop("pending_deploy")
+
+    def approve_deploy(self, prefix: str, now: float, target: str = "harness") -> str | None:
+        """Grant the pending agent deploy if `prefix` starts its commit and `target` matches the
+        request's own target. A mismatch on either -- wrong prefix, or an owner naming the
+        wrong target -- keeps the request pending rather than granting it."""
+        data = self._read()
+        req = self._take_pending_deploy(data, prefix, now, target, "agent")
+        if req is None:
+            return None
         data["grants"][DEPLOY] = {"sha": req["sha"], "target": req.get("target", "harness"),
                                    "expires_at": now + DEPLOY_GRANT_MINUTES * 60}
+        self._write(data)
+        return req["sha"]
+
+    def approve_auto_deploy(self, prefix: str, now: float, target: str = "harness") -> str | None:
+        """Approve the pending auto-ask like approve_deploy, but write no grant: the
+        caller deploys the returned commit itself."""
+        data = self._read()
+        req = self._take_pending_deploy(data, prefix, now, target, "auto")
+        if req is None:
+            return None
         self._write(data)
         return req["sha"]
 

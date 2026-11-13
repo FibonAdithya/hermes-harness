@@ -473,3 +473,79 @@ def test_main_starts_the_listener_with_a_prod_for_the_configured_owner(tmp_path,
     assert started["prod"]("x") is True
     subscribe = run.cmd("notify-subscribe")
     assert subscribe[subscribe.index("--chat-id") + 1] == "515151"
+
+
+def test_listener_deploys_an_auto_request_and_relays_the_result(tmp_path):
+    import threading
+    import time
+    import httpx
+    from hermes_broker.approvals import run_listener
+    from hermes_broker.tasks import TaskStore
+    store = store_at(tmp_path)
+    store.create_deploy_request(SHA, now=1000.0, ttl_seconds=86400, origin="auto")
+    update = {"update_id": 9, "message": {"message_id": 1, "from": {"id": OWNER}, "chat": {"id": OWNER},
+                                          "text": f"deploy {SHA[:7]}", "date": 1060}}
+    results = {"deploy": {"deployed": SHA}, "deployed": {"harness": SHA, "fleet": None},
+               "list_triage": {"issues": [], "repos_ok": [], "errors": []}}
+
+    class Call:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, verb, args, timeout=60):
+            self.calls.append((verb, args, timeout))
+            return results[verb]
+
+    fake = Call()
+    polls, sent = [], []
+    done = threading.Event()
+
+    def telegram(request):
+        if request.url.path.endswith("/getUpdates"):
+            polls.append(1)
+            if len(polls) > 1:
+                # The worker thread sends the result; wait for it, bounded.
+                done.wait(5)
+                raise Stop()
+            return httpx.Response(200, json={"ok": True, "result": [update]})
+        text = json.loads(request.content)["text"]
+        sent.append(text)
+        if text.startswith("tig-server: deployed"):
+            done.set()
+        return httpx.Response(200, json={"ok": True})
+
+    prod = Recorder()
+    with pytest.raises(Stop):
+        run_listener(store, "123:abc", OWNER, poll_seconds=0, tasks=TaskStore(tmp_path / "tasks.json"),
+                     call=fake, state_dir=tmp_path, harness_checkout=tmp_path / "nocheckout",
+                     prod=prod, transport=httpx.MockTransport(telegram))
+    assert done.is_set(), sent
+    assert prod.titles == []
+    # The worker may send its result before the poll loop sends the acknowledgement.
+    assert sum(t.startswith(f"Deploy of {SHA} to tig-server approved.") for t in sent) == 1
+    assert f"tig-server: deployed {SHA[:12]}" in sent
+    assert [c for c in fake.calls if c[0] == "deploy"] == [
+        ("deploy", {"sha": SHA, "target": "harness"}, 900)]
+
+
+def test_main_passes_harness_checkout(tmp_path, monkeypatch):
+    import logging
+    from hermes_broker import listen
+    config = tmp_path / "broker.json"
+    config.write_text(json.dumps({
+        "owner_telegram_id": 515151, "approvals_bot_token": "123:abc", "repos": [],
+        "ssh_targets": {}, "state_dir": str(tmp_path / "state"),
+        "harness_checkout": str(tmp_path / "hh")}))
+    monkeypatch.setenv("HERMES_BROKER_CONFIG", str(config))
+    started = {}
+
+    def listener(store, token, owner_id, **kwargs):
+        started.update(kwargs)
+
+    root = logging.getLogger()
+    handlers, level = root.handlers[:], root.level
+    try:
+        listen.main(listener=listener, run=FakeRun())
+    finally:
+        root.handlers[:], root.level = handlers, level
+    assert started["harness_checkout"] == tmp_path / "hh"

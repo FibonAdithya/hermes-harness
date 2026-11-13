@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 DEFAULT_TUNER_DIR = Path("/home/hermes/.hermes/tuner")
+DEFAULT_HARNESS_CHECKOUT = Path("~/hermes-harness").expanduser()
 
 
 @dataclass(frozen=True)
@@ -18,6 +19,7 @@ class BrokerConfig:
     ssh_targets: dict[str, str]
     state_dir: Path
     tuner_dir: Path = DEFAULT_TUNER_DIR
+    harness_checkout: Path = DEFAULT_HARNESS_CHECKOUT
 
     def check_repo(self, repo: str) -> None:
         if repo not in self.repos:
@@ -33,10 +35,15 @@ def load_config(path: Path) -> BrokerConfig:
         targets = dict(data["ssh_targets"])
         state_dir = Path(data["state_dir"])
         tuner_dir = Path(data.get("tuner_dir") or DEFAULT_TUNER_DIR)
+        harness_checkout = (
+            Path(data["harness_checkout"]).expanduser()
+            if data.get("harness_checkout")
+            else DEFAULT_HARNESS_CHECKOUT
+        )
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"broker config is invalid: {exc}") from exc
     if not owner:
         raise ValueError("owner_telegram_id must be a non-zero numeric id")
     if not token:
         raise ValueError("approvals_bot_token must be set")
-    return BrokerConfig(owner, token, repos, targets, state_dir, tuner_dir)
+    return BrokerConfig(owner, token, repos, targets, state_dir, tuner_dir, harness_checkout)
