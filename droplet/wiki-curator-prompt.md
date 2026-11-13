@@ -55,6 +55,8 @@ Work through these sections after the notes.
 - **tag_proposals**: add a proposed tag to `TAGS.md` only if it has no near-synonym there already. `TAGS.md` holds at most 40 tags, one `- tag — meaning` line each. Never remove or rename `finance`, `investing`, `health` or `people`.
 - **lint**: fix each problem (add a missing `index.md` line, remove a line for a missing page, replace an unknown tag, repair or remove a broken link). For `malformed tags`, rewrite the page's `tags` line as `tags: [a, b]` with plain lowercase tags from `TAGS.md`, keeping every tag the page had; until then the page is treated as private.
 
+Never edit, move, split, trim or file anything into the `## Agent follow-ups` section of `todos.md`. Agents and the owner keep that section. The rest of `todos.md` follows the usual rules.
+
 Do at most 5 split, trim or delete operations per night in total, counting page splits, trims and page deletions together. Merging an orphan into another page counts toward the 5 operations. Deleting note files from `inbox/` does not count. Leave the rest for the next night.
 
 `index.md` lists every page except the three infrastructure pages, grouped under one `## <type>` heading per page type (for example `## project`), with pages not yet backfilled under `## unsorted`. Each entry is one line, `- [[page-name]] — one-line summary`, and every entry uses a `[[wikilink]]`. No other prose.
