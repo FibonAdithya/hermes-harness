@@ -207,6 +207,28 @@ def test_start_failure_does_not_escape_handle(tmp_path):
     assert "could not start" in reply and state.asked_sha() is None and not runner.busy()
 
 
+class _FailingState(DeployAskState):
+    def set_running(self, sha, started_at):
+        raise OSError("disk full")
+
+    def clear_running(self):
+        raise OSError("disk full")
+
+    def clear_asked(self):
+        raise OSError("disk full")
+
+
+def test_unwritable_state_does_not_escape_start_or_handle(tmp_path):
+    state = _FailingState(tmp_path / STATE_FILE)
+    runner = DeployRunner(lambda v, a, t=60: {}, lambda t: True, state, spawn=lambda fn: None)
+    reply = runner.start(SHA)
+    assert "could not start" in reply and "disk full" in reply and not runner.busy()
+    store = GrantStore(tmp_path / "grants.json")
+    store.create_deploy_request(SHA, now=0.0, ttl_seconds=86400, origin="auto")
+    assert "could not start" in handle(store, "deploy", "harness:4774e23", 10.0, runner=runner)
+    assert not runner.busy()
+
+
 def test_deploy_does_not_block_other_updates(tmp_path):
     store = GrantStore(tmp_path / "grants.json")
     store.create_deploy_request(SHA, now=0.0, ttl_seconds=86400, origin="auto")

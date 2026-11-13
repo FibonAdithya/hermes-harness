@@ -121,7 +121,10 @@ class DeployRunner:
             self._spawn(lambda: self._work(sha))
         except Exception as exc:
             try:
-                self._state.clear_running()
+                try:
+                    self._state.clear_running()
+                except Exception:
+                    logger.exception("could not clear the deploy record")
             finally:
                 self._lock.release()
             # Let the next ask offer this commit again; never let the failure kill the listener.
