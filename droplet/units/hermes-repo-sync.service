@@ -1,0 +1,6 @@
+[Unit]
+Description=Mirror the owner GitHub repos into the Hermes sandbox
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/hermes-repo-sync.sh
