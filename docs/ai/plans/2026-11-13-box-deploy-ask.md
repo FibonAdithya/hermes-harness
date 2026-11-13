@@ -99,13 +99,15 @@ def test_non_hex_stamp_gives_null(tmp_path):
     (share / "harness-deployed.sha").write_text("195a042")   # short
     (share / "fleet-deployed.sha").write_text("Z" * 40)       # not hex
     assert json.loads(_verb("deployed", {}, tmp_path).stdout) == {"harness": None, "fleet": None}
+    (share / "harness-deployed.sha").write_text("c" * 41)    # too long: re.match instead of fullmatch passes it
+    assert json.loads(_verb("deployed", {}, tmp_path).stdout)["harness"] is None
 
 def test_deployed_is_reachable_through_dispatch(tmp_path):
     # boxlib.dispatch(command, stdin, verbs_dir, env) with io.BytesIO(b"{}") and capsys
     # returns 0 and prints {"harness": None, "fleet": None}
 ```
 
-Catches: a verb that returns the raw file text (short stamp passes through); a missing `.strip()` (newline stamp → null); a non-executable file (dispatch test returns "unknown verb").
+Catches: a verb that returns the raw file text (short stamp passes through); a missing `.strip()` (newline stamp → null); a prefix match instead of `fullmatch` (41-character stamp passes); a non-executable file (dispatch test returns "unknown verb").
 
 - [ ] **Step 2:** Run `cd box && uv run --with pytest python -m pytest tests/test_deployed.py -q`. Expected: FAIL (verb file missing).
 - [ ] **Step 3:** Write `box/verbs/deployed` following `box/verbs/uptime` (shebang `#!/usr/bin/env python3`, `sys.path` insert, `boxlib.read_json_stdin(sys.stdin.buffer)`), `chmod 755`.
@@ -295,7 +297,7 @@ Catches: a missing field (AttributeError); an unexpanded `~` (git -C "~/hermes-h
 **Interfaces:**
 - Produces in `deploy_ask.py`:
   - Constants: `STATE_FILE = "deploy_ask.json"`, `SETTLE_SECONDS = 1800`, `ASK_TTL_SECONDS = 86400`, `WARN_EVERY = 3600`, `DEPLOY_TIMEOUT = 900`, `MAX_COMMIT_LINES = 15`, `LINE_CHARS = 100`, `DEPLOY_BUSY = "a deploy is already running"`.
-  - `class DeployAskState(path: Path)` with `asked_sha() -> str | None`, `record_asked(sha: str) -> None`, `deploy_running() -> dict | None` (`{"sha": str, "started_at": float}`), `set_running(sha: str, started_at: float) -> None`, `clear_running() -> None`. Each method holds one `threading.Lock` across its read-modify-write (the worker thread and the main loop both write). A missing, unparsable or non-object file reads as `{}`. Writes are atomic and mode 600, as `GrantStore._write`.
+  - `class DeployAskState(path: Path)` with `asked_sha() -> str | None`, `record_asked(sha: str) -> None`, `clear_asked() -> None` (removes `asked_sha`, keeps `deploy_running`; used by Task 7's recovery), `deploy_running() -> dict | None` (`{"sha": str, "started_at": float}`), `set_running(sha: str, started_at: float) -> None`, `clear_running() -> None`. Each method holds one `threading.Lock` across its read-modify-write (the worker thread and the main loop both write). A missing, unparsable or non-object file reads as `{}`. Writes are atomic and mode 600, as `GrantStore._write`.
   - `format_deploy_ask(box_sha: str | None, master_sha: str, merged_at: float, commits: list[str], ancestor: bool) -> str`. `commits` are `git log --format='%h %s'` lines, newest first; ignored when `box_sha` is None or `ancestor` is False.
 
 Exact text (from the spec's example; `HH:MM` is `merged_at` in UTC):
@@ -321,6 +323,12 @@ def test_twenty_commits_show_fifteen_and_a_count():
     shown = [l for l in text.splitlines() if l.startswith("  ") and "more" not in l]
     assert len(shown) == 15 and "  and 5 more" in text.splitlines() and "20 commits:" in text
 
+@pytest.mark.parametrize("n, more", [(15, None), (16, "  and 1 more")])
+def test_more_line_boundary(n, more):
+    lines = [f"{i:07x} subject {i}" for i in range(n)]
+    out = format_deploy_ask("b" * 40, "a" * 40, 0.0, lines, ancestor=True).splitlines()
+    assert [l for l in out if "more" in l] == ([more] if more else [])
+
 def test_long_subject_is_cut_to_100():
     text = format_deploy_ask("b" * 40, "a" * 40, 0.0, ["abcdef0 " + "x" * 150], ancestor=True)
     (line,) = [l for l in text.splitlines() if l.startswith("  abcdef0")]
@@ -345,6 +353,8 @@ def test_state_survives_a_new_instance(tmp_path):
     assert DeployAskState(tmp_path / STATE_FILE).deploy_running() == {"sha": "b" * 40, "started_at": 5.0}
     s.clear_running()
     assert s.deploy_running() is None and s.asked_sha() == "a" * 40   # clearing keeps asked_sha
+    s.set_running("b" * 40, 6.0); s.clear_asked()
+    assert s.asked_sha() is None and s.deploy_running() == {"sha": "b" * 40, "started_at": 6.0}
 
 def test_corrupt_state_reads_as_empty(tmp_path):                       # Review Focus 3
     (tmp_path / STATE_FILE).write_text("{not json")
@@ -356,7 +366,7 @@ def test_corrupt_state_reads_as_empty(tmp_path):                       # Review 
 
 `1763034240` is 11:44:00 UTC (MEASURED while writing this plan with `python3 -c 'import datetime;print(datetime.datetime.fromtimestamp(1763034240, datetime.timezone.utc))'` → `2025-11-13 11:44:00+00:00`).
 
-Catches: unbounded commit list; a per-subject cut instead of per-line (or none); `set_running`/`clear_running` overwriting the whole file and dropping `asked_sha`; a crash on a corrupt file.
+Catches: unbounded commit list; `>=` instead of `>` for the "more" line (`and 0 more` at 15); a per-subject cut instead of per-line (or none); `set_running`/`clear_running`/`clear_asked` overwriting the whole file and dropping the other key; a crash on a corrupt file.
 
 - [ ] **Step 2:** `cd broker && uv run --extra dev pytest tests/test_deploy_ask.py -q` → FAIL (module missing).
 - [ ] **Step 3:** Implement the constants, `DeployAskState` and `format_deploy_ask`.
@@ -420,7 +430,7 @@ def test_auto_request_wrong_target_is_refused(store):        # Review Focus 4
     assert r.started == [] and store.pending_deploy_origin(10.0) == "auto"
 ```
 
-Check what `Recorder` / `store` fixtures already exist in `test_approvals.py` / `test_prod.py` and reuse them.
+`test_approvals.py` has no `store` fixture, no `SHA` and no `Recorder` today (checked at 418850a: `Recorder` is in `test_prod.py`, the `store` fixture in `test_grants.py`). Add to `test_approvals.py`: a `store(tmp_path)` fixture returning `GrantStore(tmp_path / "grants.json")`, `SHA = "4774e2314f46" + "0" * 28`, and a local `Recorder` (copy the five lines from `test_prod.py`; do not import from another test module).
 
 In `test_deploy_ask.py` (spec test 10; Review Focus 5):
 
@@ -466,7 +476,7 @@ def test_deploy_does_not_block_other_updates(tmp_path):     # spec 10, real thre
 
 `owner_update(text, date)` is a local helper building `{"update_id": 1, "message": {"from": {"id": OWNER}, "chat": {"id": OWNER}, "text": text, "date": date}}`. `SHA2` is a second 40-hex sha.
 
-Catches: a synchronous deploy in the poll loop (the first `_dispatch` blocks inside the fake until `release.wait(10)` times out and its `assert` fails, so the test fails in about 10 s instead of hanging); origin not checked in `handle` (agent test starts the runner, or auto test prods); busy check after consuming (request gone); record not cleared on failure (runner stuck busy).
+Catches: a synchronous deploy in the poll loop (the first `_dispatch` blocks inside the fake until `release.wait(10)` times out; the worker's `except` turns that `AssertionError` into a "failed" send, so the test fails on `second == "a deploy is already running"` / `sent == []` after about 10–20 s instead of hanging); origin not checked in `handle` (agent test starts the runner, or auto test prods); busy check after consuming (request gone); record not cleared on failure (runner stuck busy).
 
 - [ ] **Step 2:** `cd broker && uv run --extra dev pytest tests/test_deploy_ask.py tests/test_approvals.py -q` → FAIL.
 - [ ] **Step 3:** Implement `DeployRunner`, then the `handle` and `_dispatch` changes.
@@ -491,21 +501,22 @@ git commit -m "approvals: the listener deploys an auto-asked commit itself, in a
 - Produces: `class DeployAnnouncer(grants: GrantStore, state: DeployAskState, runner: DeployRunner, call: Call, send: Callable[[str], bool], checkout: Path, run: Callable[..., subprocess.CompletedProcess] = subprocess.run)` with `tick(now: float) -> None`.
   - Every git command is `run(["git", "-C", str(checkout), <sub>, ...], capture_output=True, text=True, timeout=30, check=False)` with `<sub>` in `("rev-parse", "log", "diff", "merge-base")`.
   - One warning limiter `_warn(now, msg)`: logs when `self._last_warn is None or now - self._last_warn >= WARN_EVERY`. Initialise to `None`, not `0.0` (tests use small `now`). Used for `deployed` failures and git failures.
+  - A **git failure** is any of: a nonzero exit from `rev-parse`, `log` or `diff`; `subprocess.TimeoutExpired` or `OSError` from any git call (including `merge-base`); a `%ct` output that is not an integer. A git failure means `_warn(now, ...)` and return from the tick; it never raises out of `tick` (otherwise the listener logs a traceback every `ANNOUNCE_EVERY`, which the hourly limit exists to prevent). `merge-base --is-ancestor` is the one exception: its nonzero exit means "not an ancestor", not a failure.
 
 `tick(now)` order:
 
-0. **Recovery.** If `state.deploy_running()` is set and `not runner.busy()`: call `deployed` (timeout 60). On failure `_warn` and return (retry next tick). Stamp equal to the record's sha → send `f"tig-server: deployed {sha[:12]}"`; else send `f"deploy of {sha[:12]} did not finish; the next ask will offer it again"`. Clear the record either way, then continue with the tick.
+0. **Recovery.** If `state.deploy_running()` is set and `not runner.busy()`: call `deployed` (timeout 60). On failure `_warn` and return (retry next tick). Stamp equal to the record's sha → send `f"tig-server: deployed {sha[:12]}"`; else send `f"deploy of {sha[:12]} did not finish; the next ask will offer it again"` **and `state.clear_asked()`**, so that promise holds when master has not moved (without it, `asked_sha == master` suppresses every later ask until the next merge). Clear the record either way, then continue with the tick.
 1. `master = rev-parse origin/master`. Nonzero exit → `_warn`, return.
 2. `r = call("deployed", {}, 60)`. Failure is any of: `"error" in r`, `"harness"` key missing, value neither None nor a 40-hex str. Failure → `_warn`, return.
 3. `box == master` → return.
 4. 3a: `grants.deploy_slot_busy(now)` or `state.deploy_running()` → return.
 5. Settle: `ct = int(log -1 --format=%ct origin/master)`; `now - ct < SETTLE_SECONDS` → return.
-6. If `box` is not None: `ancestor = merge-base --is-ancestor <box> <master>` exit 0 (any nonzero is "not an ancestor"). If ancestor: `diff --name-only <box>..<master>`; all paths start with `docs/` → return; `commits = log --format=%h %s <box>..<master>` lines. If `box` is None: run none of these.
-7. `state.asked_sha() == master` → return. Else `grants.create_deploy_request(master, now, ttl_seconds=ASK_TTL_SECONDS, origin="auto")`, `ok = send(format_deploy_ask(box, master, ct, commits, ancestor))`, `record_asked(master)` only if `ok`.
+6. If `box` is not None: `ancestor = merge-base --is-ancestor <box> <master>` exit 0 (any nonzero is "not an ancestor"). If ancestor: `diff --name-only <box>..<master>`; all paths start with `docs/` → return (an empty path list counts as docs-only: nothing outside `docs/` changed); `commits = log --format=%h %s <box>..<master>` lines. If `box` is None: run none of these.
+7. `state.asked_sha() == master` → return. Re-check `grants.deploy_slot_busy(now)` here, immediately before writing (the git calls in steps 5–6 widen the window in which the MCP server's `request_deploy` can land after step 4's check). Then `grants.create_deploy_request(master, now, ttl_seconds=ASK_TTL_SECONDS, origin="auto")`, `ok = send(format_deploy_ask(box, master, ct, commits, ancestor))`, `record_asked(master)` only if `ok`.
 
-Test fixture: a real git repo pair in `tmp_path` (bare `origin`, a working copy `up`, the droplet `checkout` cloned from origin), commits made with `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE` set to a fixed epoch `T0 = 1_763_000_000` plus an offset, then `git -C checkout fetch -q` by the test (never by the announcer). `run` is a recording wrapper over `subprocess.run` that appends each argv. `call` is the `Box`-style fake from `test_announcer.py` (`{"deployed": {"harness": ..., "fleet": None}}`), `send` the recording sender, `runner` a `FakeRunner` with `busy()`.
+Test fixture: a real git repo pair in `tmp_path` (bare `origin`, a working copy `up`, the droplet `checkout` cloned from origin), commits made with `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE` set to `f"@{T0 + offset} +0000"` for a fixed epoch `T0 = 1_763_000_000`, then `git -C checkout fetch -q` by the test (never by the announcer). `run` is a recording wrapper over `subprocess.run` that appends each argv. `call` is the `Box`-style fake from `test_announcer.py` (`{"deployed": {"harness": ..., "fleet": None}}`), `send` the recording sender, `runner` a `FakeRunner` with `busy()`.
 
-The `env` fixture exposes: `checkout`, `first` (an older commit) and `master` (the tip; its commit changes a file outside `docs/` and has commit time `ct`); `state`, `grants`, `grants_path`, `grants_json()`; `box_at(sha)` (fake `deployed` returns `{"harness": sha, "fleet": None}`), `box_reply(dict)`; `sent` (accepted texts), `send_attempts` (all texts), `send_results` (optional list of return values, default all True); `argvs` (every argv given to `run`); `runner` (the `FakeRunner`); `ann`; `new_announcer()` (a fresh `DeployAnnouncer` on the same state and grants files); `make_blocker(kind, now)`; and helpers to add commits on master or a side branch and fetch them into `checkout`. Use `caplog.set_level(logging.WARNING, logger="hermes_broker.deploy_ask")` in the warning test.
+The `env` fixture exposes: `checkout`, `first` (an older commit) and `master` (the tip; its commit changes a file outside `docs/` and has commit time `ct`); `state`, `grants`, `grants_path`, `grants_json()`; `box_at(sha)` (fake `deployed` returns `{"harness": sha, "fleet": None}`), `box_reply(dict)`; `sent` (accepted texts), `send_attempts` (all texts), `send_results` (optional list of return values, default all True); `argvs` (every argv given to `run`); `runner` (the `FakeRunner`); `ann`; `new_announcer()` (a fresh `DeployAnnouncer` on the same state and grants files); `make_blocker(kind, now)`; `fail_git(sub, failure)`; and helpers to add commits on master or a side branch and fetch them into `checkout`. Use `caplog.set_level(logging.WARNING, logger="hermes_broker.deploy_ask")` in the warning test.
 
 - [ ] **Step 1: Write the failing tests** (spec tests 1–7, 13, 15, 16, 19; Review Focus 1, 2)
 
@@ -516,9 +527,9 @@ def test_up_to_date_sends_nothing(env):                       # 1
 
 def test_settle_time(env):                                    # 2
     env.box_at(env.first)
-    env.ann.tick(env.ct + 29 * 60); assert env.sent == []
-    env.ann.tick(env.ct + 31 * 60); assert len(env.sent) == 1
-    assert env.grants.pending_deploy_origin(env.ct + 31 * 60) == "auto"
+    env.ann.tick(env.ct + 1799); assert env.sent == []
+    env.ann.tick(env.ct + 1800); assert len(env.sent) == 1     # "at least 30 minutes": 1800 s asks
+    assert env.grants.pending_deploy_origin(env.ct + 1800) == "auto"
 
 def test_once_per_commit_across_restart(env):                 # 3
     env.box_at(env.first)
@@ -548,9 +559,20 @@ def test_deployed_failure_warns_once_an_hour(env, caplog):    # 7
     env.box_reply({"error": "tig-server unreachable: timed out"})
     for i in range(20): env.ann.tick(env.ct + 3600 + 60 * i)  # spans 19 min
     assert env.sent == [] and "pending_deploy" not in env.grants_json()
-    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+    warns = lambda: [r for r in caplog.records if r.levelno == logging.WARNING and r.name == "hermes_broker.deploy_ask"]
+    assert len(warns()) == 1
     env.ann.tick(env.ct + 3600 + 3600)
-    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 2
+    assert len(warns()) == 2
+
+@pytest.mark.parametrize("sub, failure", [("rev-parse", "rc1"), ("log", "rc1"), ("diff", "rc1"),
+                                          ("log", "timeout"), ("merge-base", "timeout")])
+def test_git_failure_warns_and_skips(env, caplog, sub, failure):
+    # env.fail_git(sub, failure): the recording `run` returns CompletedProcess(rc=1, stdout="") for the
+    # first argv whose argv[3] == sub, or raises subprocess.TimeoutExpired for it
+    env.box_at(env.first); env.fail_git(sub, failure)
+    env.ann.tick(env.ct + 3600)                                # must not raise
+    assert env.sent == [] and "pending_deploy" not in env.grants_json()
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
 
 @pytest.mark.parametrize("reply", [{}, {"harness": "195a042"}, {"harness": 5}])
 def test_malformed_deployed_reply_is_a_failure(env, reply):   # Review Focus 1
@@ -578,10 +600,17 @@ def test_null_box_stamp(env):                                 # 15
 
 @pytest.mark.parametrize("stamp, expect", [("same", "tig-server: deployed "), ("other", "did not finish")])
 def test_restart_recovery(env, stamp, expect):                # 16
+    env.state.record_asked(env.master)                         # the ask that led to the deploy
     env.state.set_running(env.master, env.ct)
     env.box_at(env.master if stamp == "same" else env.first)
-    env.new_announcer().tick(env.ct + 60)
+    ann = env.new_announcer()
+    ann.tick(env.ct + 60)                                      # inside the settle time: recovery only
     assert expect in env.sent[0] and env.state.deploy_running() is None
+    ann.tick(env.ct + 3600)
+    if stamp == "same":
+        assert len(env.sent) == 1                              # box == master: nothing more
+    else:
+        assert len(env.sent) == 2 and "Read them, then reply: deploy " + env.master[:12] in env.sent[1]
 
 def test_recovery_skipped_while_this_process_is_deploying(env):
     # runner.busy() True, record set → no recovery message, record kept
@@ -592,7 +621,7 @@ def test_only_read_only_git(env):                             # 19
     # and every argv starts with ["git", "-C", str(env.checkout)]
 ```
 
-Mutation each catches: 1 asking when equal; 2 missing or inverted settle; 3 in-memory dedupe; 4 recording before a successful send; 5 `any` vs `all`; 6 and RF2 listing commits for (or crashing on) a non-ancestor, or treating exit 128 as a git failure; 7 log spam and asking blind; RF1 a box reply without a valid stamp read as null and asked about; 13 overwriting the shared slot, or a busy check without expiry (the second tick would never ask); 15 the null case falling into "git failure, skip"; 16 the record never read on start; 19 a fetch or reset in the listener's checkout.
+Mutation each catches: 1 asking when equal; 2 missing or inverted settle, and `<=` for `<` at exactly 1800 s; 3 in-memory dedupe; 4 recording before a successful send; 5 `any` vs `all`; 6 and RF2 listing commits for (or crashing on) a non-ancestor, or treating exit 128 as a git failure; 7 log spam and asking blind; RF1 a box reply without a valid stamp read as null and asked about; 13 overwriting the shared slot, or a busy check without expiry (the second tick would never ask); 15 the null case falling into "git failure, skip"; 16 the record never read on start, and a "did not finish" that leaves `asked_sha` set (no second send); git-failure test: an unchecked return code (`int("")` raises out of `tick`) or an uncaught `TimeoutExpired`; 19 a fetch or reset in the listener's checkout.
 
 - [ ] **Step 2:** `cd broker && uv run --extra dev pytest tests/test_deploy_ask.py -q` → the new tests FAIL.
 - [ ] **Step 3:** Implement `DeployAnnouncer` in `deploy_ask.py`.
@@ -661,11 +690,11 @@ git commit -m "approvals: run the deploy announcer and runner in the listener"
 
 **Interfaces:**
 - Consumes: the state file `<state_dir>/deploy_ask.json` and its `deploy_running.started_at` (Task 5), where `state_dir` is read from `${HERMES_BROKER_CONFIG:-$HOME/.hermes/broker/broker.json}` (`~` expanded).
-- Produces: in the owner block, before `git checkout`, a `python3 -c` check that exits 0 only when the record exists and `time.time() - started_at < 1200`. On 0 the script echoes `deploy running; approvals restart deferred`, skips the whole owner block (no reset, no broker `uv sync`, no restart, no stamp) and continues to the friends and later steps. Any read error (no config, no state file, bad JSON, no record) → not live → the owner block runs as today. Also replace `/usr/local/bin/uv` with `uv` in both places; `harness-pull.service` already sets `PATH=/usr/local/bin:/usr/bin:/bin`, so production resolves the same binary and the test can stub it.
+- Produces: in the owner block, before `git checkout`, a `python3 -c` check that exits 0 only when the record exists and `time.time() - started_at < 1200`. On 0 the script echoes `deploy running; approvals restart deferred`, skips the whole owner block (no broker `uv sync`, no restart, no stamp) and continues to the friends and later steps. Note that the friends block runs its own `git checkout -q master && git reset -q --hard origin/master` whenever the friends stamp is behind, which on a new master commit it always is, so the checkout is still reset under the running listener. That is accepted: the listener's modules are already imported, its venv (`broker/.venv`) is not re-synced, and the deferred owner block runs on the next tick. Do not try to defer the friends block too. Any read error (no config, no state file, bad JSON, no record) → not live → the owner block runs as today. Also replace `/usr/local/bin/uv` with `uv` in both places; `harness-pull.service` already sets `PATH=/usr/local/bin:/usr/bin:/bin`, so production resolves the same binary and the test can stub it.
 
 - [ ] **Step 1: Write the failing tests** (spec test 17; Review Focus 3)
 
-Stubs in `tmp_path/stubs`, first on PATH: `git` (logs `$*`; prints `WANT` for `rev-parse origin/master` and `abc1234` for `rev-parse --short HEAD`; exit 0), `systemctl` and `uv` (log `$*`, exit 0). `HOME=tmp_path/home` with `hermes-harness/broker` and `hermes-harness/friends` directories and the friends stamp preset to `WANT` (so only the owner block is under test). `HERMES_BROKER_CONFIG` points at a `broker.json` whose `state_dir` holds `deploy_ask.json`. Run `bash droplet/harness-pull.sh` with `timeout=30`.
+Stubs in `tmp_path/stubs`, first on PATH: `git` (logs `$*`; prints `WANT` for `rev-parse origin/master` and `abc1234` for `rev-parse --short HEAD`; exit 0), `systemctl` and `uv` (log `$*` with the working directory, exit 0). `HOME=tmp_path/home` with `hermes-harness/broker` and `hermes-harness/friends` directories. The friends stamp is **not** preset: on a real new master commit both stamps are behind, and the test must show the friends block still runs while the owner block is deferred. `HERMES_BROKER_CONFIG` points at a `broker.json` whose `state_dir` holds `deploy_ask.json`. Run `bash droplet/harness-pull.sh` with `timeout=30`. `_run` returns `logs` as a `defaultdict(str)` (a stub never called logs `""`, not a `KeyError`).
 
 ```python
 def test_fresh_deploy_record_defers_restart_and_stamp(tmp_path):
@@ -673,7 +702,9 @@ def test_fresh_deploy_record_defers_restart_and_stamp(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "restart hermes-approvals" not in logs["systemctl"]
     assert not (home / ".local/share/harness-deployed.sha").exists()
-    assert "reset" not in logs["git"]
+    assert "deploy running; approvals restart deferred" in r.stdout
+    assert "broker" not in logs["uv"]                                     # no broker uv sync
+    assert (home / ".local/share/friends-synced.sha").read_text() == WANT # the script went on
 
 def test_stale_record_restarts_and_stamps(tmp_path):
     r, logs, home = _run(tmp_path, record_age=1500)
@@ -689,7 +720,7 @@ def test_unreadable_state_does_not_block(tmp_path, state):     # Review Focus 3
 
 `record_age` sets `started_at = time.time() - age`; 300 vs 1500 seconds is far from the 1200 boundary, so wall-clock drift during the test cannot flip it.
 
-Catches: the restart killing a running deploy (fresh case restarts); a stale record blocking deploys forever (stale case does not restart); a corrupt file treated as live; the stamp written while deferred (the next tick would never retry).
+Catches: the restart killing a running deploy (fresh case restarts); a stale record blocking deploys forever (stale case does not restart); a corrupt file treated as live; the stamp written while deferred (the next tick would never retry); a deferral written as `exit 0` (friends stamp missing); the `python3 -c` check's exit 1 tripping `set -e` (stale and unreadable cases exit nonzero).
 
 - [ ] **Step 2:** `cd box && uv run --with pytest python -m pytest tests/test_harness_pull.py -q` → FAIL (fresh case restarts; stubbed `uv` is bypassed by the absolute path).
 - [ ] **Step 3:** Edit `droplet/harness-pull.sh`.
@@ -708,7 +739,7 @@ git commit -m "harness-pull: defer the approvals restart while the listener runs
 **Files:**
 - Modify: `runbooks/dispatch.md`, section "Deploys" (lines 16–31 at 418850a)
 
-- [ ] **Step 1:** Add a paragraph after the first one in "Deploys", covering exactly the spec's Docs list: the bot asks by itself when the box is behind master (30-minute settle time, no ask for a docs-only diff, once per master commit, valid 24 h); the reply is the same `deploy <prefix>`, typed after reading the commits; the listener then deploys that commit itself with no grant and replies `tig-server: deployed <sha12>` or the box's error; an agent's `request_deploy` replaces a pending auto-ask, an auto-ask never replaces an agent's request; `harness-pull` defers the approvals restart while a deploy runs (record younger than 20 minutes, `<state_dir>/deploy_ask.json`); the box refuses two deploys at once (`~/.local/share/deploy.lock`). Add the first-time step: the box needs one deploy through `request_deploy` to install the `deployed` verb; until then the listener logs one warning an hour and asks nothing. Plain statements, no metaphors.
+- [ ] **Step 1:** Add a paragraph after the first one in "Deploys", covering exactly the spec's Docs list: the bot asks by itself when the box is behind master (30-minute settle time, no ask for a docs-only diff, once per master commit, valid 24 h); the reply is the same `deploy <prefix>`, typed after reading the commits; the listener then deploys that commit itself with no grant and replies `tig-server: deployed <sha12>` or the box's error; an agent's `request_deploy` replaces a pending auto-ask, an auto-ask never replaces an agent's request; `harness-pull` defers the approvals restart while a deploy runs (record younger than 20 minutes, `<state_dir>/deploy_ask.json`); the box refuses two deploys at once (`~/.local/share/deploy.lock`); after a deploy that fails on the box (for example `install.sh failed`), the bot does not ask again for the same master commit, so retry with `request_deploy` or wait for the next merge. Add the first-time step: the box needs one deploy through `request_deploy` to install the `deployed` verb; until then the listener logs one warning an hour and asks nothing. Plain statements, no metaphors.
 - [ ] **Step 2:** Run both suites once more: broker and box commands from the top of this plan. Expected: all pass; record the counts.
 - [ ] **Step 3: Commit**
 
@@ -723,3 +754,11 @@ git commit -m "runbook: the approvals bot asks to deploy the box when it falls b
 ## Rollout
 
 Not part of this plan's execution. The owner's session does the spec's three rollout steps after merge.
+
+## Audit notes (2026-11-13)
+
+Audited with `audit-plan`; fixes are applied in the tasks above. Flagged and left as designed:
+
+- A box sha the droplet checkout has not fetched yet (an agent deployed a merge less than 15 minutes old) produces a "not an ancestor" ask for the older `origin/master`. Approving it is refused by the box's own master check, so nothing wrong is deployed. Skipping unknown shas instead would leave a box on a force-pushed commit with no ask at all, so the spec's behaviour (Review Focus 2) stands.
+- The busy check and `create_deploy_request` are still two separate reads of `grants.json`, with no file lock between the listener and the MCP server. Task 7 step 7 re-checks immediately before writing, which shrinks the window to the same size as every other `GrantStore` read-modify-write today.
+- A result message whose `send` fails in the worker is lost (the record is still cleared). The owner sees the box state on the next ask.
