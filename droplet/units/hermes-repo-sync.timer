@@ -1,0 +1,10 @@
+[Unit]
+Description=Mirror the owner GitHub repos every 30 minutes
+
+[Timer]
+OnCalendar=*:0/30
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target
