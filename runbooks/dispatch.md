@@ -38,11 +38,14 @@ agent's request. `harness-pull` defers the approvals restart while a deploy runs
 refuses a second deploy while one runs (`~/.local/share/deploy.lock`, reply
 `a deploy is already running`). If a deploy fails on the box (for example
 `install.sh failed`), the bot does not ask again for the same `master` commit:
-retry with `request_deploy` or wait for the next merge.
+retry with `request_deploy` or wait for the next merge. If the listener restarts
+and finds a deploy record whose commit the box's stamp does not match, it sends
+`deploy of <sha12> did not finish; the next ask will offer it again` and asks
+about that commit again.
 
 First time only: the box needs one deploy through `request_deploy` to install the
 `deployed` verb. Until then the listener cannot read the box's commit, logs one
-warning an hour (with the box's error text) and asks nothing.
+warning an hour (with the reason) and asks nothing.
 
 The droplet (the broker and this approvals bot) is never deployed by the
 assistant: `systemctl --user start harness-pull.service` here, by hand.
@@ -53,7 +56,10 @@ not work; type it.
 ### What happens after you approve
 
 On `approve <code>` and on `deploy <prefix>` the approvals bot tells the
-assistant, so you do not have to message it. Its reply to you ends with
+assistant, so you do not have to message it. (An auto-ask is the exception: the
+listener does not tell the assistant. It replies `Deploy of <sha> to tig-server
+approved.` and `Deploying <sha12> to tig-server. The result follows when it
+finishes.`) Its reply to you ends with
 `Hermes is being told and should continue shortly.` Within about 5 seconds the main bot
 posts a notice in the main chat (`✔ Kanban t_1a2b3c4d done — Owner approved …`)
 and the assistant takes a turn there, with the conversation so far, on a

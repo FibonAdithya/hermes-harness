@@ -385,6 +385,7 @@ def test_auto_approval_starts_the_runner_and_does_not_prod(store):
     prod, runner = Recorder(), FakeRunner()
     reply = handle(store, "deploy", "harness:4774e23", 10.0, prod, runner=runner)
     assert runner.started == [SHA] and prod.titles == [] and "Deploying." in reply
+    assert store.deploy_target() is None
 
 
 def test_agent_approval_prods_and_does_not_start_the_runner(store):

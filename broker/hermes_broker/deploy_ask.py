@@ -119,12 +119,18 @@ class DeployRunner:
         try:
             self._state.set_running(sha, self._clock())
             self._spawn(lambda: self._work(sha))
-        except BaseException:
+        except Exception as exc:
             try:
                 self._state.clear_running()
             finally:
                 self._lock.release()
-            raise
+            # Let the next ask offer this commit again; never let the failure kill the listener.
+            try:
+                self._state.clear_asked()
+            except Exception:
+                logger.exception("could not clear the asked sha")
+            logger.exception("deploy of %s could not start", sha[:12])
+            return f"Deploy of {sha[:12]} could not start: {exc}; the next ask will offer it again."
         return f"Deploying {sha[:12]} to tig-server. The result follows when it finishes."
 
     def _work(self, sha: str) -> None:
@@ -226,8 +232,10 @@ class DeployAnnouncer:
             self._warn(now, str(exc))
 
     def _tick(self, now: float) -> None:
-        running = self._state.deploy_running()
-        if running is not None and not self._runner.busy():
+        # Check busy first: start runs only on this thread and the worker clears the record
+        # before it releases, so "not busy" means any record left is from a dead process.
+        running = None if self._runner.busy() else self._state.deploy_running()
+        if running is not None:
             ok, stamp, why = self._box_stamp()
             if not ok:
                 self._warn(now, why)

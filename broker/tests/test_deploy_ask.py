@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from hermes_broker.approvals import _dispatch
+from hermes_broker.approvals import _dispatch, handle
 from hermes_broker.deploy_ask import (STATE_FILE, DeployAnnouncer, DeployAskState, DeployRunner,
                                       format_deploy_ask)
 from hermes_broker.grants import GrantStore
@@ -181,14 +181,30 @@ def test_second_start_while_busy_is_refused(tmp_path):
 
 def test_spawn_failure_clears_and_releases(tmp_path):
     state = DeployAskState(tmp_path / STATE_FILE)
+    state.record_asked(SHA)
 
     def spawn(fn):
         raise RuntimeError("no threads")
 
     r = DeployRunner(lambda v, a, t=60: {}, lambda t: True, state, spawn=spawn)
-    with pytest.raises(RuntimeError):
-        r.start(SHA)
-    assert state.deploy_running() is None and not r.busy()
+    reply = r.start(SHA)
+    assert reply == (f"Deploy of {SHA[:12]} could not start: no threads; "
+                     "the next ask will offer it again.")
+    assert state.deploy_running() is None and not r.busy() and state.asked_sha() is None
+
+
+def test_start_failure_does_not_escape_handle(tmp_path):
+    store = GrantStore(tmp_path / "grants.json")
+    store.create_deploy_request(SHA, now=0.0, ttl_seconds=86400, origin="auto")
+    state = DeployAskState(tmp_path / STATE_FILE)
+    state.record_asked(SHA)
+
+    def spawn(fn):
+        raise RuntimeError("no threads")
+
+    runner = DeployRunner(lambda v, a, t=60: {}, lambda t: True, state, spawn=spawn)
+    reply = handle(store, "deploy", "harness:4774e23", 10.0, runner=runner)
+    assert "could not start" in reply and state.asked_sha() is None and not runner.busy()
 
 
 def test_deploy_does_not_block_other_updates(tmp_path):
@@ -604,6 +620,26 @@ def test_recovery_skipped_while_this_process_is_deploying(env):
     env.ann.tick(env.ct + 3600)
     assert env.sent == [] and env.state.deploy_running() == {"sha": env.master, "started_at": env.ct}
     assert env.state.asked_sha() == env.first
+
+
+def test_recovery_checks_busy_before_reading_the_record(env):
+    # The worker finishes (clears the record, releases) between the two reads: the
+    # announcer must not then recover a deploy this process just ran.
+    env.state.record_asked(env.first)
+    env.state.set_running(env.master, env.ct)
+    env.runner.is_busy = True
+    env.box_at(env.master)
+    ann = env.new_announcer()
+    real = ann._state.deploy_running
+
+    def read_then_finish():
+        record = real()
+        env.runner.is_busy = False
+        return record
+
+    ann._state.deploy_running = read_then_finish
+    ann.tick(env.ct + 60)
+    assert env.sent == [] and env.state.asked_sha() == env.first
 
 
 def test_only_read_only_git(env):
