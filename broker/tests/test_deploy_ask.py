@@ -264,7 +264,10 @@ def env(tmp_path, monkeypatch):
     e = SimpleNamespace(checkout=checkout, sent=[], send_attempts=[], send_results=None, argvs=[], kwargs=[],
                         runner=FakeRunner(), box=FakeBox(), fail=None, offset=100)
 
-    def commit(files, offset):
+    def commit(files, offset, moves=()):
+        for src, dst in moves:
+            (up / dst).parent.mkdir(parents=True, exist_ok=True)
+            _git("-C", str(up), "mv", src, dst)
         for name, text in files.items():
             (up / name).parent.mkdir(parents=True, exist_ok=True)
             (up / name).write_text(text)
@@ -275,10 +278,11 @@ def env(tmp_path, monkeypatch):
     def fetch():
         _git("-C", str(checkout), "fetch", "-q")
 
-    def add_master_commit(files):
-        """Commit on master `files` ({path: text}); it becomes env.master with commit time env.ct."""
+    def add_master_commit(files, moves=()):
+        """Commit on master `files` ({path: text}) and `moves` ((src, dst) for `git mv`); it becomes
+        env.master with commit time env.ct."""
         e.offset += 100
-        e.master = commit(files, e.offset)
+        e.master = commit(files, e.offset, moves)
         e.ct = T0 + e.offset
         _git("-C", str(up), "push", "-q", "origin", "master")
         fetch()
@@ -416,6 +420,17 @@ def test_docs_only_is_skipped(env):
     assert len(env.sent) == 1 and "2 commits:" in env.sent[0]
 
 
+def test_move_out_of_code_into_docs_is_asked(env):
+    """`git mv app.py docs/app.py` deletes a file the box runs; rename detection would list only
+    docs/app.py and read it as docs-only."""
+    env.box_at(env.master)
+    env.add_master_commit({}, moves=[("app.py", "docs/app.py")])
+    env.ann.tick(env.ct + 3600)
+    assert len(env.sent) == 1 and "1 commit:" in env.sent[0]
+    (diff,) = [a for a in env.argvs if a[3] == "diff"]
+    assert "--no-renames" in diff
+
+
 def test_empty_diff_counts_as_docs_only(env):
     env.box_at(env.master)
     env.add_master_commit({})  # an empty commit: nothing outside docs/ changed
@@ -447,6 +462,7 @@ def test_deployed_failure_warns_once_an_hour(env, caplog):
         env.ann.tick(env.ct + 3600 + 60 * i)
     assert env.sent == [] and "pending_deploy" not in env.grants_json()
     assert len(_warnings(caplog)) == 1
+    assert "tig-server unreachable: timed out" in _warnings(caplog)[0].getMessage()
     env.ann.tick(env.ct + 3600 + 3600)
     assert len(_warnings(caplog)) == 2
 
@@ -496,7 +512,8 @@ def test_malformed_deployed_reply_is_a_failure(env, caplog, reply):
     env.box_reply(reply)
     env.ann.tick(env.ct + 3600)
     assert env.sent == [] and "pending_deploy" not in env.grants_json()
-    assert len(_warnings(caplog)) == 1
+    (warning,) = _warnings(caplog)
+    assert "malformed reply" in warning.getMessage() and repr(reply) in warning.getMessage()
 
 
 @pytest.mark.parametrize("blocker", ["agent_harness", "agent_fleet", "grant"])

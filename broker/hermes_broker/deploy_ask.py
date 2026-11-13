@@ -208,16 +208,16 @@ class DeployAnnouncer:
             raise _GitFailure(f"git {args[0]} exited {p.returncode}: {(p.stderr or '').strip()}")
         return p.stdout
 
-    def _box_stamp(self) -> tuple[bool, str | None]:
-        """(ok, harness stamp). A reply without a valid stamp (an old box, an error) is not ok;
-        {"harness": None} is ok with no stamp."""
+    def _box_stamp(self) -> tuple[bool, str | None, str]:
+        """(ok, harness stamp, why not ok). A reply without a valid stamp (an old box, an error)
+        is not ok; {"harness": None} is ok with no stamp."""
         r = self._call("deployed", {}, DEPLOYED_TIMEOUT)
-        if not isinstance(r, dict) or "error" in r or "harness" not in r:
-            return False, None
-        stamp = r["harness"]
+        if isinstance(r, dict) and "error" in r:
+            return False, None, f"cannot read the box's deploy stamp: {r['error']}"
+        stamp = r.get("harness", 0) if isinstance(r, dict) else 0
         if stamp is None or (isinstance(stamp, str) and _FULL_SHA.fullmatch(stamp)):
-            return True, stamp
-        return False, None
+            return True, stamp, ""
+        return False, None, f"cannot read the box's deploy stamp: malformed reply {r!r}"
 
     def tick(self, now: float) -> None:
         try:
@@ -228,9 +228,9 @@ class DeployAnnouncer:
     def _tick(self, now: float) -> None:
         running = self._state.deploy_running()
         if running is not None and not self._runner.busy():
-            ok, stamp = self._box_stamp()
+            ok, stamp, why = self._box_stamp()
             if not ok:
-                self._warn(now, "cannot read the box's deploy stamp")
+                self._warn(now, why)
                 return
             sha = str(running.get("sha", "")) if isinstance(running, dict) else ""
             if stamp == sha:
@@ -241,9 +241,9 @@ class DeployAnnouncer:
             self._state.clear_running()
 
         master = self._git_out("rev-parse", "origin/master").strip()
-        ok, box = self._box_stamp()
+        ok, box, why = self._box_stamp()
         if not ok:
-            self._warn(now, "cannot read the box's deploy stamp")
+            self._warn(now, why)
             return
         if box == master:
             return
@@ -262,7 +262,9 @@ class DeployAnnouncer:
             # Any nonzero exit is "not an ancestor": 1, or 128 for a commit this checkout lacks.
             ancestor = self._git("merge-base", "--is-ancestor", box, master).returncode == 0
             if ancestor:
-                paths = [p for p in self._git_out("diff", "--name-only", f"{box}..{master}").splitlines() if p]
+                # --no-renames: a move out of code into docs/ must list the deleted source path too.
+                paths = [p for p in self._git_out("diff", "--name-only", "--no-renames",
+                                                  f"{box}..{master}").splitlines() if p]
                 if all(p.startswith("docs/") for p in paths):
                     return
                 commits = [c for c in self._git_out("log", "--format=%h %s", f"{box}..{master}").splitlines()
