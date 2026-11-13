@@ -35,6 +35,7 @@
 3. **GitHub returns base64 wrapped at 60/76 characters with `\n`.** The decode must ignore the line breaks. Test: Task 2 `test_gh_get_decodes_wrapped_base64`.
 4. **A detail line that looks like an item, e.g. `  - [ ] see (2026-11-01, claude-box, id abc123)`.** `done abc123` must not tick an indented line; only column-0 item first lines count. Test: Task 1 `test_done_ignores_indented_lines`.
 5. **`jobs.json` has jobs whose `script` is `null` or a non-reminder name** (MEASURED 2026-11-13 on hermes-vm: 5 of 12 jobs have `script: null`, others include `wiki-worklist.py`, `loop0-reminder.sh`). `--prune` must treat those as "not a reminder script" without crashing, and `--cancel` of such a job refuses. Test: Task 5 `test_prune_tolerates_null_scripts` and spec test 2.
+6. **Owner lines sit between `# Todos` and the first `## `, and the section does not exist yet.** Inserting the heading directly after the H1 (the spec's wording) would make those lines part of the agents' section. The plan inserts before the first `## ` after the H1 instead; on the real file the bytes are the same. Tests: Task 1 `test_owner_lines_under_h1_stay_outside_section`, `test_no_h1_no_h2_appends_at_eof`, `test_heading_search_skips_frontmatter`.
 
 ---
 
@@ -59,13 +60,13 @@
   - All three raise `TodoError(code=1)` when `HEADING` appears more than once.
 
 **Decisions the implementer cannot make alone:**
-- Work on `text.splitlines(keepends=True)`; join with `""`. A line is the heading when `line.rstrip() == HEADING`; a line ends the section when `line.startswith("## ")` (exactly that prefix).
+- Split on `"\n"` only, keeping the endings: `re.findall(r"[^\n]*\n|[^\n]+\Z", text)`; join with `""`. Not `str.splitlines`: it also breaks at `\x0b`, `\x0c`, `\x1c`–`\x1e`, `\x85`, `\u2028`, `\u2029`, so an owner line holding one of those would be cut into fake lines (a fragment starting `## ` would end the section). The "no line ending" checks below mean "does not end with `\n`". A line is the heading when `line.rstrip() == HEADING`; a line ends the section when `line.startswith("## ")` (exactly that prefix).
 - Item first line: `re.compile(r"^- \[([ xX])\] (.*)$")` on the line with its line ending stripped (column 0 only). Ticked = `x` or `X`.
 - `tick_item` matches a first line inside the section whose `rstrip()` ends with `f"id {item_id})"`; `item_id` that does not fullmatch `[0-9a-f]{6}` → no match. It replaces only the first five characters `- [ ]` with `- [x]`.
 - Title/id parse for `list_items`: `re.compile(r"^(.*) \(\d{4}-\d{2}-\d{2}, [^,()]*, id ([0-9a-f]{6})\)$")` on the text after `- [ ] `. No match → `Item(id=None, title=<whole rest>)`.
 - Ids already in the section: every `id ([0-9a-f]{6})\)` match in the section text. `add_item` calls `new_id()` until it returns an unused id; after 100 tries raise `TodoError`.
 - Insert into an existing section: walk back from the section end over blank lines (`line.strip() == ""`) but not past the heading; insert there. If the line before the insertion point has no line ending, append `"\n"` to it first.
-- Insert when the section is missing: after the first line that starts with `# `; if none, after the closing `---` of a frontmatter block that starts on line 0; if neither, at line 0. Insert `["\n", HEADING + "\n", *item_lines]`, plus a trailing `"\n"` unless the line now following is already blank. If the anchor line has no line ending, append `"\n"` to it.
+- Insert when the section is missing (deviation from the spec's "directly after the H1", decided in the audit): `start` = the line after the closing `---` of a frontmatter block that starts on line 0, else 0. `h1` = the first line at or after `start` that starts with `# ` (never search inside the frontmatter: a `# comment` line there is legal and would put the section inside the frontmatter). Insert at the first line after `h1` (or at or after `start` when there is no H1) that starts with `## `; if there is none, at EOF. Reason: the section runs to the next `## ` line, so inserting directly after the H1 would pull any owner lines between the H1 and the first `## ` into the agents' section (`list` would show them; the curator would be barred from them). On the real file (`# Todos`, blank line, `## Current …`) both rules give the same bytes, so spec test 2 is unchanged. Block = `[HEADING + "\n", *item_lines]`; prepend `"\n"` when the line before the insertion point exists and is not blank; append `"\n"` when a line follows the insertion point. If the line before the insertion point has no line ending, append `"\n"` to it first.
 - Item lines: `f"- [ ] {title} ({today:%Y-%m-%d}, {source}, id {id})\n"` then `f"  - {d}\n"` per detail.
 - Empty detail after stripping is refused (`detail N: empty`).
 - The secret scan runs on `"\n".join([title, *details])` (stripped values).
@@ -103,9 +104,13 @@ updated: 2026-11-07
 
 - [ ] **Step 2: Write the failing tests in `wiki/tests/test_todos.py`**
 
-Helpers in the test file: `FIX = Path(__file__).parent / "fixtures" / "todos.md"`; `TODAY = date(2026, 11, 13)`; `ids(*xs)` returns a `new_id` callable yielding `xs` in order; `with_section(body: str) -> str` returns the fixture with `"## Agent follow-ups\n" + body + "\n"` inserted directly after `"# Todos\n\n"`. Each test names the mutation it catches.
+Helpers in the test file: `FIX = Path(__file__).parent / "fixtures" / "todos.md"` (always read with `encoding="utf-8"`: the fixture has an em dash); `TODAY = date(2026, 11, 13)`; `ids(*xs)` returns a `new_id` callable yielding `xs` in order; `with_section(body: str) -> str` returns the fixture with `"## Agent follow-ups\n" + body + "\n"` inserted directly after `"# Todos\n\n"`. Each test names the mutation it catches.
 
 ```python
+def test_fixture_keeps_trailing_spaces():  # guards the fixture itself: an editor that strips trailing spaces would weaken spec test 1
+    text = FIX.read_text(encoding="utf-8")
+    assert "\n- \n" in text and "\n- [ ] \n" in text and "\u2014" in text
+
 def test_add_without_section_inserts_after_h1():  # spec 2; catches append-at-EOF, insert-before-H1
     old = FIX.read_text()
     new, i = todos.add_item(old, "Merge PR 55", ["CI green"], source="claude-laptop", today=TODAY, new_id=ids("a1b2c3"))
@@ -177,7 +182,7 @@ def test_validation_boundaries():  # spec 12; catches < vs <= on every limit
     assert todos.validate("t", ["d"] * 15)[1] == ["d"] * 15
     todos.validate("t", ["x" * 300])
     for title, details in [("a" * 121, []), ("t", ["d"] * 16), ("t", ["x" * 301]), ("   ", []),
-                           ("a\nb", []), ("a\tb", []), ("t", ["a b"]), ("t", [" "])]:
+                           ("a\nb", []), ("a\tb", []), ("t", ["a\u2028b"]), ("t", [" "])]:
         with pytest.raises(todos.TodoRejected) as e: todos.validate(title, details)
         assert e.value.code == 2
 
@@ -200,10 +205,23 @@ def test_h3_inside_section_is_not_a_boundary():  # Review Focus 2
     new, _ = todos.add_item(old, "Two", [], source="s", today=TODAY, new_id=ids("222222"))
     assert "- [ ] note\n- [ ] Two (2026-11-13, s, id 222222)\n\n## Current" in new
 
-def test_no_h1_inserts_after_frontmatter():
+def test_no_h1_no_h2_appends_at_eof():  # catches inserting right after the frontmatter, which would absorb "owner item"
     old = "---\ntags: [people]\n---\n- [ ] owner item\n"
     new, _ = todos.add_item(old, "T", [], source="s", today=TODAY, new_id=ids("abcdef"))
-    assert new == "---\ntags: [people]\n---\n\n## Agent follow-ups\n- [ ] T (2026-11-13, s, id abcdef)\n\n- [ ] owner item\n"
+    assert new == old + "\n## Agent follow-ups\n- [ ] T (2026-11-13, s, id abcdef)\n"
+    assert [i.title for i in todos.list_items(new, True)] == ["T"]
+
+def test_owner_lines_under_h1_stay_outside_section():  # catches inserting directly after the H1
+    old = "# Todos\n- [ ] owner item\n\n## Current\n- [ ] x\n"
+    new, _ = todos.add_item(old, "T", [], source="s", today=TODAY, new_id=ids("abcdef"))
+    assert new == "# Todos\n- [ ] owner item\n\n## Agent follow-ups\n- [ ] T (2026-11-13, s, id abcdef)\n\n## Current\n- [ ] x\n"
+    assert [i.title for i in todos.list_items(new, True)] == ["T"]
+
+def test_heading_search_skips_frontmatter():  # catches searching for "# " / "## " from line 0 instead of after the frontmatter
+    old = "---\n## owner comment\ntags: [people]\n---\n# Todos\n\n## Current\n"
+    new, _ = todos.add_item(old, "T", [], source="s", today=TODAY, new_id=ids("abcdef"))
+    assert new.startswith("---\n## owner comment\ntags: [people]\n---\n# Todos\n\n## Agent follow-ups\n")
+    assert schema.is_private(frontmatter.parse(new)[0]) is True
 ```
 
 - [ ] **Step 3: Run to verify they fail**
@@ -251,13 +269,13 @@ git commit -m "feat(wiki): todos.py parses and edits the Agent follow-ups sectio
 
 **Decisions:**
 - `GhContents.get`: argv `[gh, "api", f"repos/{repo}/contents/{path}?ref=main"]`, `capture_output=True, text=True, timeout=30`. Non-zero exit with `(HTTP 404)` in stderr → `None`; other non-zero, `TimeoutExpired` or `OSError` → `StoreError` (first stderr line only). Parse stdout JSON, `base64.b64decode(data["content"]).decode("utf-8")`, sha `data["sha"]`.
-- `GhContents.put`: argv `[gh, "api", "-X", "PUT", f"repos/{repo}/contents/{path}", "-f", f"message={message}", "-f", f"content={b64}", "-f", f"sha={sha}", "-f", "branch=main"]`, timeout 30. `(HTTP 409)` in stderr → `Conflict`; `TimeoutExpired` → `WriteUncertain`; other failure → `StoreError`.
+- `GhContents.put`: argv `[gh, "api", "-X", "PUT", f"repos/{repo}/contents/{path}", "-f", f"message={message}", "-f", f"content={b64}", "-f", f"sha={sha}", "-f", "branch=main"]`, timeout 30. `(HTTP 409)` in stderr → `Conflict`; `TimeoutExpired` → `WriteUncertain`; `OSError` from `run` (gh missing) or any other non-zero exit → `StoreError`.
 - `update`: up to `ATTEMPTS` rounds of GET → edit → PUT. GET `None` → `TodoError("todos.md not found on main")`. `Conflict` on the last round → `TodoError("todos.md kept changing; gave up after 5 attempts")`; otherwise `sleep(0.5 * 2 ** attempt + random.uniform(0, 0.5))` and re-GET (edit re-runs on the new text). `WriteUncertain` → `TodoError("timed out writing todos.md; the write may or may not have landed")`. `StoreError(e)` → `TodoError(f"GitHub: {e}")`.
 - `cmd_add` validates first (no store call on failure), uses `datetime.now(timezone.utc).date()` and `lambda: secrets.token_hex(3)` when not injected, and returns the id from the edit of the round that landed. Message `todo: add {id}`.
 - `cmd_done`: edit returns `None` when `tick_item` returns `None`; message `todo: done {id}`.
 - `cmd_list`: `cfg.public_only` → `TodoError("todo list is not available on a public_only wiki", code=2)` before touching `store`. Otherwise one GET, `None` → `TodoError` code 1.
 
-- [ ] **Step 1: Write the failing tests** (`FakeStore` in the test file: a queue of `(text, sha)` GET results, a list of PUT outcomes (`None` or an exception instance), and logs `gets`, `puts` as `(text, sha, message)`; `cfg = WikiConfig(root=tmp_path, source="claude-box", state_dir=tmp_path / "state")`; `sleeps = []` and `sleep=sleeps.append`).
+- [ ] **Step 1: Write the failing tests** (`FakeStore` in the test file: a queue of `(text, sha)` GET results, a list of PUT outcomes (`None` or an exception instance), and logs `gets`, `puts` as `(text, sha, message)`; fixture `cfg` = `WikiConfig(root=tmp_path, source="claude-box", state_dir=tmp_path / "state")`; fixture `sleeps` returns a fresh `[]` per test and tests pass `sleep=sleeps.append`. Never a module-level `sleeps` list: it would accumulate across tests and make `len(sleeps) == 1` / `== 4` depend on test order. Every test below that uses `sleeps` takes it as a parameter, e.g. `def test_five_conflicts_give_up(cfg, sleeps):`).
 
 ```python
 def test_conflict_regets_and_applies_edit_to_new_content(cfg):  # spec 5; catches retrying the stale body, no retry
@@ -285,6 +303,7 @@ def test_secret_title_makes_no_store_call(cfg):  # spec 7; catches scan after wr
 
 def test_done_unknown_id_and_duplicate_heading_make_no_put(cfg):  # spec 9, 10 through the loop
 def test_done_already_ticked_makes_no_put(cfg):  # returns False, puts == []
+def test_done_puts_tick_with_message(cfg, sleeps):  # one item 111111 open → returns True; puts[0][0] == text with "- [x]" on that line only; puts[0][1] is the GET sha; puts[0][2] == "todo: done 111111"
 def test_missing_file_creates_nothing(cfg):  # GET None → TodoError code 1, puts == []
 def test_list_public_only_makes_no_store_call(tmp_path):  # spec 13 (module half): code 2, gets == []
 
@@ -294,13 +313,13 @@ def test_gh_get_decodes_wrapped_base64():  # Review Focus 3
     run = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, out, "")
     assert todos.GhContents("o/r", "gh", run).get("todos.md") == (body, "abc")
 
-def test_gh_get_404_is_none_and_argv():  # argv == ["gh", "api", "repos/o/r/contents/todos.md?ref=main"]
+def test_gh_get_404_is_none_and_argv():  # argv == ["gh", "api", "repos/o/r/contents/todos.md?ref=main"]; rc 1 "(HTTP 404)" → None; rc 1 "(HTTP 500)" → StoreError (catches treating every failure as "missing"); run raising OSError → StoreError
 def test_gh_put_argv_and_errors():  # sha=, branch=main, message=, content= in argv; "(HTTP 409)" → Conflict; TimeoutExpired → WriteUncertain; rc 1 other → StoreError
 def test_dry_store_round_trip_and_stale_sha(tmp_path):  # get None when absent; put then get; put with old sha → Conflict
 def test_store_for_honours_dry_env(cfg, monkeypatch):  # env "1" → DryContents at cfg.state_dir/"dry"; unset → GhContents
 ```
 
-Write the bodies of the five one-line-described tests with the assertions given in their comments.
+Write the bodies of the nine one-line-described tests (`test_done_unknown_id_and_duplicate_heading_make_no_put` through `test_store_for_honours_dry_env`) with the assertions given in their comments.
 
 - [ ] **Step 2: Run to verify they fail**
 
@@ -438,7 +457,7 @@ git commit -m "docs(wiki): curator leaves Agent follow-ups alone; runbook for to
 - `--prune`: for each `remind-*.sh` in the scripts dir whose name fullmatches the pattern, is not a live job's script basename, and `time.time() - st_mtime > 600`: remove it and its `.txt`, print each removed path. Exit 0.
 - Update the header comment with both new forms, and the `usage` string.
 
-- [ ] **Step 1: Write the failing tests.** Extend `_run` with `jobs=None` (when a dict/str is given, write it to `home/.hermes/cron/jobs.json`; a str is written verbatim for the malformed case) and `files=()` (reminder base names to create as `.sh`/`.txt` pairs, with an optional age in seconds applied via `os.utime`).
+- [ ] **Step 1: Write the failing tests.** Extend `_run` with `jobs=None` (when a dict/str is given, write it to `home/.hermes/cron/jobs.json`; a str is written verbatim for the malformed case) and `files=()` (a sequence of `(base_name, age_seconds)`; each creates `base_name.sh` and `base_name.txt` in the scripts dir and sets both mtimes to `time.time() - age_seconds` with `os.utime`) and `extra=()` (a sequence of `(file_name, age_seconds)` for single non-pair files such as `loop0-reminder.sh`).
 
 ```python
 def test_cancel_removes_job_and_only_its_files(tmp_path):  # spec 1; catches deleting by glob
@@ -450,7 +469,7 @@ def test_cancel_keeps_files_when_remove_fails(tmp_path):  # spec 3: rc=3 → ret
 def test_prune_deletes_only_orphans(tmp_path):  # spec 4: live pair + orphan pair, both 11 min old → only orphan gone; stdout names both orphan paths
 def test_prune_malformed_jobs_deletes_nothing(tmp_path):  # spec 5: jobs.json "{not json" → rc 1, orphan pair present; also jobs.json missing → rc 1
 def test_prune_age_guard(tmp_path):  # spec 6: orphans aged 300 s and 660 s → 300 s kept, 660 s deleted
-def test_prune_tolerates_null_scripts(tmp_path):  # Review Focus 5: jobs with script None and "loop0-reminder.sh" plus one orphan → rc 0, orphan deleted, loop0-reminder.sh file (if present) untouched
+def test_prune_tolerates_null_scripts(tmp_path):  # Review Focus 5: jobs with script None and "loop0-reminder.sh"; files: loop0-reminder.sh, remind-notes.sh and one orphan pair, all aged 660 s → rc 0, orphan pair deleted, loop0-reminder.sh and remind-notes.sh both still present (catches dropping the fullmatch and globbing remind-*.sh)
 def test_cancel_without_id_is_usage_error(tmp_path):  # rc 2, calls == []
 ```
 
