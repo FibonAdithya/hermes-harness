@@ -249,9 +249,12 @@ no droplet todo command.
 
 **The section.** It starts at the line `## Agent follow-ups` and ends before the
 next line that starts with `## ` (or at the end of the file). A `### ` line
-does not end it. Every byte of `todos.md` outside the section stays unchanged,
-frontmatter included. If the heading is missing, `add` creates it before the
-first `## ` heading after the `# ` title. If the heading appears twice, the
+does not end it. Existing lines outside the section are never edited, the
+frontmatter included. When `add` has to create the heading, it may add a blank
+separator line, and a missing final newline on the line before the heading. If
+the heading is missing, `add` creates it before the first `## ` heading after
+the `# ` title; with no `# ` title it goes before the first `## ` heading after
+the frontmatter, or at the end of the file. If the heading appears twice, the
 command is refused. Each item is
 `- [ ] TITLE (YYYY-MM-DD, SOURCE, id XXXXXX)` with optional `  - DETAIL` lines
 under it. The date is UTC, SOURCE is the config's `source`, and the id is 6
@@ -261,8 +264,9 @@ lowercase hex characters.
 
 - `hermes-wiki todo add TITLE [--detail LINE]... [--detail-stdin]` adds an item
   and prints its id. The title is one line of 1-120 characters. Each detail is
-  one line of at most 300 characters, and there are at most 15. Any secret-scan
-  hit refuses the item.
+  one line of at most 300 characters, and there are at most 15.
+  `--detail-stdin` strips each line and drops blank lines. Any secret-scan hit
+  refuses the item.
 - `hermes-wiki todo done ID` ticks the item. An item that is already ticked
   exits 0 with a message on stderr.
 - `hermes-wiki todo list [--all]` prints `ID TITLE` for open items (all items
@@ -272,10 +276,11 @@ lowercase hex characters.
 Exit codes: 2 for a validation failure, a secret hit, or `list` on a
 `public_only` config. 1 for a missing `todos.md` on `main`, a duplicate
 heading, an unknown id, 5 conflicts in a row, a PUT timeout, or any other
-GitHub failure. After a PUT timeout the write may or may not have landed;
-run `hermes-wiki todo list` on the laptop before adding it again. Otherwise 0.
-Validation runs before any GitHub call. Output never includes `todos.md`
-content except the `list` output.
+GitHub failure. After a PUT timeout the write may or may not have landed. The
+error message names the item id; run `hermes-wiki todo list --all` on the
+laptop and look for that id before adding the item again (`list` is refused on
+the box). Otherwise 0. `add` validates its input before any GitHub call.
+Output never includes `todos.md` content except the `list` output.
 
 Setting `HERMES_WIKI_DRY_PUBLISH=1` reads and writes `<state_dir>/dry/todos.md`
 instead of GitHub.
