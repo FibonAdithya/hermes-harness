@@ -85,6 +85,7 @@ def main(listener=run_listener, run=subprocess.run) -> None:
         tuner_dir=tuner_dir,
         state_dir=cfg.state_dir,
         prod=_prod_wiring(cfg, run=run),
+        harness_checkout=cfg.harness_checkout,
     )
 
 

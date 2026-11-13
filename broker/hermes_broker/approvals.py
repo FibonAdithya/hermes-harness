@@ -19,7 +19,7 @@ from typing import Callable
 
 import httpx
 
-from .deploy_ask import DEPLOY_BUSY, DeployRunner
+from .deploy_ask import DEPLOY_BUSY, STATE_FILE, DeployAnnouncer, DeployAskState, DeployRunner
 from .grants import DEPLOY_GRANT_MINUTES, GrantStore
 from .prod import Prod
 from .proposals import ProposalStore, change_hash, record_approval, record_drop, safe_id
@@ -474,15 +474,27 @@ def run_listener(
     tuner_dir: Path | None = None,
     state_dir: Path | None = None,
     prod: Prod | None = None,
+    harness_checkout: Path | None = None,
     transport: httpx.BaseTransport | None = None,
 ) -> None:
     """Poll the approvals chat forever. `transport` replaces the network in tests."""
     offset = 0
     last_announce = 0.0
     last_tuner = 0.0
+    last_deploy_ask = 0.0
     with httpx.Client(transport=transport) as client:
         announcer = None
         tuner_announcer = None
+        deploy_announcer = None
+        runner = None
+        if call is not None and state_dir is not None and harness_checkout is not None:
+            # The runner's worker thread sends through this same client; httpx's pool is thread-safe.
+            def send(text: str) -> bool:
+                return _send(client, token, owner_id, text)
+
+            deploy_state = DeployAskState(Path(state_dir) / STATE_FILE)
+            runner = DeployRunner(call, send, deploy_state)
+            deploy_announcer = DeployAnnouncer(store, deploy_state, runner, call, send, harness_checkout)
         if tasks is not None and call is not None:
             announcer = Announcer(tasks, store, call, lambda text: _send(client, token, owner_id, text),
                                   proposals=proposals)
@@ -506,7 +518,8 @@ def run_listener(
 
             for update in updates:
                 offset = max(offset, update.get("update_id", 0) + 1)
-                reply = _dispatch(update, owner_id, store, tasks, call, repos, time.time, proposals, state_dir, prod)
+                reply = _dispatch(update, owner_id, store, tasks, call, repos, time.time, proposals, state_dir, prod,
+                                 runner)
                 if reply is not None:
                     _send(client, token, owner_id, reply)
             now = time.time()
@@ -523,3 +536,9 @@ def run_listener(
                     tuner_announcer.tick(now)
                 except Exception:
                     logger.exception("tuner announcer tick failed")
+            if deploy_announcer is not None and now - last_deploy_ask >= ANNOUNCE_EVERY:
+                last_deploy_ask = now
+                try:
+                    deploy_announcer.tick(now)
+                except Exception:
+                    logger.exception("deploy announcer tick failed")
