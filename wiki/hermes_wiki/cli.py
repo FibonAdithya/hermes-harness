@@ -184,8 +184,50 @@ def _add_seed(sub) -> None:
     p.set_defaults(func=_cmd_seed, needs_config=False)
 
 
+def _cmd_todo(args, cfg) -> int:
+    from . import todos
+
+    store = todos.store_for(cfg, subprocess.run)
+    try:
+        if args.todo_cmd == "add":
+            details = list(args.detail)
+            if args.detail_stdin:
+                details += [ln.strip() for ln in sys.stdin.read().splitlines() if ln.strip()]
+            print(todos.cmd_add(cfg, store, args.title, details))
+        elif args.todo_cmd == "done":
+            if not todos.cmd_done(cfg, store, args.id):
+                print(f"hermes-wiki: {args.id} is already done", file=sys.stderr)
+        else:
+            for item in todos.cmd_list(cfg, store, args.all):
+                print(f"{item.id or '-'} {item.title}")
+    except todos.TodoRejected as e:
+        for err in e.errors:
+            print(f"hermes-wiki: todo refused: {err}", file=sys.stderr)
+        return e.code
+    except todos.TodoError as e:
+        print(f"hermes-wiki: {e}", file=sys.stderr)
+        return e.code
+    return 0
+
+
+def _add_todo(sub) -> None:
+    p = sub.add_parser("todo", help="add, tick or list the owner todo list (todos.md in the wiki repo)")
+    p.set_defaults(func=_cmd_todo)
+    tsub = p.add_subparsers(dest="todo_cmd", required=True)
+    a = tsub.add_parser("add", help="add an item under 'Agent follow-ups'; prints its id")
+    a.add_argument("title")
+    a.add_argument("--detail", action="append", default=[], help="detail line (repeatable)")
+    a.add_argument("--detail-stdin", action="store_true", help="also read detail lines from stdin")
+    d = tsub.add_parser("done", help="tick an item by id")
+    d.add_argument("id")
+    ls = tsub.add_parser("list", help="list open items (--all includes ticked)")
+    ls.add_argument("--all", action="store_true")
+    for child in (a, d, ls):
+        child.add_argument("--config", default=argparse.SUPPRESS, help="config file path")
+
+
 _COMMANDS = [_add_mcp, _add_export_public, _add_worklist, _add_session_end, _add_drain, _add_extract_dir,
-             _add_install_hook, _add_import_memory, _add_seed]
+             _add_install_hook, _add_import_memory, _add_seed, _add_todo]
 
 
 def build_parser() -> argparse.ArgumentParser:
