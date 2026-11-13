@@ -597,12 +597,18 @@ is not quietly misleading.
     `github.com` would not help, since a token turns a gist or an issue body into
     an exfiltration channel.
 
-    **Status (checked 2026-10-17): designed, not live.** Task 18 stopped after
-    Steps 2–4 and 9: the script and units are installed and SOUL.md describes
-    the mirrors, but the listing PAT (Step 1) was never created, the service has
-    only run once (the intended no-credential failure), and the timer is
-    disabled. `/root/repos` does not exist. The rest of this entry describes
-    the design.
+    **Status: live since 2026-11-13**, differing from Task 18 in two ways.
+    (1) One fine-grained token (all repos, Contents read-only) at
+    `~/.hermes/gh-config`, mounted read-only at `/gh`, both lists the repos and
+    answers git's credential requests (`gh auth git-credential`); every git call
+    in the sync switches off the sandbox home's `store` helper. Task 18 had
+    cloned with the sandbox's `.git-credentials` token, but by 2026-11-13 that
+    token was rejected by GitHub, and git's `store` helper erased it from the
+    file on the rejection, so the file is now empty. (2) The script and units
+    live in this repo (`droplet/hermes-repo-sync.sh`, `droplet/repo-sync.sh`,
+    `droplet/units/hermes-repo-sync.*`, installed by
+    `droplet/install-repo-sync.sh`), and each pass also runs `git clean -fdx`,
+    since `reset --hard` alone kept untracked files the agent wrote.
 
     Instead, a `hermes-repo-sync` timer clones every owned repo host-side into
     `/root/repos/<name>` every 30 minutes, using the same throwaway-root-container

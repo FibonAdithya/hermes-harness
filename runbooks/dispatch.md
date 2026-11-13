@@ -143,12 +143,32 @@ ssh tig-gpu /venv/main/bin/gpuq list
 
 ## The repo mirrors
 
-> **Not live yet (checked 2026-10-17).** The script, the units and the SOUL.md
-> section are installed, but the listing token was never created, the only run
-> was the deliberate no-credential failure on 2026-08-17, and the timer is
-> disabled. `/root/repos` does not exist, although SOUL.md tells the agent it
-> does. To finish: VM plan Task 18, Step 1 (token), then Steps 5–8. Until then
-> the commands below show a disabled timer and a failed service.
+The sync lives in this repo: `droplet/hermes-repo-sync.sh` (host side) runs
+`droplet/repo-sync.sh` in a throwaway `hermes-sandbox` container that has the
+host's network; the agent's sandbox still has none. One fine-grained token,
+mounted read-only at `/gh` and outside the agent's `/root`, both lists the repos
+and answers git's credential requests. The sandbox home's own credential store is
+never consulted.
+
+### Setup (once)
+
+1. Create a fine-grained PAT at https://github.com/settings/personal-access-tokens/new:
+   resource owner you, **Repository access: All repositories**, **Repository
+   permissions: Contents read-only** (Metadata read-only comes with it). Nothing else.
+2. Store it outside the agent's `/root`, in a file, not a keyring: the container
+   cannot reach a keyring, and the sync refuses a `hosts.yml` without `oauth_token`.
+
+   ```bash
+   ssh -t hermes-vm 'mkdir -p ~/.hermes/gh-config && chmod 700 ~/.hermes/gh-config && GH_CONFIG_DIR=~/.hermes/gh-config gh auth login --with-token --insecure-storage'
+   # paste the PAT, then press Ctrl-D
+   ssh hermes-vm 'GH_CONFIG_DIR=~/.hermes/gh-config gh api user -q .login'
+   ```
+
+3. `ssh hermes-vm '~/hermes-harness/droplet/install-repo-sync.sh'`, then run one
+   pass by hand (`systemctl --user start hermes-repo-sync.service`), read its
+   log, and only then `systemctl --user enable --now hermes-repo-sync.timer`.
+
+### Day to day
 
 The assistant reads your code at `/root/repos/<name>` in its sandbox
 (`~/.hermes/sandboxes/docker/default/home/repos` on the host). Every repo you own
@@ -168,19 +188,21 @@ systemctl --user start hermes-repo-sync.service    # refresh now
 - **`STALE mirror: <name>`** means you renamed or deleted that repo. Nothing
   removes it automatically, by design. Delete it yourself when you are sure:
   `sudo rm -rf ~/.hermes/sandboxes/docker/default/home/repos/<name>`.
-- **The mirrors are replicas, not workspaces.** Every pass does `reset --hard`, so
-  anything written there is discarded. Do not keep work in them.
+- **The mirrors are replicas, not workspaces.** Every pass does `reset --hard` and
+  `clean -fdx`, so anything written there, tracked or not, is discarded. Do not
+  keep work in them.
+- **`FATAL: ... has no oauth_token`** means the token was stored in a keyring.
+  Log in again with `--insecure-storage` (Setup, step 2).
 
 ## Rotating credentials
 
 - **GitHub PAT** — regenerate the fine-grained token, then
   `ssh -t tig-server 'nano /etc/hermes-exec/github-token'`. Never pass it as a
   shell argument.
-- **Repo-listing PAT** (mirrors only, read-only, Metadata scope) — regenerate,
-  then `GH_CONFIG_DIR=~/.hermes/gh-config gh auth login --with-token` and paste
-  it. Verify with `GH_CONFIG_DIR=~/.hermes/gh-config gh api user -q .login`. This
-  token lives outside the agent's `/root` deliberately — do not move it into the
-  sandbox.
+- **Repo-mirror PAT** (mirrors only; all repos, Contents read-only) — regenerate,
+  then run step 2 of the mirrors' Setup again. Verify with
+  `GH_CONFIG_DIR=~/.hermes/gh-config gh api user -q .login`. This token lives
+  outside the agent's `/root` deliberately — do not move it into the sandbox.
 - **Claude Code credential** — the executor mounts the box's own login,
   `~adi/.claude/.credentials.json`, read-only. Re-login with `ssh -t tig-adi claude`.
 - **Approvals bot token** — BotFather `/revoke`, then edit
