@@ -1,7 +1,12 @@
 import json
-from hermes_broker.approvals import parse_command
+
+import pytest
+
+from hermes_broker.approvals import handle, parse_command
+from hermes_broker.grants import GrantStore
 
 OWNER = 111222333
+SHA = "4774e2314f46" + "0" * 28
 
 
 def msg(text, **extra):
@@ -344,3 +349,73 @@ def test_codes_unique_across_three_stores(tmp_path, monkeypatch):
     monkeypatch.setattr(pmod.secrets, "randbelow", lambda n: next(draws))
     code = props.announce("fix-1", H, now=1.0, avoid=_avoid_codes(grants, tasks, None, 1.0))
     assert code == "4242" and code not in taken
+
+
+@pytest.fixture
+def store(tmp_path):
+    return GrantStore(tmp_path / "grants.json")
+
+
+class Recorder:
+    """A prod that records the titles it was given."""
+
+    def __init__(self, result=True):
+        self.titles = []
+        self.result = result
+
+    def __call__(self, title):
+        self.titles.append(title)
+        return self.result
+
+
+class FakeRunner:
+    def __init__(self, busy=False):
+        self.started, self._busy = [], busy
+
+    def busy(self):
+        return self._busy
+
+    def start(self, sha):
+        self.started.append(sha)
+        return "Deploying."
+
+
+def test_auto_approval_starts_the_runner_and_does_not_prod(store):
+    store.create_deploy_request(SHA, now=0.0, ttl_seconds=86400, origin="auto")
+    prod, runner = Recorder(), FakeRunner()
+    reply = handle(store, "deploy", "harness:4774e23", 10.0, prod, runner=runner)
+    assert runner.started == [SHA] and prod.titles == [] and "Deploying." in reply
+
+
+def test_agent_approval_prods_and_does_not_start_the_runner(store):
+    store.create_deploy_request(SHA, now=0.0)
+    prod, runner = Recorder(), FakeRunner()
+    handle(store, "deploy", "harness:4774e23", 10.0, prod, runner=runner)
+    assert runner.started == [] and len(prod.titles) == 1 and store.deploy_target() == "harness"
+
+
+def test_auto_approval_while_busy_keeps_the_request(store):
+    store.create_deploy_request(SHA, now=0.0, ttl_seconds=86400, origin="auto")
+    r = FakeRunner(busy=True)
+    assert handle(store, "deploy", "harness:4774e23", 10.0, runner=r) == "a deploy is already running"
+    assert r.started == [] and store.pending_deploy_origin(10.0) == "auto"
+
+
+def test_auto_approval_without_a_runner_keeps_the_request(store):
+    store.create_deploy_request(SHA, now=0.0, ttl_seconds=86400, origin="auto")
+    assert handle(store, "deploy", "harness:4774e23", 10.0) == "Auto deploys are not wired in this listener."
+    assert store.pending_deploy_origin(10.0) == "auto"
+
+
+def test_auto_request_wrong_target_is_refused(store):
+    store.create_deploy_request(SHA, now=0.0, ttl_seconds=86400, origin="auto")
+    r = FakeRunner()
+    assert handle(store, "deploy", "fleet:4774e23", 10.0, runner=r).startswith("No pending fleet deploy")
+    assert r.started == [] and store.pending_deploy_origin(10.0) == "auto"
+
+
+def test_auto_request_wrong_prefix_is_refused(store):
+    store.create_deploy_request(SHA, now=0.0, ttl_seconds=86400, origin="auto")
+    r = FakeRunner()
+    assert handle(store, "deploy", "harness:abcdef0", 10.0, runner=r).startswith("No pending harness deploy")
+    assert r.started == [] and store.pending_deploy_origin(10.0) == "auto"

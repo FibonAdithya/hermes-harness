@@ -19,6 +19,7 @@ from typing import Callable
 
 import httpx
 
+from .deploy_ask import DEPLOY_BUSY, DeployRunner
 from .grants import DEPLOY_GRANT_MINUTES, GrantStore
 from .prod import Prod
 from .proposals import ProposalStore, change_hash, record_approval, record_drop, safe_id
@@ -96,7 +97,8 @@ def _tell_hermes(prod: Prod | None, title: str) -> str:
     return "\nCould not tell Hermes. Message it yourself to continue."
 
 
-def handle(store: GrantStore, verb: str, arg: str, now: float, prod: Prod | None = None) -> str:
+def handle(store: GrantStore, verb: str, arg: str, now: float, prod: Prod | None = None,
+           runner: DeployRunner | None = None) -> str:
     """Apply one parsed owner command; return the reply to send.
 
     `prod`, when given, is called once for each grant issued, with the line of
@@ -112,6 +114,17 @@ def handle(store: GrantStore, verb: str, arg: str, now: float, prod: Prod | None
         target, sep, prefix = arg.partition(":")
         if not sep:
             target, prefix = "harness", target
+        if store.pending_deploy_origin(now) == "auto":
+            if runner is None:
+                return "Auto deploys are not wired in this listener."
+            if runner.busy():
+                return DEPLOY_BUSY
+            sha = store.approve_auto_deploy(prefix, now, target)
+            if sha is None:
+                logger.info("rejected deploy prefix")
+                return f"No pending {target} deploy of a commit starting {prefix}."
+            logger.info("auto deploy of %s approved", sha)
+            return f"Deploy of {sha} to tig-server approved.\n" + runner.start(sha)
         sha = store.approve_deploy(prefix, now, target=target)
         if sha is None:
             logger.info("rejected deploy prefix")
@@ -410,6 +423,7 @@ def _dispatch(
     proposals: ProposalStore | None = None,
     state_dir: Path | None = None,
     prod: Prod | None = None,
+    runner: DeployRunner | None = None,
 ) -> str | None:
     """Route one parsed update to its handler; None means nothing to send.
 
@@ -445,7 +459,7 @@ def _dispatch(
             logger.exception("handle_task failed")
             return f"task reply failed: {exc}"
     sent_at = float((update.get("message") or {}).get("date") or now_fn())
-    return handle(store, verb, arg, sent_at, prod)
+    return handle(store, verb, arg, sent_at, prod, runner=runner)
 
 
 def run_listener(

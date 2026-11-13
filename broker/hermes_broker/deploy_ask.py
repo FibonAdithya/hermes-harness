@@ -4,10 +4,16 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import logging
 import tempfile
 import threading
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
+
+Call = Callable[..., dict]
 
 STATE_FILE = "deploy_ask.json"
 SETTLE_SECONDS = 1800
@@ -80,6 +86,62 @@ class DeployAskState:
             data = self._read()
             data.pop("deploy_running", None)
             self._write(data)
+
+
+def _spawn_thread(fn: Callable[[], None]) -> None:
+    threading.Thread(target=fn, daemon=True).start()
+
+
+class DeployRunner:
+    """Runs an approved auto-asked deploy on a worker thread, one at a time.
+
+    The listener's poll loop must keep answering (a `revoke`, say) while the box
+    deploys, so `start` returns at once and the worker sends the result later.
+    """
+
+    def __init__(self, call: Call, send: Callable[[str], bool], state: DeployAskState,
+                 clock: Callable[[], float] = time.time,
+                 spawn: Callable[[Callable[[], None]], None] = _spawn_thread) -> None:
+        self._call, self._send, self._state = call, send, state
+        self._clock, self._spawn = clock, spawn
+        self._lock = threading.Lock()
+
+    def busy(self) -> bool:
+        return self._lock.locked()
+
+    def start(self, sha: str) -> str:
+        if not self._lock.acquire(blocking=False):
+            return DEPLOY_BUSY
+        try:
+            self._state.set_running(sha, self._clock())
+            self._spawn(lambda: self._work(sha))
+        except BaseException:
+            try:
+                self._state.clear_running()
+            finally:
+                self._lock.release()
+            raise
+        return f"Deploying {sha[:12]} to tig-server. The result follows when it finishes."
+
+    def _work(self, sha: str) -> None:
+        try:
+            try:
+                r = self._call("deploy", {"sha": sha, "target": "harness"}, DEPLOY_TIMEOUT)
+                if r.get("deployed") == sha:
+                    text = f"tig-server: deployed {sha[:12]}"
+                else:
+                    text = f"tig-server: deploy of {sha[:12]} failed: {r.get('error', r)}"
+            except Exception as exc:
+                text = f"tig-server: deploy of {sha[:12]} failed: {exc}"
+            try:
+                self._send(text)
+            except Exception:
+                logger.exception("could not send deploy result")
+        finally:
+            try:
+                self._state.clear_running()
+            finally:
+                self._lock.release()
 
 
 def format_deploy_ask(box_sha: str | None, master_sha: str, merged_at: float,
