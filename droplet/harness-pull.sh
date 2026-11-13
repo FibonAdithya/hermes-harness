@@ -12,21 +12,40 @@ stamp="$HOME/.local/share/harness-deployed.sha"
 friends_stamp="$HOME/.local/share/friends-synced.sha"
 mkdir -p "$(dirname "$stamp")"
 
+# The listener runs an approved deploy in a worker thread, so a restart now would
+# kill it. It records the running deploy in <state_dir>/deploy_ask.json; a record
+# younger than 20 minutes (1200 s) is live, an older one is stale. Any read error
+# (no config, no file, bad JSON, no record) means not live.
+deploy_running() {
+  python3 -c '
+import json, os, sys, time
+cfg = json.load(open(os.path.expanduser(sys.argv[1])))
+state = os.path.join(os.path.expanduser(cfg["state_dir"]), "deploy_ask.json")
+rec = json.load(open(state))["deploy_running"]
+sys.exit(0 if time.time() - float(rec["started_at"]) < 1200 else 1)
+' "${HERMES_BROKER_CONFIG:-$HOME/.hermes/broker/broker.json}" 2>/dev/null
+}
+
 # Owner steps. The stamp is written only after every step succeeded, so a failed
 # `uv sync` or restart is retried on the next tick instead of being forgotten.
+# While a deploy runs the whole block is skipped (no stamp), so the next tick retries.
 if [ "$(cat "$stamp" 2>/dev/null)" != "$want" ]; then
-  git checkout -q master && git reset -q --hard origin/master
-  (cd broker && /usr/local/bin/uv sync --no-dev -q)
-  systemctl --user restart hermes-approvals
-  printf %s "$want" > "$stamp"
-  echo "deployed $(git rev-parse --short HEAD)"
+  if deploy_running; then
+    echo "deploy running; approvals restart deferred"
+  else
+    git checkout -q master && git reset -q --hard origin/master
+    (cd broker && uv sync --no-dev -q)
+    systemctl --user restart hermes-approvals
+    printf %s "$want" > "$stamp"
+    echo "deployed $(git rev-parse --short HEAD)"
+  fi
 fi
 
 # Friends steps, independent of the owner's stamp. The checkout is at `want`
 # here only if the owner steps ran now or earlier; a stale checkout is fixed first.
 if [ "$(cat "$friends_stamp" 2>/dev/null)" != "$want" ]; then
   git checkout -q master && git reset -q --hard origin/master
-  if (cd friends && /usr/local/bin/uv sync --no-dev -q); then
+  if (cd friends && uv sync --no-dev -q); then
     printf %s "$want" > "$friends_stamp"
     echo "friends synced $(git rev-parse --short HEAD)"
   else
