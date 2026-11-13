@@ -319,6 +319,11 @@ def test_curator_prompt_states_page_keys_rule():
             "a page missing a key or using any other key is hidden from the coding box until repaired.") in text
 
 
+def test_curator_prompt_leaves_agent_follow_ups_alone():
+    text = " ".join(PROMPT.read_text(encoding="utf-8").split())
+    assert "Never edit, move, split, trim or file anything into the `## Agent follow-ups` section of `todos.md`" in text
+
+
 def test_flagged_related_name_is_dropped_not_the_note(shim):
     note = _note(CLEAN, "The box deploy uses uv.")
     note["related"] = ["QUARANTINE-ME-page", "alpha"]

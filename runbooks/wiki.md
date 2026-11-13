@@ -3,7 +3,8 @@
 The wiki (`FibonAdithya/hermes-wiki`, branch `main`) is Hermes's long-term
 memory. Hermes edits pages on the droplet; a timer (`hermes-wiki-sync.timer`)
 pulls, commits and pushes every 15 minutes. Other agents (laptop and box Claude
-Code sessions, the one-time memory import) only add notes under `inbox/`. A
+Code sessions, the one-time memory import) only add notes under `inbox/`,
+except todo items (see "Todo items"). A
 nightly Hermes cron job, `wiki-curator`, files those notes into pages, keeps
 pages under their size caps and tidies the wiki. Design:
 `docs/ai/specs/2026-10-26-shared-knowledge-base-design.md`.
@@ -234,6 +235,69 @@ hermes cron run <id>
 Expected: a normal curator summary on Telegram. Whether `--provider anthropic`
 reads `ANTHROPIC_API_KEY` from `~/.hermes/.env` is unverified; this run is the
 check (acceptance check 13).
+
+## Todo items
+
+The owner's todo list is `todos.md` at the root of the wiki repo. Agents add
+follow-up items under its `## Agent follow-ups` section.
+
+**Who writes where.** Laptop and box sessions run `hermes-wiki todo`, which
+edits `todos.md` on `main` through the GitHub contents API (GET, then PUT with
+the file's `sha`; on HTTP 409 it re-reads and retries, 5 attempts at most).
+Hermes on the droplet edits its own checkout of `todos.md` directly; there is
+no droplet todo command.
+
+**The section.** It starts at the line `## Agent follow-ups` and ends before the
+next line that starts with `## ` (or at the end of the file). A `### ` line
+does not end it. Existing lines outside the section are never edited, the
+frontmatter included. When `add` has to create the heading, it may add a blank
+separator line, and a missing final newline on the line before the heading. If
+the heading is missing, `add` creates it before the first `## ` heading after
+the `# ` title; with no `# ` title it goes before the first `## ` heading after
+the frontmatter, or at the end of the file. If the heading appears twice, the
+command is refused. Each item is
+`- [ ] TITLE (YYYY-MM-DD, SOURCE, id XXXXXX)` with optional `  - DETAIL` lines
+under it. The date is UTC, SOURCE is the config's `source`, and the id is 6
+lowercase hex characters.
+
+**Commands.**
+
+- `hermes-wiki todo add TITLE [--detail LINE]... [--detail-stdin]` adds an item
+  and prints its id. The title is one line of 1-120 characters. Each detail is
+  one line of at most 300 characters, and there are at most 15.
+  `--detail-stdin` strips each line and drops blank lines. Any secret-scan hit
+  refuses the item.
+- `hermes-wiki todo done ID` ticks the item. An item that is already ticked
+  exits 0 with a message on stderr.
+- `hermes-wiki todo list [--all]` prints `ID TITLE` for open items (all items
+  with `--all`). It is refused on the box, where the config has `public_only`,
+  and makes no GitHub call there.
+
+Exit codes: 2 for a validation failure, a secret hit, or `list` on a
+`public_only` config. 1 for a missing `todos.md` on `main`, a duplicate
+heading, an unknown id, 5 conflicts in a row, a PUT timeout, or any other
+GitHub failure. After a PUT timeout the write may or may not have landed. The
+error message names the item id; run `hermes-wiki todo list --all` on the
+laptop and look for that id before adding the item again (`list` is refused on
+the box). Otherwise 0. `add` validates its input before any GitHub call.
+Output never includes `todos.md` content except the `list` output.
+
+Setting `HERMES_WIKI_DRY_PUBLISH=1` reads and writes `<state_dir>/dry/todos.md`
+instead of GitHub.
+
+**The curator** never edits, moves, splits, trims or files anything into the
+`## Agent follow-ups` section. The rest of `todos.md` follows the usual rules.
+
+**Reminder or todo item.** Anything tied to a time goes through `remind-owner`.
+Everything else is a todo item.
+
+**Cancelling and pruning reminders.** Do not use `hermes cron remove` on a
+reminder directly. Use `remind-owner --cancel JOB_ID`: it refuses a job that is
+not a reminder, runs `hermes cron remove`, and deletes that reminder's `.sh`
+and `.txt` files only if the removal succeeded. `remind-owner --prune` deletes
+`remind-*.sh` and `.txt` pairs that have no live job and whose `.sh` is more
+than 10 minutes old. If `jobs.json` is malformed, `--prune` exits 1 and deletes
+nothing.
 
 ## Day to day
 
