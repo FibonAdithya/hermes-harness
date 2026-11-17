@@ -21,7 +21,7 @@ MAX_GRANT_MINUTES = 480
 DEPLOY = "deploy"
 DEPLOY_GRANT_MINUTES = 10
 MIN_SHA_PREFIX = 7
-DEPLOY_TARGETS = ("harness", "fleet")
+DEPLOY_TARGETS = ("harness", "fleet", "chain")
 # "agent": requested through the broker, approved into a grant Hermes consumes.
 # "auto": asked by the approvals listener itself, approved and deployed by it.
 DEPLOY_ORIGINS = ("agent", "auto")

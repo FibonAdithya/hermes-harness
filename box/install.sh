@@ -10,7 +10,15 @@ ln -sfn "$here/../executor/run-task.sh" "$bin/run-task.sh"
 chmod +x "$here/dispatch" "$here/run-night.sh" "$here/../executor/run-task.sh"
 cp "$here"/units/*.service "$here"/units/*.timer "$units/"
 [ -f "$HOME/nights/config.toml" ] || cp "$here/night-config.example.toml" "$HOME/nights/config.toml"
+mkdir -p "$HOME/.config/chain"
+[ -f "$HOME/.config/chain/config.toml" ] || cp "$here/chain-config.example.toml" "$HOME/.config/chain/config.toml"
 systemctl --user daemon-reload
+# chaind is a service, not a timer: enable it once the chain checkout is set up.
+if [ -x "$HOME/chain/.venv/bin/chaind" ]; then
+  systemctl --user enable --now chaind.service || echo "chaind failed to start; see journalctl --user -u chaind" >&2
+else
+  echo "chaind not set up: re-run provision.sh after gh auth login, or clone FibonAdithya/chain to ~/chain and run make setup there, then re-run install.sh"
+fi
 # The executor image follows the Dockerfile: rebuild when its content changed
 # since the last install, so a merged Dockerfile change deploys like a verb.
 stamp="$HOME/.local/share/hermes-exec.dockerfile.sha"

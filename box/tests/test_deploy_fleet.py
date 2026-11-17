@@ -92,7 +92,7 @@ def test_a_red_commit_is_rolled_back_to_the_deployed_one(tmp_path):
 def test_unknown_target_refused(tmp_path):
     _, home, _, first, shims = make_repos(tmp_path)
     rc, out = run(home, shims, {"sha": first, "target": "droplet"})
-    assert rc == 2 and out["error"] == "deploy target must be harness or fleet"
+    assert rc == 2 and out["error"] == "deploy target must be harness, fleet or chain"
 
 
 def _flaky_uv(fail_on_call: int, message: str) -> str:

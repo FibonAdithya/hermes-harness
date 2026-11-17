@@ -211,6 +211,26 @@ def test_request_access_avoids_live_task_codes(store, tmp_path, monkeypatch):
     assert task_code not in out
 
 
+def test_request_access_avoids_live_human_codes(store, tmp_path, monkeypatch):
+    """A code live in the fleet:human store must never be issued as a grant code."""
+    from hermes_broker import server
+    import hermes_broker.grants as grants
+
+    now = time.time()
+    human_code = TaskStore(tmp_path / "human_codes.json").announce(
+        "fleet", "FibonAdithya/fleet", 2, "b" * 64, now=now, avoid=set()
+    )
+
+    monkeypatch.setattr(server, "_config", lambda: SimpleNamespace(state_dir=tmp_path))
+    monkeypatch.setattr(server, "_store", lambda: store)
+
+    draws = iter([int(human_code), 2222])
+    monkeypatch.setattr(grants.secrets, "randbelow", lambda n: next(draws))
+
+    out = server.request_access("tig-server", 30, "r")
+    assert "approve 2222" in out
+
+
 def test_night_status_shows_doctor_results_and_a_failed_doctor(monkeypatch):
     from hermes_broker import server
     monkeypatch.setattr(server, "_target", lambda box: "tig-server")

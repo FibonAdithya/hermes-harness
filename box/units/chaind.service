@@ -1,0 +1,18 @@
+[Unit]
+Description=chaind, the chain daemon that fleet's build/bug route submits to
+
+[Service]
+Type=simple
+WorkingDirectory=%h/chain
+Environment=PATH=%h/.npm-global/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/chain/.venv/bin/chaind
+# Stage runs are child processes; a daemon restart must not kill them. A stop does not
+# kill them either: see runbooks/dispatch.md "The chain route on the box".
+KillMode=process
+# chaind is always on (spec section 6). 10 s apart, a crash loop stays under systemd's
+# default start limit (5 starts in 10 s), so it keeps retrying instead of giving up.
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

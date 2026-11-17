@@ -1,0 +1,36 @@
+# chaind config for the box. install.sh copies this to ~/.config/chain/config.toml if absent.
+# No [intake] table: fleet submits tasks; chain does not poll for them.
+#
+# chain falls back to built-in stage budgets (summing to well over 40 USD) for any
+# stage not set here, so all seven stages are set.
+# Run ceiling: chain counts a loop stage's spend (review, fix) across all its rounds
+# against that stage's one budget, so the ceiling is the plain sum of the seven
+# budget_usd values:
+#   2 + 4 + 3 + 12 + 1 + 8 + 8 = 38.0 USD, at most the fleet-fixture
+#   [agents.chain] per_task_usd of 40.0.
+# ESTIMATE (unverified): every budget here and the 40.0 ceiling are unmeasured until
+# the acceptance run measures chain spend on the box. Re-check this accounting against
+# the chain commit that ships fleet mode (engine.py _stage_spent, _stage_budget_sum).
+max_concurrent_runs = 1
+max_fix_rounds = 2
+
+[stages.confirm]
+budget_usd = 2.0
+
+[stages.plan]
+budget_usd = 4.0
+
+[stages.audit]
+budget_usd = 3.0
+
+[stages.implement]
+budget_usd = 12.0
+
+[stages.pr]
+budget_usd = 1.0
+
+[stages.review]
+budget_usd = 8.0
+
+[stages.fix]
+budget_usd = 8.0

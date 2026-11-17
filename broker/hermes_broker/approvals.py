@@ -1,10 +1,12 @@
 """Approval channel: a Telegram bot the broker owns and the agent cannot see.
 
 Grants are issued only from a message that is (a) from the owner's numeric id,
-(b) an exact `approve <4 digits>`, `deploy <7-40 hex>`, `revoke`, or
-`task|solo|drop <4 digits>`, or `tool <4 digits>`, and (c) not forwarded. (c) is the
-defence against As-built #20: text someone else wrote, forwarded in, arrives
-through a channel already vetted as the owner.
+(b) an exact `approve <4 digits>`, `deploy <7-40 hex>`, `revoke`,
+`task|solo|drop <4 digits>`, `tool <4 digits>`, `take <4 digits>`, or
+`answer <4 digits> <text>` (the text runs to the end of the message, newlines
+included), and (c) not forwarded. (c) is the defence against As-built #20: text
+someone else wrote, forwarded in, arrives through a channel already vetted as the
+owner. `answer`/`take` (and `drop` on a fleet:human code) are handled in human.py.
 """
 
 from __future__ import annotations
@@ -29,9 +31,11 @@ logger = logging.getLogger(__name__)
 
 _APPROVE = re.compile(r"^approve\s+(\d{4})$", re.IGNORECASE)
 _REVOKE = re.compile(r"^revoke$", re.IGNORECASE)
-_DEPLOY = re.compile(r"^deploy\s+(?:(harness|fleet)\s+)?([0-9a-f]{7,40})$", re.IGNORECASE)
+_DEPLOY = re.compile(r"^deploy\s+(?:(harness|fleet|chain)\s+)?([0-9a-f]{7,40})$", re.IGNORECASE)
 _TASK = re.compile(r"^(task|solo|drop)\s+(\d{4})$", re.IGNORECASE)
 _TOOL = re.compile(r"^tool\s+(\d{4})$", re.IGNORECASE)
+_ANSWER = re.compile(r"^answer\s+(\d{4})\s+(.+)$", re.IGNORECASE | re.DOTALL)
+_TAKE = re.compile(r"^take\s+(\d{4})$", re.IGNORECASE)
 
 # Any of these on a message means it originated elsewhere.
 _FORWARD_MARKERS = (
@@ -71,6 +75,12 @@ def parse_command(update: dict, owner_id: int) -> tuple[str, str] | None:
     tool = _TOOL.match(text)
     if tool:
         return ("tool", tool.group(1))
+    answer = _ANSWER.match(text)
+    if answer and answer.group(2).strip():
+        return ("answer", f"{answer.group(1)}\n{answer.group(2).strip()}")
+    take = _TAKE.match(text)
+    if take:
+        return ("take", take.group(1))
     if _REVOKE.match(text):
         return ("revoke", "")
     return None
@@ -133,7 +143,7 @@ def handle(store: GrantStore, verb: str, arg: str, now: float, prod: Prod | None
         # sha was granted for `target`: approve_deploy only grants on a target match,
         # so there is no need to re-read the grant to learn its target.
         what = sha if target == "harness" else f"{target} {sha}"
-        tool = "deploy_harness" if target == "harness" else "deploy_fleet"
+        tool = {"harness": "deploy_harness", "fleet": "deploy_fleet", "chain": "deploy_chain"}[target]
         told = _tell_hermes(prod, f"Owner approved deploying {target} {sha[:12]}. Call {tool} now.")
         return f"Deploy of {what} to tig-server approved for {DEPLOY_GRANT_MINUTES} min.{told}"
     reason = store.pending_reason(arg)
@@ -170,15 +180,31 @@ def is_drop_only(issue: dict) -> bool:
             or "ops" in issue.get("labels", []))
 
 
+_INVISIBLE = frozenset({"Cf", "Zl", "Zp"})
+
+
+def _without_separator(text: str) -> str:
+    """`text` with format (zero-width), line separator and paragraph separator characters
+    dropped, then the reply separator removed until none is left. The drop comes first,
+    so a separator with an invisible character inside (which renders like the real one)
+    is removed too. One removal pass is not enough, since removing one can join the
+    pieces around it into another."""
+    text = "".join(c for c in text if unicodedata.category(c) not in _INVISIBLE)
+    while True:
+        prev, text = text, text.replace(_TAIL_SEPARATOR, "")
+        if text == prev:
+            return text
+
+
 def format_announcement(issue: dict, code: str) -> str:
     source = next((x.split(":", 1)[1] for x in issue.get("labels", []) if x.startswith("source:")), "manual")
-    title = issue["title"][:TITLE_CHARS].replace(_TAIL_SEPARATOR, "")
+    title = _without_separator(issue["title"][:TITLE_CHARS])
     head = f"{issue['repo']}#{issue['number']} [{source}] {title}"
     body = issue.get("body", "")
     trimmed = len(body) > BODY_CHARS or len(issue["title"]) > TITLE_CHARS
     # The separator appears exactly once, in front of the real tail, so an issue
     # cannot put a fake separator and fake reply lines above it.
-    shown = body[:BODY_CHARS].replace(_TAIL_SEPARATOR, "") + ("\n[… trimmed]" if len(body) > BODY_CHARS else "")
+    shown = _without_separator(body[:BODY_CHARS]) + ("\n[… trimmed]" if len(body) > BODY_CHARS else "")
     if "ops" in issue.get("labels", []):
         tail = f"code {code} — needs you on the box, not an agent.\ndrop {code}"
     elif trimmed:
@@ -252,9 +278,9 @@ class Announcer:
     because getUpdates is single-consumer and this bot is the owner's only channel."""
 
     def __init__(self, tasks: TaskStore, grants: GrantStore, call: Call, send: Callable[[str], bool],
-                 proposals: ProposalStore | None = None) -> None:
+                 proposals: ProposalStore | None = None, humans: TaskStore | None = None) -> None:
         self.tasks, self.grants, self.call, self.send = tasks, grants, call, send
-        self.proposals = proposals
+        self.proposals, self.humans = proposals, humans
         self.box_down = False
 
     def tick(self, now: float) -> None:
@@ -273,7 +299,7 @@ class Announcer:
         self.tasks.prune(set(r.get("repos_ok", [])), {(i["repo"], i["number"]) for i in issues}, now)
         for issue in issues:
             code = self.tasks.announce(issue["repo"], issue["slug"], issue["number"], issue["hash"], now,
-                                       avoid=_avoid_codes(self.grants, None, self.proposals, now),
+                                       avoid=_avoid_codes(self.grants, None, self.proposals, now, humans=self.humans),
                                        drop_only=is_drop_only(issue))
             if code and not self.send(format_announcement(issue, code)):
                 # The send failed: give the code back so the next tick re-announces
@@ -282,13 +308,12 @@ class Announcer:
 
 
 def _avoid_codes(grants: GrantStore, tasks: TaskStore | None, proposals: ProposalStore | None,
-                 now: float) -> set[str]:
+                 now: float, humans: TaskStore | None = None) -> set[str]:
     """Every live code in every store that issues codes; a new code must avoid all of them."""
     out = set(grants.pending_codes(now))
-    if tasks is not None:
-        out |= tasks.live_codes(now)
-    if proposals is not None:
-        out |= proposals.live_codes(now)
+    for other in (tasks, proposals, humans):
+        if other is not None:
+            out |= other.live_codes(now)
     return out
 
 
@@ -424,6 +449,7 @@ def _dispatch(
     state_dir: Path | None = None,
     prod: Prod | None = None,
     runner: DeployRunner | None = None,
+    humans: TaskStore | None = None,
 ) -> str | None:
     """Route one parsed update to its handler; None means nothing to send.
 
@@ -431,11 +457,16 @@ def _dispatch(
     `date`), not by when this loop gets around to processing it: the announcer tick
     can hold the loop for up to 120s (list_triage's own timeout), and
     REQUEST_TTL_SECONDS is also 120s, so processing-time expiry would spuriously
-    reject a reply the owner sent in time. A prod after a grant holds the loop as
-    well, for up to five of prod.STEP_TIMEOUT (75s), and a reply queued behind it
-    (a `revoke`, say) waits that long. Task replies use 7-day codes, so
-    processing time is fine there, and a broken handler must not take the listener
-    down with it.
+    reject a reply the owner sent in time. The fleet:human announcer tick adds up to
+    another 120s per round (list_human's timeout). A prod after a grant holds the
+    loop as well, for up to five of prod.STEP_TIMEOUT (75s), and an `answer` or
+    `take` reply holds it for up to its box call's timeout (120s); a reply queued
+    behind any of these (a `revoke`, say) waits that long. Task and fleet:human
+    replies use 7-day codes, so processing time is fine there, and a broken handler
+    must not take the listener down with it.
+
+    `drop` goes to the store that issued the code: proposals, then fleet:human,
+    then tasks. Codes are unique across stores (_avoid_codes), so at most one holds it.
     """
     parsed = parse_command(update, owner_id)
     if parsed is None:
@@ -450,6 +481,15 @@ def _dispatch(
         except Exception as exc:
             logger.exception("handle_proposal failed")
             return f"tool reply failed: {exc}"
+    if verb in _human.HUMAN_VERBS or (verb == "drop" and humans is not None
+                                      and arg in humans.live_codes(now_fn())):
+        if humans is None or call is None:
+            return None
+        try:
+            return _human.handle_human(humans, verb, arg, now_fn(), call)
+        except Exception as exc:
+            logger.exception("handle_human failed")
+            return f"fleet:human reply failed: {exc}"
     if verb in TASK_VERBS:
         if tasks is None or call is None:
             return None
@@ -476,16 +516,19 @@ def run_listener(
     prod: Prod | None = None,
     harness_checkout: Path | None = None,
     transport: httpx.BaseTransport | None = None,
+    humans: TaskStore | None = None,
 ) -> None:
     """Poll the approvals chat forever. `transport` replaces the network in tests."""
     offset = 0
     last_announce = 0.0
     last_tuner = 0.0
     last_deploy_ask = 0.0
+    last_human = 0.0
     with httpx.Client(transport=transport) as client:
         announcer = None
         tuner_announcer = None
         deploy_announcer = None
+        human_announcer = None
         runner = None
         if call is not None and state_dir is not None and harness_checkout is not None:
             # The runner's worker thread sends through this same client; httpx's pool is thread-safe.
@@ -497,10 +540,13 @@ def run_listener(
             deploy_announcer = DeployAnnouncer(store, deploy_state, runner, call, send, harness_checkout)
         if tasks is not None and call is not None:
             announcer = Announcer(tasks, store, call, lambda text: _send(client, token, owner_id, text),
-                                  proposals=proposals)
+                                  proposals=proposals, humans=humans)
+        if humans is not None and call is not None:
+            human_announcer = _human.HumanAnnouncer(humans, store, tasks, proposals, call,
+                                                    lambda text: _send(client, token, owner_id, text))
         if proposals is not None and tuner_dir is not None:
             tuner_announcer = TunerAnnouncer(
-                proposals, lambda t: _avoid_codes(store, tasks, proposals, t), tuner_dir,
+                proposals, lambda t: _avoid_codes(store, tasks, proposals, t, humans=humans), tuner_dir,
                 lambda text: _send(client, token, owner_id, text))
         while True:
             try:
@@ -519,7 +565,7 @@ def run_listener(
             for update in updates:
                 offset = max(offset, update.get("update_id", 0) + 1)
                 reply = _dispatch(update, owner_id, store, tasks, call, repos, time.time, proposals, state_dir, prod,
-                                 runner)
+                                 runner, humans=humans)
                 if reply is not None:
                     _send(client, token, owner_id, reply)
             now = time.time()
@@ -536,9 +582,20 @@ def run_listener(
                     tuner_announcer.tick(now)
                 except Exception:
                     logger.exception("tuner announcer tick failed")
+            if human_announcer is not None and now - last_human >= ANNOUNCE_EVERY:
+                last_human = now
+                try:
+                    human_announcer.tick(now)
+                except Exception:
+                    logger.exception("fleet:human announcer tick failed")
             if deploy_announcer is not None and now - last_deploy_ask >= ANNOUNCE_EVERY:
                 last_deploy_ask = now
                 try:
                     deploy_announcer.tick(now)
                 except Exception:
                     logger.exception("deploy announcer tick failed")
+
+
+# human.py imports this module's constants, so it is bound as a module here and its
+# names are looked up at call time: importing either module first then works.
+from . import human as _human  # noqa: E402

@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
+import tempfile
 import tomllib
 from pathlib import Path
 from typing import Callable
@@ -20,7 +22,7 @@ import boxlib
 Gh = Callable[[list[str], "str | None"], "tuple[int, str, str]"]
 
 # fleet/src/fleet/labels.py::CLASSES. Extend by PR when fleet does.
-CLASSES = ("patch", "spec", "investigation", "integration")
+CLASSES = ("patch", "spec", "investigation", "integration", "build", "bug")
 TRIAGE, READY, AUTO_OK, HUMAN = "fleet:triage", "fleet:ready", "fleet:auto-ok", "fleet:human"
 SOLO, DROPPED = "fleet:solo", "fleet:dropped"
 SOURCES = ("source:hermes", "source:doctor")
@@ -29,6 +31,17 @@ MODES = {"fleet": (READY, AUTO_OK), "solo": (HUMAN, SOLO)}
 # BODY_CHARS), and approve() binds the hash of the whole text, so a longer body
 # could be approved unread. The broker offers only `drop` for anything longer.
 MAX_TITLE, MAX_BODY = 200, 3500
+# The owner's answers to fleet:human escalations, one JSON list per issue, under home.
+ANSWERS_DIR = Path(".local/state/fleet/answers")
+MAX_ANSWER = 2000
+# fleet depends on this prefix, byte for byte: a comment whose body starts with it, after
+# a handoff packet, on an issue with a fleet:answered-N label (N >= 1), makes fleet treat
+# that packet as stale. Do not reword it without changing fleet in step.
+ANSWER_HEADER = "Owner's answer (from Telegram):\n\n"
+# fleet (herdr_executor._ANSWERS_MAX_BYTES) and chain (fleetmode.MAX_ANSWERS_BYTES) refuse
+# to read an answers file larger than this, so answer() never writes one.
+ANSWERS_MAX_BYTES = 65536
+ANSWERED = "fleet:answered-"
 
 
 class TaskError(ValueError):
@@ -190,3 +203,319 @@ def triage(gh: Gh, repo_slug: str) -> list[dict]:
 
 def comment(gh: Gh, repo_slug: str, number: int, body: str) -> None:
     _ok(gh, ["issue", "comment", str(int(number)), "--repo", repo_slug, "--body", body])
+
+
+# --- fleet:human: the owner answers or takes an escalated issue -------------------------
+
+# The -c snippet fleet_escalations runs. latest() raising on one issue's comments gives
+# that issue an {"error": ...} marker instead of failing every issue in the call.
+_ESCALATIONS_CODE = """\
+import json, sys
+from fleet.escalation import latest
+def one(v):
+    try:
+        return latest(v)
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"[:300]}
+d = json.load(sys.stdin)
+print(json.dumps({k: one(v) for k, v in d.items()}))
+"""
+
+
+def _valid_escalation(e) -> bool:
+    if e is None:
+        return True
+    if not isinstance(e, dict):
+        return False
+    if "error" in e:
+        return set(e) == {"error"} and isinstance(e["error"], str)
+    return type(e.get("index")) is int and isinstance(e.get("reason"), str) and isinstance(e.get("text"), str)
+
+
+def fleet_escalations(home: Path, comments: dict[int, list[str]], timeout: float = 60) -> dict[int, dict | None]:
+    """Each issue's newest escalation, read by fleet's own parser (fleet.escalation.latest).
+
+    One process for every issue; the comment bodies go on stdin as JSON. --no-sync: this
+    is reached from the owner's Telegram reply, and must not sync (rewrite) the deployed
+    fleet checkout's environment; deploy_fleet owns that. -P: the cwd must not shadow
+    fleet's imports. An issue whose comments make latest() raise gets {"error": "..."};
+    the other issues keep their escalations. A failure of the whole call (uv missing,
+    non-zero exit, a timeout, output that is not the expected JSON) raises TaskError, so
+    a caller never mistakes a broken fleet checkout for an issue with no escalation."""
+    want = {int(n): [str(b) for b in v] for n, v in comments.items()}
+    try:
+        p = subprocess.run(["uv", "run", "--no-sync", "--project", str(Path(home) / "TIG" / "fleet"),
+                            "python", "-P", "-c", _ESCALATIONS_CODE],
+                           input=json.dumps({str(n): v for n, v in want.items()}),
+                           capture_output=True, text=True, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise TaskError(f"reading escalations timed out after {timeout} s") from exc
+    except OSError as exc:
+        raise TaskError(f"cannot run uv: {exc}") from exc
+    if p.returncode != 0:
+        raise TaskError(f"could not read escalations: {p.stderr.strip()[-300:]}")
+    try:
+        raw = json.loads(p.stdout.strip().splitlines()[-1])
+        out = {int(k): v for k, v in raw.items()}
+    except (IndexError, ValueError, AttributeError, TypeError) as exc:
+        raise TaskError(f"fleet.escalation.latest printed no JSON object: {p.stdout.strip()[-300:]!r}") from exc
+    for n in want:
+        if n not in out:
+            raise TaskError(f"fleet.escalation.latest gave nothing for #{n}")
+        if not _valid_escalation(out[n]):
+            raise TaskError(f"fleet.escalation.latest gave a malformed escalation for #{n}: {out[n]!r}"[:300])
+    return {n: out[n] for n in want}
+
+
+def _login(gh: Gh) -> str:
+    login = _ok(gh, ["api", "user", "--jq", ".login"]).strip()
+    if not login:
+        raise TaskError("gh api user gave no login")
+    return login
+
+
+def _own_bodies(comments, login: str) -> list[str]:
+    """The bodies of the comments the box's gh login wrote, in order. fleet writes its
+    escalations (and its agents their handoff packets) as that login; anyone else's
+    comment is not an escalation, even with fleet's marker in it, since any GitHub user
+    can comment on a public repository's issue. A comment whose author is missing or
+    unreadable is left out."""
+    out = []
+    for c in comments or []:
+        author = c.get("author") if isinstance(c, dict) else None
+        if isinstance(author, dict) and isinstance(author.get("login"), str) and author["login"] == login:
+            out.append(str(c.get("body", "")))
+    return out
+
+
+def _human_rows(issues: list[dict], home: Path, escalations, login: str) -> list[dict]:
+    """The rows human() lists, and the freshness hash answer() and take() check against.
+    Only comments by `login` (the box's gh login) are read; see _own_bodies.
+
+    The hash binds the title and the escalation the owner read (its index and text), so
+    a newer escalation or a reworded one changes it. An issue with no escalation comment
+    gets index -1 and text "". When fleet's helper fails, for the whole call or for one
+    issue (an {"error": ...} entry), that issue is still listed, with a note, index -1,
+    and as text a digest of all its comment bodies: the hash then still changes when a
+    newer escalation is posted while the helper stays broken. The note and digest are
+    per issue, so one unreadable issue does not change the hash of the others."""
+    if not issues:
+        return []
+    comments = {int(r["number"]): _own_bodies(r.get("comments"), login) for r in issues}
+    whole_note = None
+    try:
+        found = escalations(home, comments)
+    except TaskError as exc:
+        found, whole_note = {}, f"escalation text unavailable: {str(exc)[:200]}"
+    rows = []
+    for r in issues:
+        e = found.get(int(r["number"]))
+        note = whole_note
+        if isinstance(e, dict) and "error" in e:
+            e, note = None, f"escalation text unavailable: {str(e['error'])[:200]}"
+        esc = {"index": e["index"], "reason": e["reason"], "text": e["text"]} if e else None
+        if esc:
+            index, text = esc["index"], esc["text"]
+        elif note:
+            index, text = -1, hashlib.sha256(json.dumps(comments[int(r["number"])]).encode("utf-8")).hexdigest()
+        else:
+            index, text = -1, ""
+        rows.append({"number": int(r["number"]), "title": r["title"],
+                     "labels": [x["name"] for x in r.get("labels", [])],
+                     "escalation": esc, "note": note, "hash": issue_hash(r["title"], f"{index}\n{text}")})
+    return rows
+
+
+def human(gh: Gh, repo_slug: str, home: Path, escalations=fleet_escalations) -> list[dict]:
+    """Open fleet:human issues waiting on the owner: not solo work (run_task's), and not
+    already taken by the box's gh login."""
+    login = _login(gh)
+    issues = json.loads(_ok(gh, ["issue", "list", "--repo", repo_slug, "--state", "open", "--label", HUMAN,
+                                 "--json", "number,title,labels,assignees", "--limit", "200"]) or "[]")
+    # Comments come from the same view call _fresh_human makes (gh issue list may cap
+    # them per issue), so the listing hashes the comment set answer() rechecks.
+    views = [_view_human(gh, repo_slug, r["number"]) for r in issues if _waiting(r, login)]
+    return _human_rows([v for v in views if _waiting(v, login)], home, escalations, login)
+
+
+def _waiting(row: dict, login: str) -> bool:
+    names = {x["name"] for x in row.get("labels", [])}
+    return (str(row.get("state", "OPEN")).upper() == "OPEN" and HUMAN in names and SOLO not in names
+            and login not in {a.get("login") for a in row.get("assignees") or []})
+
+
+def _view_human(gh: Gh, repo_slug: str, number: int) -> dict:
+    row = json.loads(_ok(gh, ["issue", "view", str(int(number)), "--repo", repo_slug,
+                              "--json", "state,title,labels,assignees,comments"]))
+    row["number"] = int(number)
+    return row
+
+
+def _fresh_human(gh: Gh, repo_slug: str, number: int, want_hash: str, home: Path, escalations,
+                 login: str) -> dict:
+    """Refuse unless the issue still waits on the owner with the escalation they read."""
+    row = _view_human(gh, repo_slug, number)
+    names = {x["name"] for x in row.get("labels", [])}
+    if str(row.get("state", "")).upper() != "OPEN":
+        raise TaskError(f"#{number} is closed")
+    if HUMAN not in names:
+        raise TaskError(f"#{number} is no longer waiting on the owner")
+    if SOLO in names:
+        raise TaskError(f"#{number} is solo work; it is not answered from here")
+    [fresh] = _human_rows([row], home, escalations, login)
+    if fresh["hash"] != want_hash:
+        raise TaskError(f"#{number} changed since it was announced; wait for the new announcement")
+    return fresh
+
+
+def answers_path(home: Path, repo_slug: str, number: int) -> Path:
+    if not isinstance(repo_slug, str) or not boxlib.SLUG_RE.fullmatch(repo_slug):
+        raise TaskError(f"repo must be owner/name: {repo_slug!r}")
+    owner, name = repo_slug.split("/")
+    return Path(home) / ANSWERS_DIR / f"{owner}__{name}" / f"{int(number)}.json"
+
+
+def _read_raw(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise TaskError(f"cannot read the answers file {path}: {exc}") from exc
+
+
+def _read_answers(path: Path) -> list[dict]:
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise TaskError(f"cannot read the answers file {path}: {exc}") from exc
+    try:
+        entries = json.loads(text)
+    except ValueError as exc:
+        raise TaskError(f"the answers file {path} is not JSON; fix it by hand, earlier answers are in it") from exc
+    if not isinstance(entries, list) or not all(isinstance(e, dict) for e in entries):
+        raise TaskError(f"the answers file {path} is not a list of answers; fix it by hand")
+    return entries
+
+
+def _answers_bytes(entries: list[dict]) -> bytes:
+    """The answers file as written. ASCII-escaped: lossless for any str, a lone surrogate
+    from the broker's JSON included, so the size measured here is the size on disk."""
+    return (json.dumps(entries, indent=1) + "\n").encode("ascii")
+
+
+def _write_answers(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:  # mkstemp creates it mode 600
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def _answered(labels: list[str]) -> int:
+    """The highest N among fleet:answered-N labels, as fleet's ledger reads it (0 if none)."""
+    found = [int(x[len(ANSWERED):]) for x in labels
+             if x.startswith(ANSWERED) and x[len(ANSWERED):].isascii() and x[len(ANSWERED):].isdecimal()]
+    return max(found, default=0)
+
+
+def _edit(gh: Gh, repo_slug: str, number: int, flag: str, names: list[str]) -> tuple[int, str, str]:
+    return gh(["issue", "edit", str(int(number)), "--repo", repo_slug, flag, ",".join(names)], None)
+
+
+def _undo_answer(gh: Gh, repo_slug: str, number: int, path: Path, before: bytes | None,
+                 added: list[str]) -> list[str]:
+    """Put the answers file and labels back as answer() found them. Returns what could
+    not be put back. fleet:human is re-added before the added labels go, so a remove
+    that GitHub applied but did not confirm never leaves the issue in no fleet state."""
+    left = []
+    try:
+        if before is None:
+            path.unlink(missing_ok=True)
+        else:
+            _write_answers(path, before)
+    except OSError as exc:
+        left.append(f"the answers file {path} still holds this answer ({exc}); remove its last entry by hand")
+    rc, _, err = _edit(gh, repo_slug, number, "--add-label", [HUMAN])
+    if rc != 0:
+        left.append(f"fleet:human could not be put back ({err.strip()[:200]}), so {', '.join(added)} "
+                    f"stay on the issue; fix its labels by hand")
+    elif added:
+        rc, _, err = _edit(gh, repo_slug, number, "--remove-label", added)
+        if rc != 0:
+            left.append(f"{', '.join(added)} are still on the issue ({err.strip()[:200]}); remove them by hand")
+    return left
+
+
+def answer(gh: Gh, repo_slug: str, number: int, want_hash: str, text: str, home: Path, now: float,
+           escalations=fleet_escalations) -> dict:
+    """The owner's `answer` reply: records it for fleet and sends the issue back to ready.
+
+    All or nothing as the owner sees it: a refusal leaves the answers file and labels as
+    they were, so a retry is not counted twice. N in fleet:answered-N is one past the
+    highest such label (what fleet reads), not the number of entries in the file.
+
+    Order: add fleet:answered-N and fleet:ready, post the "Owner's answer" comment (fleet
+    reads it, with the label, as making an earlier handoff packet stale), write the file,
+    then remove fleet:human. Removing fleet:human is the commit: until then the issue
+    carries fleet:human and fleet:ready together, which fleet's ledger refuses loudly
+    instead of acting on, so fleet never acts on a half-written answer. A failure before
+    the commit puts the file and labels back; a comment already posted stays on GitHub
+    (the error says so), and is harmless to fleet while the issue waits on the owner.
+    If the process is killed instead: after the label add, a retry costs one extra
+    fleet:answered label; after the comment, also a stray comment; after the file write,
+    also a stray answer in the file. That last window is one gh call wide. Writing the
+    file after the commit instead would let fleet act on fleet:ready with raised caps and
+    no answer text, or lose the text silently."""
+    text = text.strip() if isinstance(text, str) else ""
+    if not 1 <= len(text) <= MAX_ANSWER:
+        raise TaskError(f"an answer must be 1..{MAX_ANSWER} characters")
+    fresh = _fresh_human(gh, repo_slug, number, want_hash, home, escalations, _login(gh))
+    path = answers_path(home, repo_slug, number)
+    before = _read_raw(path)
+    entries = _read_answers(path)
+    entries.append({"text": text, "at": float(now)})
+    data = _answers_bytes(entries)
+    if len(data) > ANSWERS_MAX_BYTES:
+        raise TaskError(f"nothing was recorded: with this answer the answers file would be {len(data)} bytes, "
+                        f"over the {ANSWERS_MAX_BYTES} fleet and chain read ({len(before or b'')} used; "
+                        f"a non-ASCII character takes 6 or 12). Send a shorter answer, or take the issue")
+    # fleet reads the highest fleet:answered-N; earlier ones stay on the issue.
+    add = [f"{ANSWERED}{_answered(fresh['labels']) + 1}", READY]
+    for name in add:
+        ensure_label(gh, repo_slug, name)
+    added = [x for x in add if x not in fresh["labels"]]
+    commented = False
+    try:
+        # Add before remove, as approve() does.
+        _ok(gh, ["issue", "edit", str(int(number)), "--repo", repo_slug, "--add-label", ",".join(add)])
+        comment(gh, repo_slug, number, ANSWER_HEADER + text)
+        commented = True
+        _write_answers(path, data)
+        _ok(gh, ["issue", "edit", str(int(number)), "--repo", repo_slug, "--remove-label", HUMAN])
+    except (TaskError, OSError) as exc:
+        left = _undo_answer(gh, repo_slug, number, path, before, added)
+        stray = " (the \"Owner's answer\" comment it posted stays on the issue)" if commented else ""
+        if left:
+            raise TaskError(f"{exc}; undoing it failed: {'; '.join(left)}{stray}") from exc
+        raise TaskError(f"{exc}; nothing was recorded{stray}") from exc
+    return {"number": int(number), "answers": len(entries)}
+
+
+def take(gh: Gh, repo_slug: str, number: int, want_hash: str, escalations=fleet_escalations,
+         home: Path | None = None) -> dict:
+    """The owner's `take` reply: assigns the box's gh login, so human() stops listing the
+    issue. fleet:human stays on it; the owner works it by hand."""
+    home = Path.home() if home is None else Path(home)
+    login = _login(gh)
+    fresh = _fresh_human(gh, repo_slug, number, want_hash, home, escalations, login)
+    _ok(gh, ["issue", "edit", str(int(number)), "--repo", repo_slug, "--add-assignee", login])
+    return {"number": int(number), "title": fresh["title"], "assignee": login}

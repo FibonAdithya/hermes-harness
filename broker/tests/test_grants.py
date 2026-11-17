@@ -321,3 +321,11 @@ def test_deploy_slot_busy(store, setup, busy):
 def test_unknown_origin_rejected(store):
     with pytest.raises(ValueError):
         store.create_deploy_request(SHA, now=0.0, origin="owner")
+
+
+def test_chain_is_a_deploy_target(store):
+    store.create_deploy_request(SHA_F, now=1.0, target="chain")
+    assert store.approve_deploy(SHA_F[:7], now=2.0) is None
+    assert store.approve_deploy(SHA_F[:7], now=2.0, target="chain") == SHA_F
+    assert store.take_deploy_grant(now=3.0, target="fleet") is None
+    assert store.take_deploy_grant(now=3.0, target="chain") == SHA_F
