@@ -216,6 +216,7 @@ def test_deploy_fleet_reply_does_not_approve_a_harness_request(tmp_path):
     ("deploy harness abc1234", ("deploy", "harness:abc1234")),
     ("deploy abc1234", ("deploy", "harness:abc1234")),
     ("Deploy FLEET ABC1234", ("deploy", "fleet:abc1234")),
+    ("deploy chain abc1234", ("deploy", "chain:abc1234")),
 ])
 def test_deploy_reply_parses_the_named_target(text, expected):
     assert parse_command(msg(text), OWNER) == expected
@@ -420,3 +421,25 @@ def test_auto_request_wrong_prefix_is_refused(store):
     r = FakeRunner()
     assert handle(store, "deploy", "harness:abcdef0", 10.0, runner=r).startswith("No pending harness deploy")
     assert r.started == [] and store.pending_deploy_origin(10.0) == "auto"
+
+
+def test_deploy_chain_parsed():
+    assert parse_command(msg("deploy chain 91a2e06"), OWNER) == ("deploy", "chain:91a2e06")
+
+
+def test_deploy_chain_reply_names_deploy_chain(tmp_path):
+    from hermes_broker.approvals import handle
+    from hermes_broker.grants import GrantStore
+    store = GrantStore(tmp_path / "g.json")
+    sha = "91a2e066c76837d9ac80243755ebc628993a0454"
+    store.create_deploy_request(sha, now=1000.0, target="chain")
+    titles = []
+
+    class P:
+        def __call__(self, title):
+            titles.append(title)
+            return "ok"
+    assert handle(store, "deploy", "chain:91a2e06", now=1002.0) == f"Deploy of chain {sha} to tig-server approved for 10 min."
+    store.create_deploy_request(sha, now=1100.0, target="chain")
+    handle(store, "deploy", "chain:91a2e06", now=1102.0, prod=P())
+    assert titles and "deploy_chain" in titles[0] and "deploy_fleet" not in titles[0]

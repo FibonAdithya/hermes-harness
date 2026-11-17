@@ -198,21 +198,22 @@ _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 def request_deploy(sha: str, target: str = "harness") -> str:
     """Ask the owner to approve deploying one commit to the box.
 
-    target is "harness" (hermes-harness master) or "fleet" (fleet main). sha is the
-    full 40-character commit id. The owner approves by typing that commit's prefix
-    in the approvals chat -- `deploy fleet <prefix>` for a fleet deploy, since a bare
-    `deploy <prefix>` is read as harness and never approves a fleet request. The
-    approval covers that commit and target only, for one deploy_harness() or
-    deploy_fleet() call within 10 minutes.
+    target is "harness" (hermes-harness master), "fleet" (fleet main) or "chain"
+    (chain main). sha is the full 40-character commit id. The owner approves by
+    typing that commit's prefix in the approvals chat -- `deploy fleet <prefix>` for
+    a fleet deploy, `deploy chain <prefix>` for a chain deploy, since a bare
+    `deploy <prefix>` is read as harness and never approves another target's
+    request. The approval covers that commit and target only, for one
+    deploy_harness(), deploy_fleet() or deploy_chain() call within 10 minutes.
     """
-    if target not in ("harness", "fleet"):
-        return "target must be harness or fleet"
+    if target not in ("harness", "fleet", "chain"):
+        return "target must be harness, fleet or chain"
     sha = sha.strip().lower()
     if not _SHA_RE.fullmatch(sha):
         return "sha must be the full 40-character commit id"
     _store().create_deploy_request(sha, now=time.time(), target=target)
-    what = "hermes-harness" if target == "harness" else "fleet"
-    reply_as = f"deploy {sha[:12]}" if target == "harness" else f"deploy fleet {sha[:12]}"
+    what = "hermes-harness" if target == "harness" else target
+    reply_as = f"deploy {sha[:12]}" if target == "harness" else f"deploy {target} {sha[:12]}"
     return (
         f"Requested a deploy of {what} {sha} to tig-server.\n"
         f"Ask the owner to read that commit and reply `{reply_as}` "
@@ -249,6 +250,20 @@ def deploy_fleet() -> str:
         raise Locked('LOCKED: no approved fleet deploy. Call request_deploy(sha, "fleet") first.')
     r = box.call(_target("tig-server"), "deploy", {"sha": sha, "target": "fleet"}, timeout=1800)
     return r.get("error") or f"tig-server: fleet deployed {sha[:12]}."
+
+
+@mcp.tool()
+def deploy_chain() -> str:
+    """Deploy the owner-approved chain main commit to the box. Needs request_deploy(sha, "chain") first.
+
+    The box runs make setup and make check on the new commit, stays on the previous
+    one if either fails, and restarts chaind once the commit is installed.
+    """
+    sha = _store().take_deploy_grant(now=time.time(), target="chain")
+    if sha is None:
+        raise Locked('LOCKED: no approved chain deploy. Call request_deploy(sha, "chain") first.')
+    r = box.call(_target("tig-server"), "deploy", {"sha": sha, "target": "chain"}, timeout=1800)
+    return r.get("error") or f"tig-server: chain deployed {sha[:12]}."
 
 
 @mcp.tool()

@@ -116,3 +116,48 @@ def test_deploy_fleet_does_not_consume_a_live_harness_grant(fakes, store):
     out = server.deploy_harness()
     assert calls == [("box", "tig-server", "deploy", {"sha": SHA}, 900)]
     assert out.startswith(f"tig-server: deployed {SHA[:12]}")
+
+
+def test_request_deploy_chain(fakes, store):
+    import time
+    server, _, _ = fakes
+    out = server.request_deploy(SHA, target="chain")
+    assert f"`deploy chain {SHA[:12]}`" in out and "chain" in out
+    assert store.approve_deploy(SHA[:12], now=time.time(), target="chain") == SHA
+
+
+def test_bare_deploy_never_approves_chain(fakes, store):
+    import time
+    server, _, _ = fakes
+    server.request_deploy(SHA, target="chain")
+    assert store.approve_deploy(SHA[:12], now=time.time()) is None
+    assert store.approve_deploy(SHA[:12], now=time.time(), target="fleet") is None
+    assert store.approve_deploy(SHA[:12], now=time.time(), target="chain") == SHA
+
+
+def test_deploy_chain_deploys_the_approved_commit(fakes, store):
+    import time
+    server, calls, _ = fakes
+    store.create_deploy_request(SHA, now=time.time(), target="chain")
+    store.approve_deploy(SHA[:7], now=time.time(), target="chain")
+    with pytest.raises(Locked):
+        server.deploy_harness()
+    with pytest.raises(Locked):
+        server.deploy_fleet()
+    out = server.deploy_chain()
+    assert calls == [("box", "tig-server", "deploy", {"sha": SHA, "target": "chain"}, 1800)]
+    assert out.startswith(f"tig-server: chain deployed {SHA[:12]}")
+
+
+def test_deploy_chain_needs_grant(fakes, store):
+    import time
+    server, calls, _ = fakes
+    with pytest.raises(Locked):
+        server.deploy_chain()
+    store.create_deploy_request(SHA, now=time.time(), target="fleet")
+    store.approve_deploy(SHA[:7], now=time.time(), target="fleet")
+    with pytest.raises(Locked):
+        server.deploy_chain()
+    assert calls == []
+    assert store.deploy_target() == "fleet"  # not consumed
+    assert store.take_deploy_grant(now=time.time(), target="fleet") == SHA

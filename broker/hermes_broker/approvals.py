@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 _APPROVE = re.compile(r"^approve\s+(\d{4})$", re.IGNORECASE)
 _REVOKE = re.compile(r"^revoke$", re.IGNORECASE)
-_DEPLOY = re.compile(r"^deploy\s+(?:(harness|fleet)\s+)?([0-9a-f]{7,40})$", re.IGNORECASE)
+_DEPLOY = re.compile(r"^deploy\s+(?:(harness|fleet|chain)\s+)?([0-9a-f]{7,40})$", re.IGNORECASE)
 _TASK = re.compile(r"^(task|solo|drop)\s+(\d{4})$", re.IGNORECASE)
 _TOOL = re.compile(r"^tool\s+(\d{4})$", re.IGNORECASE)
 _ANSWER = re.compile(r"^answer\s+(\d{4})\s+(.+)$", re.IGNORECASE | re.DOTALL)
@@ -143,7 +143,7 @@ def handle(store: GrantStore, verb: str, arg: str, now: float, prod: Prod | None
         # sha was granted for `target`: approve_deploy only grants on a target match,
         # so there is no need to re-read the grant to learn its target.
         what = sha if target == "harness" else f"{target} {sha}"
-        tool = "deploy_harness" if target == "harness" else "deploy_fleet"
+        tool = {"harness": "deploy_harness", "fleet": "deploy_fleet", "chain": "deploy_chain"}[target]
         told = _tell_hermes(prod, f"Owner approved deploying {target} {sha[:12]}. Call {tool} now.")
         return f"Deploy of {what} to tig-server approved for {DEPLOY_GRANT_MINUTES} min.{told}"
     reason = store.pending_reason(arg)

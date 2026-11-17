@@ -22,4 +22,5 @@ def stamp(name: str):
 
 
 boxlib.read_json_stdin(sys.stdin.buffer)
-print(json.dumps({"harness": stamp("harness-deployed.sha"), "fleet": stamp("fleet-deployed.sha")}))
+print(json.dumps({"harness": stamp("harness-deployed.sha"), "fleet": stamp("fleet-deployed.sha"),
+                  "chain": stamp("chain-deployed.sha")}))
