@@ -546,3 +546,68 @@ def test_fleet_escalations_raises_when_uv_is_missing(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
     with pytest.raises(TaskError, match="cannot run uv"):
         tasklib.fleet_escalations(tmp_path / "home", {4: ["a"]})
+
+
+def _uv_running_snippet(tmp_path, monkeypatch, latest_src):
+    """A uv stand-in that runs the real -c snippet against a stand-in fleet.escalation."""
+    pkg = tmp_path / "fakefleet" / "fleet"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("")
+    (pkg / "escalation.py").write_text(latest_src)
+    _fake_uv(tmp_path, monkeypatch,
+             "import os, subprocess, sys\n"
+             "code = sys.argv[sys.argv.index('-c') + 1]\n"
+             f"env = dict(os.environ, PYTHONPATH={str(tmp_path / 'fakefleet')!r})\n"
+             "p = subprocess.run([sys.executable, '-P', '-c', code], stdin=sys.stdin, env=env)\n"
+             "sys.exit(p.returncode)\n")
+
+
+def test_fleet_escalations_marks_the_one_issue_latest_cannot_parse(tmp_path, monkeypatch):
+    _uv_running_snippet(tmp_path, monkeypatch,
+                        "def latest(bodies):\n"
+                        "    if any('BOOM' in b for b in bodies):\n"
+                        "        raise ValueError('cannot parse comment')\n"
+                        "    return {'index': len(bodies) - 1, 'reason': 'r', 'text': bodies[-1]} if bodies else None\n")
+    out = tasklib.fleet_escalations(tmp_path / "home", {1: ["Which port?"], 2: ["BOOM"], 3: []})
+    assert out == {1: {"index": 0, "reason": "r", "text": "Which port?"},
+                   2: {"error": "ValueError: cannot parse comment"}, 3: None}
+
+
+def test_fleet_escalations_rejects_a_malformed_error_marker(tmp_path, monkeypatch):
+    _fake_uv(tmp_path, monkeypatch, "import sys; sys.stdin.read()\nprint('{\"4\": {\"error\": 5}}')\n")
+    with pytest.raises(TaskError, match="malformed"):
+        tasklib.fleet_escalations(tmp_path / "home", {4: ["a"]})
+
+
+def test_fleet_escalations_times_out(tmp_path, monkeypatch):
+    _fake_uv(tmp_path, monkeypatch, "import time; time.sleep(10)\n")
+    with pytest.raises(TaskError, match="timed out"):
+        tasklib.fleet_escalations(tmp_path / "home", {4: ["a"]}, timeout=0.5)
+
+
+def test_one_unreadable_issue_does_not_refuse_the_others(tmp_path):
+    gh = FakeGh()
+    good = _human_issue(gh, comments=("Which port?",))
+    bad = _human_issue(gh, title="Poison", comments=("BOOM",))
+    esc = stub({good: dict(ESC), bad: {"error": "ValueError: cannot parse comment"}})
+    rows = {r["number"]: r for r in tasklib.human(gh, SLUG, tmp_path, escalations=esc)}
+    assert rows[good]["escalation"] == ESC and rows[good]["note"] is None
+    assert rows[good]["hash"] == tasklib.issue_hash("Pick a port", f"{ESC['index']}\n{ESC['text']}")
+    assert rows[bad]["escalation"] is None
+    assert rows[bad]["note"] == "escalation text unavailable: ValueError: cannot parse comment"
+    digest = hashlib.sha256(json.dumps(["BOOM"]).encode("utf-8")).hexdigest()
+    assert rows[bad]["hash"] == tasklib.issue_hash("Poison", f"-1\n{digest}")
+    # answer() views one issue and recomputes its hash; both must be accepted.
+    out = tasklib.answer(gh, SLUG, good, rows[good]["hash"], "8080", tmp_path, 1.0, escalations=esc)
+    assert out["answers"] == 1
+    out = tasklib.answer(gh, SLUG, bad, rows[bad]["hash"], "skip it", tmp_path, 2.0, escalations=esc)
+    assert out["answers"] == 1
+
+
+def test_whole_call_failure_notes_every_row(tmp_path):
+    gh = FakeGh()
+    a = _human_issue(gh)
+    b = _human_issue(gh, title="Other")
+    rows = tasklib.human(gh, SLUG, tmp_path, escalations=broken)
+    assert [r["number"] for r in rows] == [a, b]
+    assert all(r["escalation"] is None and "cannot run uv" in r["note"] for r in rows)

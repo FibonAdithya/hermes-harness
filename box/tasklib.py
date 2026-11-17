@@ -200,22 +200,49 @@ def comment(gh: Gh, repo_slug: str, number: int, body: str) -> None:
 
 # --- fleet:human: the owner answers or takes an escalated issue -------------------------
 
-def fleet_escalations(home: Path, comments: dict[int, list[str]]) -> dict[int, dict | None]:
+# The -c snippet fleet_escalations runs. latest() raising on one issue's comments gives
+# that issue an {"error": ...} marker instead of failing every issue in the call.
+_ESCALATIONS_CODE = """\
+import json, sys
+from fleet.escalation import latest
+def one(v):
+    try:
+        return latest(v)
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"[:300]}
+d = json.load(sys.stdin)
+print(json.dumps({k: one(v) for k, v in d.items()}))
+"""
+
+
+def _valid_escalation(e) -> bool:
+    if e is None:
+        return True
+    if not isinstance(e, dict):
+        return False
+    if "error" in e:
+        return set(e) == {"error"} and isinstance(e["error"], str)
+    return type(e.get("index")) is int and isinstance(e.get("reason"), str) and isinstance(e.get("text"), str)
+
+
+def fleet_escalations(home: Path, comments: dict[int, list[str]], timeout: float = 60) -> dict[int, dict | None]:
     """Each issue's newest escalation, read by fleet's own parser (fleet.escalation.latest).
 
     One process for every issue; the comment bodies go on stdin as JSON. --no-sync: this
     is reached from the owner's Telegram reply, and must not sync (rewrite) the deployed
     fleet checkout's environment; deploy_fleet owns that. -P: the cwd must not shadow
-    fleet's imports. Every failure raises TaskError, so a caller never mistakes a broken
-    fleet checkout for an issue with no escalation."""
-    code = ("import json, sys; from fleet.escalation import latest; "
-            "d = json.load(sys.stdin); print(json.dumps({k: latest(v) for k, v in d.items()}))")
+    fleet's imports. An issue whose comments make latest() raise gets {"error": "..."};
+    the other issues keep their escalations. A failure of the whole call (uv missing,
+    non-zero exit, a timeout, output that is not the expected JSON) raises TaskError, so
+    a caller never mistakes a broken fleet checkout for an issue with no escalation."""
     want = {int(n): [str(b) for b in v] for n, v in comments.items()}
     try:
         p = subprocess.run(["uv", "run", "--no-sync", "--project", str(Path(home) / "TIG" / "fleet"),
-                            "python", "-P", "-c", code],
+                            "python", "-P", "-c", _ESCALATIONS_CODE],
                            input=json.dumps({str(n): v for n, v in want.items()}),
-                           capture_output=True, text=True, check=False)
+                           capture_output=True, text=True, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise TaskError(f"reading escalations timed out after {timeout} s") from exc
     except OSError as exc:
         raise TaskError(f"cannot run uv: {exc}") from exc
     if p.returncode != 0:
@@ -228,10 +255,8 @@ def fleet_escalations(home: Path, comments: dict[int, list[str]]) -> dict[int, d
     for n in want:
         if n not in out:
             raise TaskError(f"fleet.escalation.latest gave nothing for #{n}")
-        e = out[n]
-        if e is not None and not (isinstance(e, dict) and type(e.get("index")) is int
-                                  and isinstance(e.get("reason"), str) and isinstance(e.get("text"), str)):
-            raise TaskError(f"fleet.escalation.latest gave a malformed escalation for #{n}: {e!r}"[:300])
+        if not _valid_escalation(out[n]):
+            raise TaskError(f"fleet.escalation.latest gave a malformed escalation for #{n}: {out[n]!r}"[:300])
     return {n: out[n] for n in want}
 
 
@@ -247,20 +272,25 @@ def _human_rows(issues: list[dict], home: Path, escalations) -> list[dict]:
 
     The hash binds the title and the escalation the owner read (its index and text), so
     a newer escalation or a reworded one changes it. An issue with no escalation comment
-    gets index -1 and text "". When fleet's helper fails, every issue is still listed,
-    with a note, index -1, and as text a digest of all its comment bodies: the hash then
-    still changes when a newer escalation is posted while the helper stays broken."""
+    gets index -1 and text "". When fleet's helper fails, for the whole call or for one
+    issue (an {"error": ...} entry), that issue is still listed, with a note, index -1,
+    and as text a digest of all its comment bodies: the hash then still changes when a
+    newer escalation is posted while the helper stays broken. The note and digest are
+    per issue, so one unreadable issue does not change the hash of the others."""
     if not issues:
         return []
     comments = {int(r["number"]): [c.get("body", "") for c in r.get("comments") or []] for r in issues}
-    note = None
+    whole_note = None
     try:
         found = escalations(home, comments)
     except TaskError as exc:
-        found, note = {}, f"escalation text unavailable: {str(exc)[:200]}"
+        found, whole_note = {}, f"escalation text unavailable: {str(exc)[:200]}"
     rows = []
     for r in issues:
         e = found.get(int(r["number"]))
+        note = whole_note
+        if isinstance(e, dict) and "error" in e:
+            e, note = None, f"escalation text unavailable: {str(e['error'])[:200]}"
         esc = {"index": e["index"], "reason": e["reason"], "text": e["text"]} if e else None
         if esc:
             index, text = esc["index"], esc["text"]

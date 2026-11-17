@@ -249,6 +249,21 @@ def test_list_human_lists_issue_when_uv_fails(tmp_path):
     assert row["escalation"] is None and "escalation text unavailable" in row["note"]
 
 
+def test_list_human_one_unreadable_issue_keeps_the_others(tmp_path):
+    home, shims = home_with_repo(tmp_path)
+    _add_human_issue(home, number=1)
+    _add_human_issue(home, number=2, esc={"error": "ValueError: cannot parse comment"})
+    rc, out = run("list_human", home, shims, {})
+    assert rc == 0
+    rows = {r["number"]: r for r in out["issues"]}
+    assert rows[1]["escalation"] == ESC and rows[1]["note"] is None
+    assert rows[2]["escalation"] is None
+    assert rows[2]["note"] == "escalation text unavailable: ValueError: cannot parse comment"
+    rc, out = run("answer_human", home, shims,
+                  {"repo": "fleet-fixture", "number": 1, "hash": rows[1]["hash"], "text": "use 8080"})
+    assert rc == 0 and out["answers"] == 1
+
+
 def test_answer_human_verb(tmp_path):
     home, shims = home_with_repo(tmp_path)
     _add_human_issue(home)
