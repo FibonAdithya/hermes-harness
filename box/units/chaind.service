@@ -1,0 +1,14 @@
+[Unit]
+Description=chaind, the chain daemon that fleet's build/bug route submits to
+
+[Service]
+Type=simple
+WorkingDirectory=%h/chain
+Environment=PATH=%h/.npm-global/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/chain/.venv/bin/chaind
+# Stage runs are child processes; a daemon restart must not kill them.
+KillMode=process
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

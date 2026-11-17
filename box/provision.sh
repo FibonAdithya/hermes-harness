@@ -67,11 +67,21 @@ log "claude and codex"
 run_as_adi 'command -v claude >/dev/null || npm install -g @anthropic-ai/claude-code >/dev/null'
 run_as_adi 'command -v codex  >/dev/null || npm install -g @openai/codex >/dev/null'
 
+log "chain"
+# Needs gh auth, which is an interactive step after this script; skip until then.
+if run_as_adi 'gh auth status >/dev/null 2>&1'; then
+  run_as_adi '[ -d ~/chain ] || gh repo clone FibonAdithya/chain ~/chain'
+  run_as_adi 'make -C ~/chain setup'
+else
+  echo "chain step skipped: gh is not logged in; after gh auth login, re-run provision.sh"
+fi
+
 log "done"
 cat <<'EOF'
 Provisioning complete. Interactive steps still needed, each over `ssh -t tig-adi`:
   claude          # then /login
   codex login
   gh auth login
+  re-run provision.sh   # for the chain checkout (needs gh login)
 Then copy the Claude guards:  scp -r ~/.claude/{CLAUDE.md,settings.json,hooks} tig-adi:~/.claude/
 EOF
