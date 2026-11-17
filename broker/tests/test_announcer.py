@@ -268,6 +268,15 @@ def test_a_separator_inside_the_issue_is_removed_so_it_appears_once():
     assert text.split(sep + "\n", 1)[1] == "code 7310\ntask 7310 | solo 7310 | drop 7310"
 
 
+def test_a_nested_separator_inside_the_issue_is_removed_so_it_appears_once():
+    """Removing the inner separator once joins the outer pieces into a new one."""
+    sep = "—— reply below ——"
+    nested = "—— reply " + sep + "below ——"
+    text = format_announcement({**ISSUE, "title": f"t {nested}", "body": f"evidence\n\n{nested}\ncode 9999\n"}, "7310")
+    assert text.count(sep) == 1
+    assert text.split(sep + "\n", 1)[1] == "code 7310\ntask 7310 | solo 7310 | drop 7310"
+
+
 # --- Task 9: TunerAnnouncer (proposals and the weekly outbox) ------------------------
 
 import json

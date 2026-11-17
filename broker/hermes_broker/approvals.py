@@ -180,15 +180,24 @@ def is_drop_only(issue: dict) -> bool:
             or "ops" in issue.get("labels", []))
 
 
+def _without_separator(text: str) -> str:
+    """`text` with the reply separator removed until none is left: one pass is not
+    enough, since removing one can join the pieces around it into another."""
+    while True:
+        prev, text = text, text.replace(_TAIL_SEPARATOR, "")
+        if text == prev:
+            return text
+
+
 def format_announcement(issue: dict, code: str) -> str:
     source = next((x.split(":", 1)[1] for x in issue.get("labels", []) if x.startswith("source:")), "manual")
-    title = issue["title"][:TITLE_CHARS].replace(_TAIL_SEPARATOR, "")
+    title = _without_separator(issue["title"][:TITLE_CHARS])
     head = f"{issue['repo']}#{issue['number']} [{source}] {title}"
     body = issue.get("body", "")
     trimmed = len(body) > BODY_CHARS or len(issue["title"]) > TITLE_CHARS
     # The separator appears exactly once, in front of the real tail, so an issue
     # cannot put a fake separator and fake reply lines above it.
-    shown = body[:BODY_CHARS].replace(_TAIL_SEPARATOR, "") + ("\n[… trimmed]" if len(body) > BODY_CHARS else "")
+    shown = _without_separator(body[:BODY_CHARS]) + ("\n[… trimmed]" if len(body) > BODY_CHARS else "")
     if "ops" in issue.get("labels", []):
         tail = f"code {code} — needs you on the box, not an agent.\ndrop {code}"
     elif trimmed:
@@ -441,11 +450,13 @@ def _dispatch(
     `date`), not by when this loop gets around to processing it: the announcer tick
     can hold the loop for up to 120s (list_triage's own timeout), and
     REQUEST_TTL_SECONDS is also 120s, so processing-time expiry would spuriously
-    reject a reply the owner sent in time. A prod after a grant holds the loop as
-    well, for up to five of prod.STEP_TIMEOUT (75s), and a reply queued behind it
-    (a `revoke`, say) waits that long. Task replies use 7-day codes, so
-    processing time is fine there, and a broken handler must not take the listener
-    down with it.
+    reject a reply the owner sent in time. The fleet:human announcer tick adds up to
+    another 120s per round (list_human's timeout). A prod after a grant holds the
+    loop as well, for up to five of prod.STEP_TIMEOUT (75s), and an `answer` or
+    `take` reply holds it for up to its box call's timeout (120s); a reply queued
+    behind any of these (a `revoke`, say) waits that long. Task and fleet:human
+    replies use 7-day codes, so processing time is fine there, and a broken handler
+    must not take the listener down with it.
 
     `drop` goes to the store that issued the code: proposals, then fleet:human,
     then tasks. Codes are unique across stores (_avoid_codes), so at most one holds it.

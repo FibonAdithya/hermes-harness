@@ -182,7 +182,7 @@ def test_human_announcement_says_when_there_is_no_escalation_comment():
 
 def test_long_escalation_is_trimmed_with_a_marker():
     out = format_human({**ISSUE, "escalation": {**ESC, "text": "x" * 5000}}, "1234")
-    assert "x" * 3500 in out and "x" * 3501 not in out and "[… trimmed]" in out
+    assert "x" * 3500 in out and "x" * 3501 not in out and "\n[… trimmed; read it on GitHub]" in out
 
 
 def test_worst_case_human_announcement_fits_telegram():
@@ -286,6 +286,15 @@ def test_drop_routes_to_human_store(st):
     assert st["humans"].live_codes(2.0) == set()
 
 
+def test_drop_box_error_says_the_issue_comes_back(st):
+    code = _announce(st)
+    box = Box({"close_task": {"error": "gh: simulated failure"}})
+    out = _dispatch(msg(f"drop {code}"), OWNER, st["grants"], st["tasks"], box, (), now_fn=lambda: 2.0,
+                    proposals=st["props"], state_dir=st["dir"], humans=st["humans"])
+    assert out == ("fleet#42: gh: simulated failure\nThis code is spent; if the issue still waits on you "
+                   "it will be announced again with a new code.")
+
+
 def test_drop_still_reaches_tasks_when_code_is_not_human(st):
     _announce(st)
     tcode = st["tasks"].announce("fleet", "FibonAdithya/fleet", 7, H, now=1.0,
@@ -347,7 +356,6 @@ def test_human_reply_exception_is_caught_and_reported(st):
 def test_codes_unique_across_stores(st, monkeypatch):
     """(a) the human store avoids grants, tasks and proposals; (b) triage tasks and the
     tuner's proposals avoid the human store."""
-    import hermes_broker.proposals as pmod
     import hermes_broker.tasks as tmod
     g = st["grants"].create_request("tig-server", 30, "r", now=1.0)
     t = st["tasks"].announce("fleet", "FibonAdithya/fleet", 1, H, now=1.0, avoid={g})

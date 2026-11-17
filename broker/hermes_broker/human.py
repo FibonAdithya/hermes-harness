@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 from typing import Callable
 
-from .approvals import _TAIL_SEPARATOR, BODY_CHARS, TITLE_CHARS, Call, _avoid_codes
+from .approvals import _TAIL_SEPARATOR, BODY_CHARS, TITLE_CHARS, Call, _avoid_codes, _without_separator
 from .grants import GrantStore
 from .proposals import ProposalStore
 from .tasks import TaskStore
@@ -28,15 +28,6 @@ logger = logging.getLogger(__name__)
 ANSWER_CHARS = 2000
 NO_ESCALATION = "(no escalation comment on the issue; read it on GitHub)"
 HUMAN_VERBS = ("answer", "take")
-
-
-def _without_separator(text: str) -> str:
-    """`text` with the reply separator removed until none is left: one pass is not
-    enough, since removing one can join the pieces around it into another."""
-    while True:
-        prev, text = text, text.replace(_TAIL_SEPARATOR, "")
-        if text == prev:
-            return text
 
 
 def format_human(issue: dict, code: str) -> str:
@@ -51,7 +42,8 @@ def format_human(issue: dict, code: str) -> str:
         text = issue["note"]
     else:
         text = NO_ESCALATION
-    shown = _without_separator(text[:BODY_CHARS]) + ("\n[… trimmed]" if len(text) > BODY_CHARS else "")
+    trim = "\n[… trimmed; read it on GitHub]" if len(text) > BODY_CHARS else ""
+    shown = _without_separator(text[:BODY_CHARS]) + trim
     tail = f"code {code}\nanswer {code} <your text> | drop {code} | take {code}"
     return f"{head}\n\n{shown}\n\n{_TAIL_SEPARATOR}\n{tail}"
 
@@ -83,7 +75,7 @@ def handle_human(humans: TaskStore, verb: str, arg: str, now: float, call: Call)
         return f"{ref} is yours: assigned to {r.get('assignee', 'the box login')}; it will not be announced again."
     if verb == "drop":
         r = call("close_task", {"repo": entry["repo"], "number": entry["number"]}, 60)
-        return f"{ref}: {r['error']}" if "error" in r else f"Dropped {ref}."
+        return f"{ref}: {r['error']}\n{again}" if "error" in r else f"Dropped {ref}."
     return f"{ref}: unknown reply {verb!r}. {again}"
 
 
