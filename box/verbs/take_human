@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+"""The owner's `take` reply: assign the box's gh login so the issue is no longer listed. Called only by the broker's approvals listener."""
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import boxlib  # noqa: E402
+import tasklib  # noqa: E402
+
+a = boxlib.read_json_stdin(sys.stdin.buffer) or {}
+home = Path(os.environ.get("HOME", "/home/adi"))
+try:
+    repo = tasklib.repo_dir(home, a.get("repo", ""))
+    slug = tasklib.slug(repo)
+    out = tasklib.take(tasklib.real_gh, slug, int(a.get("number", 0)), str(a.get("hash", "")), home=home)
+except (ValueError, TypeError) as exc:
+    sys.exit(boxlib.refuse(str(exc)))
+print(json.dumps({"repo": repo.name, "slug": slug, **out}))

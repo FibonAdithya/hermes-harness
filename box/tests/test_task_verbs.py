@@ -19,7 +19,20 @@ rc, out, err = gh(sys.argv[1:], stdin)
 json.dump({"labels": sorted(gh.labels), "issues": gh.issues}, open(state, "w"))
 sys.stdout.write(out); sys.stderr.write(err); sys.exit(rc)
 '''
-UV_SHIM = '#!/bin/sh\necho \'["daemon", "docs"]\'\n'
+UV_SHIM = r'''#!/usr/bin/env python3
+import json, os, sys
+if "escalation" not in " ".join(sys.argv[1:]):
+    print('["daemon", "docs"]')
+    sys.exit(0)
+home = os.environ["HOME"]
+if os.path.exists(home + "/escalations.fail"):
+    sys.stderr.write("fleet checkout broken")
+    sys.exit(1)
+wanted = json.load(sys.stdin)
+f = home + "/escalations.json"
+scripted = json.load(open(f)) if os.path.exists(f) else {}
+print(json.dumps({k: scripted.get(k) for k in wanted}))
+'''
 
 
 SYSTEMD_RUN_SHIM = '#!/bin/sh\nprintf "%s\\n" "$*" >> "$HOME/systemd-run.log"\n'
@@ -166,3 +179,113 @@ def test_run_fleet_starts_a_night_only_where_fleet_can_run(tmp_path):
     rc, out = run("run_fleet", home, shims, {"repo": "fleet-fixture", "hours": 1})
     assert rc == 0 and out["id"].startswith("fleet-")
     assert f"--unit=night-{out['id']}" in (home / "systemd-run.log").read_text()
+
+
+# --- fleet:human verbs ------------------------------------------------------------------
+
+ESC = {"index": 2, "reason": "needs a decision", "text": "Which port should the daemon use?"}
+
+
+def _add_human_issue(home, number=1, labels=("fleet:human", "area:docs"), esc=ESC, title="Pick a port"):
+    """Puts a fleet:human issue in the gh shim's state and scripts its escalation."""
+    f = home / "gh.json"
+    st = json.load(open(f)) if f.exists() else {"labels": [], "issues": {}}
+    st["labels"] = sorted(set(st["labels"]) | {"fleet:human", "fleet:solo", "area:docs"} | {x for x in labels})
+    st["issues"][str(number)] = {"number": number, "title": title, "body": "b", "state": "OPEN",
+                                 "labels": [{"name": x} for x in labels],
+                                 "comments": [{"body": "escalation comment"}], "assignees": []}
+    json.dump(st, open(f, "w"))
+    if esc is not None:
+        e = home / "escalations.json"
+        cur = json.load(open(e)) if e.exists() else {}
+        cur[str(number)] = esc
+        json.dump(cur, open(e, "w"))
+
+
+def _issue(home, number):
+    return json.load(open(home / "gh.json"))["issues"][str(number)]
+
+
+def test_human_verbs_are_executable():
+    for v in ("list_human", "answer_human", "take_human"):
+        p = BOX / "verbs" / v
+        assert os.access(p, os.X_OK), v
+        assert p.read_text().startswith("#!/usr/bin/env python3")
+
+
+def test_list_human_verb_shape(tmp_path):
+    home, shims = home_with_repo(tmp_path)
+    _add_human_issue(home)
+    rc, out = run("list_human", home, shims, {})
+    assert rc == 0 and out["repos_ok"] == ["fleet-fixture"] and out["errors"] == []
+    [row] = out["issues"]
+    assert set(row) == {"repo", "slug", "number", "title", "labels", "escalation", "note", "hash"}
+    assert row["repo"] == "fleet-fixture" and row["slug"] == "FibonAdithya/fleet-fixture"
+    assert row["escalation"] == ESC and row["note"] is None and row["number"] == 1
+
+
+def test_list_human_reports_repo_errors(tmp_path):
+    home, shims = home_with_repo(tmp_path)
+    bad = home / "TIG" / "broken"
+    bad.mkdir()
+    (bad / "fleet.toml").write_text("[repo]\n")  # no slug
+    _add_human_issue(home)
+    rc, out = run("list_human", home, shims, {})
+    assert rc == 0 and out["repos_ok"] == ["fleet-fixture"] and len(out["issues"]) == 1
+    assert len(out["errors"]) == 1 and out["errors"][0].startswith("broken:")
+
+
+def test_list_human_lists_issue_when_uv_fails(tmp_path):
+    home, shims = home_with_repo(tmp_path)
+    _add_human_issue(home)
+    (home / "escalations.fail").write_text("")
+    rc, out = run("list_human", home, shims, {})
+    assert rc == 0
+    [row] = out["issues"]
+    assert row["escalation"] is None and "escalation text unavailable" in row["note"]
+
+
+def test_answer_human_verb(tmp_path):
+    home, shims = home_with_repo(tmp_path)
+    _add_human_issue(home)
+    [row] = run("list_human", home, shims, {})[1]["issues"]
+    rc, out = run("answer_human", home, shims,
+                  {"repo": "fleet-fixture", "number": 1, "hash": row["hash"], "text": "  use 8080  "})
+    assert rc == 0 and out == {"repo": "fleet-fixture", "slug": "FibonAdithya/fleet-fixture", "number": 1, "answers": 1}
+    f = home / ".local/state/fleet/answers/FibonAdithya__fleet-fixture/1.json"
+    [entry] = json.load(open(f))
+    assert entry["text"] == "use 8080" and isinstance(entry["at"], float) and entry["at"] > 0
+    assert oct(f.stat().st_mode & 0o777) == "0o600"
+    assert _labels(home, 1) == {"fleet:answered-1", "fleet:ready", "area:docs"}
+    assert any("use 8080" in c["body"] for c in _issue(home, 1)["comments"])
+
+
+def test_answer_human_refuses_stale_hash(tmp_path):
+    home, shims = home_with_repo(tmp_path)
+    _add_human_issue(home)
+    rc, out = run("answer_human", home, shims, {"repo": "fleet-fixture", "number": 1, "hash": "0" * 64, "text": "x"})
+    assert rc == 2 and "error" in out
+    assert not (home / ".local/state/fleet/answers").exists()
+    assert "fleet:human" in _labels(home, 1)
+
+
+def test_answer_human_refuses_bad_number(tmp_path):
+    home, shims = home_with_repo(tmp_path)
+    _add_human_issue(home)
+    rc, out = run("answer_human", home, shims, {"repo": "fleet-fixture", "number": "abc", "hash": "0" * 64, "text": "x"})
+    assert rc == 2 and "error" in out
+    rc, out = run("answer_human", home, shims, {"repo": "fleet-fixture", "number": 0, "hash": "0" * 64, "text": "x"})
+    assert rc == 2 and "error" in out
+    assert not (home / ".local/state/fleet/answers").exists()
+
+
+def test_take_human_verb(tmp_path):
+    home, shims = home_with_repo(tmp_path)
+    _add_human_issue(home)
+    [row] = run("list_human", home, shims, {})[1]["issues"]
+    rc, out = run("take_human", home, shims, {"repo": "fleet-fixture", "number": 1, "hash": row["hash"]})
+    assert rc == 0 and out == {"repo": "fleet-fixture", "slug": "FibonAdithya/fleet-fixture",
+                               "number": 1, "title": "Pick a port", "assignee": "fibon-box"}
+    assert [a["login"] for a in _issue(home, 1)["assignees"]] == ["fibon-box"]
+    assert "fleet:human" in _labels(home, 1)
+    assert run("list_human", home, shims, {})[1]["issues"] == []
