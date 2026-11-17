@@ -85,8 +85,30 @@ def test_chain_example_budgets_fit_ceiling():
     cfg = tomllib.loads(CHAIN_CFG.read_text())
     names = ["confirm", "plan", "audit", "implement", "pr", "review", "fix"]
     assert set(cfg["stages"]) == set(names)
-    b = {n: cfg["stages"][n]["budget_usd"] for n in names}
-    r = cfg["max_fix_rounds"]
-    worst = (b["confirm"] + b["plan"] + b["audit"] + b["implement"] + b["pr"]
-             + (r + 1) * b["review"] + r * b["fix"])
-    assert worst <= 40.0, worst
+    # chain counts review and fix spend across all their rounds against the one stage
+    # budget, so a run's ceiling is the plain sum of the seven budgets.
+    total = sum(cfg["stages"][n]["budget_usd"] for n in names)
+    assert total <= 40.0, total
+
+
+def test_install_survives_chaind_failing_to_start(tmp_path):
+    """A crash-looping chaind must not abort a harness install (set -e)."""
+    import os
+    import subprocess
+    home, fake = tmp_path / "home", tmp_path / "bin"
+    (home / "chain" / ".venv" / "bin").mkdir(parents=True)
+    (home / "chain" / ".venv" / "bin" / "chaind").write_text("#!/bin/sh\n")
+    (home / "chain" / ".venv" / "bin" / "chaind").chmod(0o755)
+    fake.mkdir()
+    log = tmp_path / "systemctl.log"
+    for name, body in (("systemctl", f'echo "$*" >> "{log}"\ncase "$*" in *chaind*) exit 1;; esac\n'),
+                       ("docker", "exit 0\n"), ("uv", "exit 0\n")):
+        (fake / name).write_text("#!/bin/sh\n" + body)
+        (fake / name).chmod(0o755)
+    env = {"HOME": str(home), "PATH": f"{fake}:{os.environ['PATH']}", "UV": str(fake / "uv")}
+    p = subprocess.run(["bash", str(REPO / "box" / "install.sh")], env=env, capture_output=True, text=True,
+                       timeout=60, check=False)
+    assert p.returncode == 0, p.stderr
+    assert "--user enable --now chaind.service" in log.read_text()
+    assert "chaind failed to start; see journalctl --user -u chaind" in p.stderr
+    assert "installed verbs:" in p.stdout

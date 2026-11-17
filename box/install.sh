@@ -15,7 +15,7 @@ mkdir -p "$HOME/.config/chain"
 systemctl --user daemon-reload
 # chaind is a service, not a timer: enable it once the chain checkout is set up.
 if [ -x "$HOME/chain/.venv/bin/chaind" ]; then
-  systemctl --user enable --now chaind.service
+  systemctl --user enable --now chaind.service || echo "chaind failed to start; see journalctl --user -u chaind" >&2
 else
   echo "chaind not set up: re-run provision.sh after gh auth login, or clone FibonAdithya/chain to ~/chain and run make setup there, then re-run install.sh"
 fi
