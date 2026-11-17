@@ -11,6 +11,10 @@ import json, os, sys
 sys.path.insert(0, os.environ["TESTS_DIR"])
 from fakegh import FakeGh
 state = os.environ["GH_STATE"]
+failing = os.path.join(os.environ["HOME"], "gh.fail")
+if os.path.exists(failing) and open(failing).read().strip() in sys.argv:
+    sys.stderr.write("gh: simulated failure")
+    sys.exit(1)
 gh = FakeGh()
 if os.path.exists(state):
     s = json.load(open(state)); gh.labels = set(s["labels"]); gh.issues = {int(k): v for k, v in s["issues"].items()}
@@ -269,14 +273,36 @@ def test_answer_human_refuses_stale_hash(tmp_path):
     assert "fleet:human" in _labels(home, 1)
 
 
-def test_answer_human_refuses_bad_number(tmp_path):
+BAD_NUMBERS = ['"abc"', "0", "-1", "1e999", "true", "1.5", "null"]
+
+
+def _run_raw(verb, home, shims, raw):
+    env = {"HOME": str(home), "PATH": f"{shims}:{os.environ['PATH']}",
+           "GH_STATE": str(home / "gh.json"), "TESTS_DIR": str(BOX / "tests")}
+    p = subprocess.run([str(BOX / "verbs" / verb)], input=raw.encode(), env=env, capture_output=True, check=False)
+    return p
+
+
+def test_human_verbs_refuse_bad_payloads(tmp_path):
     home, shims = home_with_repo(tmp_path)
     _add_human_issue(home)
-    rc, out = run("answer_human", home, shims, {"repo": "fleet-fixture", "number": "abc", "hash": "0" * 64, "text": "x"})
-    assert rc == 2 and "error" in out
-    rc, out = run("answer_human", home, shims, {"repo": "fleet-fixture", "number": 0, "hash": "0" * 64, "text": "x"})
-    assert rc == 2 and "error" in out
-    assert not (home / ".local/state/fleet/answers").exists()
+    before = (home / "gh.json").read_text()
+    h = '"' + run("list_human", home, shims, {})[1]["issues"][0]["hash"] + '"'  # valid, so only the number is wrong
+    cases = []
+    for n in BAD_NUMBERS:
+        cases.append(("answer_human", f'{{"repo": "fleet-fixture", "number": {n}, "hash": {h}, "text": "x"}}'))
+        cases.append(("take_human", f'{{"repo": "fleet-fixture", "number": {n}, "hash": {h}}}'))
+    cases += [("answer_human", f'{{"repo": "fleet-fixture", "number": 1, "hash": 5, "text": "x"}}'),
+              ("answer_human", f'{{"repo": "fleet-fixture", "number": 1, "hash": {h}, "text": 5}}'),
+              ("answer_human", f'{{"repo": "fleet-fixture", "number": 1, "hash": {h}}}'),
+              ("take_human", f'{{"repo": "fleet-fixture", "number": 1, "hash": 5}}'),
+              ("take_human", f'{{"repo": "fleet-fixture", "number": 1}}')]
+    for verb, raw in cases:
+        p = _run_raw(verb, home, shims, raw)
+        assert p.returncode == 2, (verb, raw, p.stderr[-200:])
+        assert "error" in json.loads(p.stdout), (verb, raw)
+        assert (home / "gh.json").read_text() == before, (verb, raw)
+        assert not (home / ".local/state/fleet/answers").exists(), (verb, raw)
 
 
 def test_take_human_verb(tmp_path):
@@ -289,3 +315,15 @@ def test_take_human_verb(tmp_path):
     assert [a["login"] for a in _issue(home, 1)["assignees"]] == ["fibon-box"]
     assert "fleet:human" in _labels(home, 1)
     assert run("list_human", home, shims, {})[1]["issues"] == []
+
+
+def test_list_human_reports_a_repo_whose_gh_calls_fail(tmp_path):
+    home, shims = home_with_repo(tmp_path)
+    _add_human_issue(home)
+    bad = home / "TIG" / "ghfails"
+    bad.mkdir()
+    (bad / "fleet.toml").write_text('[repo]\nslug = "FibonAdithya/ghfails"\n')
+    (home / "gh.fail").write_text("FibonAdithya/ghfails")
+    rc, out = run("list_human", home, shims, {})
+    assert rc == 0 and out["repos_ok"] == ["fleet-fixture"] and len(out["issues"]) == 1
+    assert len(out["errors"]) == 1 and out["errors"][0].startswith("ghfails:")

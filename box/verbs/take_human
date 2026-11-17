@@ -14,7 +14,12 @@ home = Path(os.environ.get("HOME", "/home/adi"))
 try:
     repo = tasklib.repo_dir(home, a.get("repo", ""))
     slug = tasklib.slug(repo)
-    out = tasklib.take(tasklib.real_gh, slug, int(a.get("number", 0)), str(a.get("hash", "")), home=home)
+    number, want_hash = a.get("number"), a.get("hash")
+    if type(number) is not int or number < 1:
+        sys.exit(boxlib.refuse("number must be a positive integer"))
+    if not isinstance(want_hash, str):
+        sys.exit(boxlib.refuse("hash must be a string"))
+    out = tasklib.take(tasklib.real_gh, slug, number, want_hash, home=home)
 except (ValueError, TypeError) as exc:
     sys.exit(boxlib.refuse(str(exc)))
 print(json.dumps({"repo": repo.name, "slug": slug, **out}))
