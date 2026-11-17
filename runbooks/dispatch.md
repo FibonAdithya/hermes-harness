@@ -370,7 +370,16 @@ ssh tig-adi 'systemctl --user stop night-<id>.service'                         #
 - chaind runs fleet's `build` and `bug` tasks on the box. chain stops at a clean review; fleet's integrator merges
   into `integration`. There is no Telegram and no intake on the box: fleet submits, chain does not poll.
 - Unit: `box/units/chaind.service`, installed by `box/install.sh`. It runs `~/chain/.venv/bin/chaind` with
-  `KillMode=process` and `Restart=on-failure`, so a restart leaves a running stage process alone.
+  `KillMode=process`, `Restart=always` and `RestartSec=10`: chaind comes back after any exit, and a restart leaves a
+  running stage process alone.
+- Stopping chaind does not stop its stages. With `KillMode=process`, `systemctl --user stop chaind` ends only the
+  daemon; each stage runs in its own process group and keeps running (and spending) until it exits. To end them,
+  abort the runs while chaind is still up, then stop it: `~/chain/.venv/bin/chain status` lists the active runs,
+  `~/chain/.venv/bin/chain abort <run-id>` ends one (chaind kills its stage's process group on its next tick).
+  If chaind is already stopped, list the recorded groups with
+  `jq -r '.id as $r | .attempts[] | select(.pgid != null) | "\($r) \(.stage) \(.pgid)"' ~/.local/state/chain/runs/*/run.json`,
+  check a group is still the stage with `ps -o pid,pgid,etime,args -g <pgid>`, and end it with
+  `kill -TERM -- -<pgid>`. Do not kill by name.
   `install.sh` enables it only when `~/chain/.venv/bin/chaind` exists; otherwise it prints
   `chaind not set up: ...`. `box/provision.sh` clones `FibonAdithya/chain` to `~/chain` and runs `make setup` once
   `gh auth status` passes, and prints `chain step skipped: gh is not logged in` before that.

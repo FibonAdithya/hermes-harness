@@ -58,7 +58,10 @@ def _section(path, name):
 def test_box_chaind_unit_kill_mode_process():
     svc = _section(CHAIND, "Service")
     assert svc["KillMode"] == ["process"]
-    assert svc["Restart"] == ["on-failure"]
+    # Spec section 6: chaind is always on, so it comes back after a clean exit too, and
+    # the 10 s spacing keeps a crash loop under systemd's default start limit (5 in 10 s).
+    assert svc["Restart"] == ["always"]
+    assert svc["RestartSec"] == ["10"]
     assert svc["WorkingDirectory"] == ["%h/chain"]
     assert svc["ExecStart"] == ["%h/chain/.venv/bin/chaind"]
     assert _section(CHAIND, "Install")["WantedBy"] == ["default.target"]
