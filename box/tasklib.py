@@ -34,6 +34,9 @@ MAX_TITLE, MAX_BODY = 200, 3500
 # The owner's answers to fleet:human escalations, one JSON list per issue, under home.
 ANSWERS_DIR = Path(".local/state/fleet/answers")
 MAX_ANSWER = 2000
+# fleet depends on this prefix, byte for byte: a comment whose body starts with it, after
+# a handoff packet, on an issue with a fleet:answered-N label (N >= 1), makes fleet treat
+# that packet as stale. Do not reword it without changing fleet in step.
 ANSWER_HEADER = "Owner's answer (from Telegram):\n\n"
 # fleet (herdr_executor._ANSWERS_MAX_BYTES) and chain (fleetmode.MAX_ANSWERS_BYTES) refuse
 # to read an answers file larger than this, so answer() never writes one.
@@ -460,16 +463,18 @@ def answer(gh: Gh, repo_slug: str, number: int, want_hash: str, text: str, home:
     they were, so a retry is not counted twice. N in fleet:answered-N is one past the
     highest such label (what fleet reads), not the number of entries in the file.
 
-    Order: add fleet:answered-N and fleet:ready, write the file, remove fleet:human, then
-    post the record comment. Until the remove, the issue carries fleet:human and
-    fleet:ready together, which fleet's ledger refuses loudly instead of acting on, and
-    any failure is rolled back. If the process is killed instead, the window that leaves
-    a stray answer in the file is the one gh call between the file write and the remove;
-    a kill after the label add costs at most one extra fleet:answered label. The other
-    order, the file last, would let fleet act on fleet:ready with raised caps and no
-    answer text, or lose the text silently, so the file is written before the remove.
-    The comment is only the record on GitHub; it comes after the answer took effect, so
-    its failure is returned as a warning rather than told to the owner as a failure."""
+    Order: add fleet:answered-N and fleet:ready, post the "Owner's answer" comment (fleet
+    reads it, with the label, as making an earlier handoff packet stale), write the file,
+    then remove fleet:human. Removing fleet:human is the commit: until then the issue
+    carries fleet:human and fleet:ready together, which fleet's ledger refuses loudly
+    instead of acting on, so fleet never acts on a half-written answer. A failure before
+    the commit puts the file and labels back; a comment already posted stays on GitHub
+    (the error says so), and is harmless to fleet while the issue waits on the owner.
+    If the process is killed instead: after the label add, a retry costs one extra
+    fleet:answered label; after the comment, also a stray comment; after the file write,
+    also a stray answer in the file. That last window is one gh call wide. Writing the
+    file after the commit instead would let fleet act on fleet:ready with raised caps and
+    no answer text, or lose the text silently."""
     text = text.strip() if isinstance(text, str) else ""
     if not 1 <= len(text) <= MAX_ANSWER:
         raise TaskError(f"an answer must be 1..{MAX_ANSWER} characters")
@@ -488,22 +493,21 @@ def answer(gh: Gh, repo_slug: str, number: int, want_hash: str, text: str, home:
     for name in add:
         ensure_label(gh, repo_slug, name)
     added = [x for x in add if x not in fresh["labels"]]
+    commented = False
     try:
         # Add before remove, as approve() does.
         _ok(gh, ["issue", "edit", str(int(number)), "--repo", repo_slug, "--add-label", ",".join(add)])
+        comment(gh, repo_slug, number, ANSWER_HEADER + text)
+        commented = True
         _write_answers(path, data)
         _ok(gh, ["issue", "edit", str(int(number)), "--repo", repo_slug, "--remove-label", HUMAN])
     except (TaskError, OSError) as exc:
         left = _undo_answer(gh, repo_slug, number, path, before, added)
+        stray = " (the \"Owner's answer\" comment it posted stays on the issue)" if commented else ""
         if left:
-            raise TaskError(f"{exc}; undoing it failed: {'; '.join(left)}") from exc
-        raise TaskError(f"{exc}; nothing was recorded") from exc
-    out = {"number": int(number), "answers": len(entries)}
-    try:
-        comment(gh, repo_slug, number, ANSWER_HEADER + text)
-    except TaskError as exc:
-        out["warning"] = f"the answer is recorded, but the record comment on GitHub failed: {exc}"
-    return out
+            raise TaskError(f"{exc}; undoing it failed: {'; '.join(left)}{stray}") from exc
+        raise TaskError(f"{exc}; nothing was recorded{stray}") from exc
+    return {"number": int(number), "answers": len(entries)}
 
 
 def take(gh: Gh, repo_slug: str, number: int, want_hash: str, escalations=fleet_escalations,

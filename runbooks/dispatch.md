@@ -327,17 +327,18 @@ ssh tig-adi 'systemctl --user stop night-<id>.service'                         #
   offered drop only: its escalation or title is too long to show here in full. Read it on GitHub and handle it
   there, or drop it.` plus the spent-code line. Handle it on GitHub: assign the box's gh login to stop the pings.
 - Replies, in the approvals chat only (owner, private chat, not forwarded):
-  - `answer NNNN <text>` — text is 1 to 2000 characters, newlines allowed. The box adds `fleet:answered-N` (N is one
-    past the highest `fleet:answered-*` label on the issue, which is what fleet reads) and `fleet:ready`, appends
-    `{"text", "at"}` to `~/.local/state/fleet/answers/<owner>__<name>/<number>.json` (a JSON list, ASCII-escaped,
-    mode 600, at most 65536 bytes: fleet and chain refuse to read a larger one), removes `fleet:human`, then
-    comments "Owner's answer (from Telegram):" with the text. If a GitHub call fails before `fleet:human` is
-    removed, the box puts the file and labels back and replies `...; nothing was recorded`; a retry is then counted
-    once. If putting them back fails too, the reply says what is left (`undoing it failed: ...`); fix those labels or
-    the file by hand. Reply: `<repo>#<n>: answer recorded; the issue is back in fleet:ready for the next fleet
-    night.`, with a second line `the answer is recorded, but the record comment on GitHub failed: ...` when only the
-    comment failed. fleet's next dispatch carries the answers, and each answer raises that task's attempt, fix-pass
-    and rebase caps (fleet's behaviour, not checked in this repository).
+  - `answer NNNN <text>` — text is 1 to 2000 characters, newlines allowed. The box, in this order: adds
+    `fleet:answered-N` (N is one past the highest `fleet:answered-*` label on the issue, which is what fleet reads)
+    and `fleet:ready`; comments "Owner's answer (from Telegram):" with the text (fleet relies on that exact prefix:
+    with the label, it makes an earlier handoff packet stale); appends `{"text", "at"}` to
+    `~/.local/state/fleet/answers/<owner>__<name>/<number>.json` (a JSON list, ASCII-escaped, mode 600, at most
+    65536 bytes: fleet and chain refuse to read a larger one); and last removes `fleet:human`. Until that remove the
+    issue has `fleet:human` and `fleet:ready` together, which fleet refuses rather than acts on. If a step fails
+    first, the box puts the file and labels back and replies `...; nothing was recorded` (a comment already posted
+    stays, and the reply says so); a retry is then counted once. If putting them back fails too, the reply says what
+    is left (`undoing it failed: ...`); fix those labels or the file by hand. Reply: `<repo>#<n>: answer recorded;
+    the issue is back in fleet:ready for the next fleet night.` fleet's next dispatch carries the answers, and each
+    answer raises that task's attempt, fix-pass and rebase caps (fleet's behaviour, not checked in this repository).
   - `drop NNNN` — closes the issue and adds `fleet:dropped`. Reply: `Dropped <repo>#<n>.` If the box refuses, the
     reply is `<repo>#<n>: <error>` followed by the spent-code line below.
   - `take NNNN` — assigns the box's gh login and leaves `fleet:human` on. The issue is not announced again. Reply:

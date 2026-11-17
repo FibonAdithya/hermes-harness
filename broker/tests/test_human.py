@@ -330,15 +330,6 @@ def test_answer_at_the_limit_is_sent(st):
     assert [v for v, _ in box.calls] == ["answer_human"]
 
 
-def test_answer_reply_relays_the_box_warning(st):
-    """The answer took effect but the record comment failed: the owner is told both."""
-    code = _announce(st)
-    warning = "the answer is recorded, but the record comment on GitHub failed: gh issue comment failed: HTTP 502"
-    box = Box({"answer_human": {"repo": "fleet", "number": 42, "answers": 1, "warning": warning}})
-    out = handle_human(st["humans"], "answer", f"{code}\nTOML", 2.0, box)
-    assert out == f"fleet#42: answer recorded; the issue is back in fleet:ready for the next fleet night.\n{warning}"
-
-
 def test_answer_box_error_is_reported_and_code_spent(st):
     code = _announce(st)
     box = Box({"answer_human": {"error": "the escalation changed since it was announced"}})

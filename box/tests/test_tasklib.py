@@ -730,7 +730,8 @@ def test_answer_that_fails_on_github_records_nothing(tmp_path, when, earlier):
     assert names(gh, n) == labels_before
     assert (f.read_bytes() if f.exists() else None) == before
     assert (list(f.parent.iterdir()) if f.parent.exists() else []) == ([f] if earlier is not None else [])  # no temp file
-    assert not [c for c in gh.issues[n]["comments"] if c["body"].startswith(tasklib.ANSWER_HEADER)]
+    posted = [c for c in gh.issues[n]["comments"] if c["body"].startswith(tasklib.ANSWER_HEADER)]
+    assert len(posted) == (1 if when is removes_human else 0)  # posted just before the remove
     out = tasklib.answer(gh, SLUG, n, _hash(), "use sqlite", tmp_path, 2.0, escalations=stub({n: dict(ESC)}))
     assert out == {"number": n, "answers": len(earlier or []) + 1}
     assert json.loads(f.read_text()) == (earlier or []) + [{"text": "use sqlite", "at": 2.0}]
@@ -761,16 +762,52 @@ def test_answer_says_what_a_failed_rollback_left(tmp_path):
     assert not _answers(tmp_path, n).exists()
 
 
-def test_answer_whose_record_comment_fails_is_still_recorded(tmp_path):
-    """The comment is only the record on GitHub and comes after the answer took effect, so
-    its failure is a warning; the owner is not told an answer failed that fleet will use."""
+def test_answer_comment_prefix_is_the_one_fleet_reads(tmp_path):
+    """fleet treats an earlier handoff packet as stale when a later comment starts with
+    exactly this prefix and the issue has fleet:answered-N; it must not change."""
+    assert tasklib.ANSWER_HEADER == "Owner's answer (from Telegram):\n\n"
     gh = FakeGh()
     n = _human_issue(gh)
-    out = tasklib.answer(failing(gh, lambda a: a[:2] == ["issue", "comment"]), SLUG, n, _hash(), "x",
-                         tmp_path, 1.0, escalations=stub({n: dict(ESC)}))
-    assert out["number"] == n and out["answers"] == 1 and "record comment" in out["warning"]
-    assert json.loads(_answers(tmp_path, n).read_text()) == [{"text": "x", "at": 1.0}]
-    assert {"fleet:answered-1", "fleet:ready"} <= names(gh, n) and "fleet:human" not in names(gh, n)
+    tasklib.answer(gh, SLUG, n, _hash(), "Use 8080.", tmp_path, 1.0, escalations=stub({n: dict(ESC)}))
+    assert gh.issues[n]["comments"][-1] == {"author": {"login": gh.login},
+                                            "body": "Owner's answer (from Telegram):\n\nUse 8080."}
+
+
+def test_answer_is_complete_before_fleet_human_is_removed(tmp_path):
+    """Removing fleet:human is the commit; by then the comment, both labels and the file
+    entry are all in place, so fleet never sees fleet:ready with any of them missing."""
+    gh = FakeGh()
+    n = _human_issue(gh)
+    seen = []
+
+    def check(args, stdin=None):
+        if removes_human(args):
+            seen.append((names(gh, n), [c["body"] for c in gh.issues[n]["comments"]],
+                         json.loads(_answers(tmp_path, n).read_text())))
+        return gh(args, stdin)
+    tasklib.answer(check, SLUG, n, _hash(), "x", tmp_path, 1.0, escalations=stub({n: dict(ESC)}))
+    [(labels, comments, entries)] = seen
+    assert {"fleet:answered-1", "fleet:ready", "fleet:human"} <= labels
+    assert comments[-1] == tasklib.ANSWER_HEADER + "x"
+    assert entries == [{"text": "x", "at": 1.0}]
+
+
+def test_answer_whose_comment_fails_records_nothing(tmp_path):
+    gh = FakeGh()
+    n = _human_issue(gh)
+    labels_before = names(gh, n)
+    with pytest.raises(TaskError, match="nothing was recorded$"):
+        tasklib.answer(failing(gh, lambda a: a[:2] == ["issue", "comment"]), SLUG, n, _hash(), "x",
+                       tmp_path, 1.0, escalations=stub({n: dict(ESC)}))
+    assert names(gh, n) == labels_before and not _answers(tmp_path, n).exists()
+
+
+def test_answer_rolled_back_after_the_comment_says_the_comment_stays(tmp_path):
+    gh = FakeGh()
+    n = _human_issue(gh)
+    with pytest.raises(TaskError, match="nothing was recorded .*comment it posted stays on the issue"):
+        tasklib.answer(failing(gh, removes_human), SLUG, n, _hash(), "x", tmp_path, 1.0,
+                       escalations=stub({n: dict(ESC)}))
 
 
 @pytest.mark.parametrize("have, want", [
