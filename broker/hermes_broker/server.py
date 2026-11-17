@@ -75,7 +75,8 @@ def request_access(box: str, minutes: int, reason: str) -> str:
     now = time.time()
     state_dir = _config().state_dir
     avoid = (TaskStore(state_dir / "tasks.json").live_codes(now)
-             | ProposalStore(state_dir / "proposals.json").live_codes(now))
+             | ProposalStore(state_dir / "proposals.json").live_codes(now)
+             | TaskStore(state_dir / "human_codes.json").live_codes(now))
     code = _store().create_request(box, minutes, reason, now=now, avoid=avoid)
     return (
         f"Requested {box} for {minutes} minutes.\n"

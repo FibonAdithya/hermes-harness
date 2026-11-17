@@ -59,6 +59,14 @@ def _task_wiring(cfg: BrokerConfig) -> tuple[TaskStore | None, Call | None]:
     )
 
 
+def _human_wiring(cfg: BrokerConfig) -> TaskStore | None:
+    """The fleet:human code store, or None if tig-server isn't configured (its
+    announcer and replies need the box)."""
+    if cfg.ssh_targets.get("tig-server") is None:
+        return None
+    return TaskStore(cfg.state_dir / "human_codes.json")
+
+
 def _proposal_wiring(cfg: BrokerConfig) -> tuple[ProposalStore, Path]:
     """Proposal announcing and the weekly outbox need only local files, not tig-server."""
     return ProposalStore(cfg.state_dir / "proposals.json"), cfg.tuner_dir
@@ -86,6 +94,7 @@ def main(listener=run_listener, run=subprocess.run) -> None:
         state_dir=cfg.state_dir,
         prod=_prod_wiring(cfg, run=run),
         harness_checkout=cfg.harness_checkout,
+        humans=_human_wiring(cfg),
     )
 
 
