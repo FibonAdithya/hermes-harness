@@ -246,8 +246,10 @@ def _human_rows(issues: list[dict], home: Path, escalations) -> list[dict]:
     """The rows human() lists, and the freshness hash answer() and take() check against.
 
     The hash binds the title and the escalation the owner read (its index and text), so
-    a newer escalation or a reworded one changes it. When fleet's helper fails, every
-    issue is still listed, with a note and the fallback index -1 and text ""."""
+    a newer escalation or a reworded one changes it. An issue with no escalation comment
+    gets index -1 and text "". When fleet's helper fails, every issue is still listed,
+    with a note, index -1, and as text a digest of all its comment bodies: the hash then
+    still changes when a newer escalation is posted while the helper stays broken."""
     if not issues:
         return []
     comments = {int(r["number"]): [c.get("body", "") for c in r.get("comments") or []] for r in issues}
@@ -260,7 +262,12 @@ def _human_rows(issues: list[dict], home: Path, escalations) -> list[dict]:
     for r in issues:
         e = found.get(int(r["number"]))
         esc = {"index": e["index"], "reason": e["reason"], "text": e["text"]} if e else None
-        index, text = (esc["index"], esc["text"]) if esc else (-1, "")
+        if esc:
+            index, text = esc["index"], esc["text"]
+        elif note:
+            index, text = -1, hashlib.sha256(json.dumps(comments[int(r["number"])]).encode("utf-8")).hexdigest()
+        else:
+            index, text = -1, ""
         rows.append({"number": int(r["number"]), "title": r["title"],
                      "labels": [x["name"] for x in r.get("labels", [])],
                      "escalation": esc, "note": note, "hash": issue_hash(r["title"], f"{index}\n{text}")})
@@ -272,17 +279,29 @@ def human(gh: Gh, repo_slug: str, home: Path, escalations=fleet_escalations) -> 
     already taken by the box's gh login."""
     login = _login(gh)
     issues = json.loads(_ok(gh, ["issue", "list", "--repo", repo_slug, "--state", "open", "--label", HUMAN,
-                                 "--json", "number,title,labels,assignees,comments", "--limit", "200"]) or "[]")
-    waiting = [r for r in issues
-               if SOLO not in {x["name"] for x in r.get("labels", [])}
-               and login not in {a.get("login") for a in r.get("assignees") or []}]
-    return _human_rows(waiting, home, escalations)
+                                 "--json", "number,title,labels,assignees", "--limit", "200"]) or "[]")
+    # Comments come from the same view call _fresh_human makes (gh issue list may cap
+    # them per issue), so the listing hashes the comment set answer() rechecks.
+    views = [_view_human(gh, repo_slug, r["number"]) for r in issues if _waiting(r, login)]
+    return _human_rows([v for v in views if _waiting(v, login)], home, escalations)
+
+
+def _waiting(row: dict, login: str) -> bool:
+    names = {x["name"] for x in row.get("labels", [])}
+    return (str(row.get("state", "OPEN")).upper() == "OPEN" and HUMAN in names and SOLO not in names
+            and login not in {a.get("login") for a in row.get("assignees") or []})
+
+
+def _view_human(gh: Gh, repo_slug: str, number: int) -> dict:
+    row = json.loads(_ok(gh, ["issue", "view", str(int(number)), "--repo", repo_slug,
+                              "--json", "state,title,labels,assignees,comments"]))
+    row["number"] = int(number)
+    return row
 
 
 def _fresh_human(gh: Gh, repo_slug: str, number: int, want_hash: str, home: Path, escalations) -> dict:
     """Refuse unless the issue still waits on the owner with the escalation they read."""
-    row = json.loads(_ok(gh, ["issue", "view", str(int(number)), "--repo", repo_slug,
-                              "--json", "state,title,labels,assignees,comments"]))
+    row = _view_human(gh, repo_slug, number)
     names = {x["name"] for x in row.get("labels", [])}
     if str(row.get("state", "")).upper() != "OPEN":
         raise TaskError(f"#{number} is closed")
@@ -290,7 +309,6 @@ def _fresh_human(gh: Gh, repo_slug: str, number: int, want_hash: str, home: Path
         raise TaskError(f"#{number} is no longer waiting on the owner")
     if SOLO in names:
         raise TaskError(f"#{number} is solo work; it is not answered from here")
-    row["number"] = int(number)
     [fresh] = _human_rows([row], home, escalations)
     if fresh["hash"] != want_hash:
         raise TaskError(f"#{number} changed since it was announced; wait for the new announcement")
@@ -327,6 +345,8 @@ def _write_answers(path: Path, entries: list[dict]) -> None:
         with os.fdopen(fd, "w") as f:  # mkstemp creates it mode 600
             json.dump(entries, f, indent=1)
             f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)

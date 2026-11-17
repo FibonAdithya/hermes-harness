@@ -7,7 +7,8 @@ SLUG = "FibonAdithya/fleet-fixture"
 class FakeGh:
     """Stands in for the gh CLI. Labels must exist before they are applied, as with real gh.
 
-    Comments and assignees have gh's --json shape: [{"body": ...}] and [{"login": ...}]."""
+    Comments and assignees have gh's --json shape: [{"body": ...}] and [{"login": ...}].
+    `issue list` and `issue view` return only the fields named in --json, as gh does."""
 
     def __init__(self):
         self.login = "fibon-box"
@@ -35,7 +36,7 @@ class FakeGh:
             return 0, f"https://github.com/{SLUG}/issues/{n}\n", ""
         if cmd == ["issue", "view"]:
             i = self.issues.get(int(args[2]))
-            return (0, json.dumps(i), "") if i else (1, "", "not found")
+            return (0, json.dumps(_fields(i, args)), "") if i else (1, "", "not found")
         if cmd == ["issue", "edit"]:
             i = self.issues[int(args[2])]
             if "--add-label" in args:
@@ -61,10 +62,15 @@ class FakeGh:
         if cmd == ["issue", "list"]:
             label = args[args.index("--label") + 1]
             rows = [i for i in self.issues.values() if i["state"] == "OPEN" and label in [x["name"] for x in i["labels"]]]
-            return 0, json.dumps(rows), ""
+            return 0, json.dumps([_fields(i, args) for i in rows]), ""
         if cmd == ["issue", "comment"]:
             self.issues[int(args[2])]["comments"].append({"body": args[args.index("--body") + 1]})
             return 0, "", ""
         if args == ["api", "user", "--jq", ".login"]:
             return 0, self.login + "\n", ""
         raise AssertionError(f"unexpected gh call {args}")
+
+
+def _fields(issue, args):
+    want = args[args.index("--json") + 1].split(",")
+    return {k: issue[k] for k in want if k in issue}

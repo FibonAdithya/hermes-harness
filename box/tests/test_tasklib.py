@@ -1,4 +1,7 @@
 """tasklib: the only code on the box that writes the fleet ledger."""
+import hashlib
+import json
+
 import pytest
 
 import tasklib
@@ -255,9 +258,24 @@ def test_human_lists_escalated_issue(tmp_path):
                      "escalation": {"index": 3, "reason": "needs a decision", "text": "Which port should the daemon use?"},
                      "note": None, "hash": tasklib.issue_hash("Pick a port", "3\nWhich port should the daemon use?")}]
     assert esc.seen == [(tmp_path, {n: ["first", "Escalation: which port?"]})]
-    # One list call reads comments and assignees together.
+
+
+def test_human_reads_comments_with_the_view_call_answer_uses(tmp_path):
+    """gh issue list may cap comments per issue; gh issue view loads them all. The listing
+    must hash the same comment set answer() later rechecks, so both read them by view."""
+    gh = FakeGh()
+    n = _human_issue(gh)
+    esc = stub({n: dict(ESC)})
+    [row] = tasklib.human(gh, SLUG, tmp_path, escalations=esc)
     [lst] = [c[0] for c in gh.calls if c[0][:2] == ("issue", "list")]
-    assert "number,title,labels,assignees,comments" in lst
+    assert "comments" not in lst[lst.index("--json") + 1].split(",")
+    listing_views = [c[0] for c in gh.calls if c[0][:2] == ("issue", "view")]
+    gh.calls.clear()
+    tasklib.answer(gh, SLUG, n, row["hash"], "x", tmp_path, 1.0, escalations=esc)
+    answer_views = [c[0] for c in gh.calls if c[0][:2] == ("issue", "view")]
+    assert listing_views == answer_views == [("issue", "view", str(n), "--repo", SLUG, "--json",
+                                              "state,title,labels,assignees,comments")]
+    assert esc.seen[0][1] == esc.seen[1][1] == {n: ["first", "Escalation: which port?"]}
 
 
 def test_human_skips_solo(tmp_path):
@@ -277,12 +295,28 @@ def test_human_skips_taken(tmp_path):
     assert [r["number"] for r in rows] == [other, free]
 
 
+def test_human_rechecks_the_issue_it_viewed(tmp_path):
+    """An issue taken or moved to solo between the list call and its view call is not listed."""
+    gh = FakeGh()
+    moved = _human_issue(gh)
+    keep = _human_issue(gh)
+
+    def racing(args, stdin=None):
+        if args[:3] == ["issue", "view", str(moved)]:
+            gh.issues[moved]["labels"].append({"name": "fleet:solo"})
+        return gh(args, stdin)
+    rows = tasklib.human(racing, SLUG, tmp_path, escalations=stub({}))
+    assert [r["number"] for r in rows] == [keep]
+
+
 def test_human_lists_issue_when_escalation_unreadable(tmp_path):
     gh = FakeGh()
     n = _human_issue(gh)
     [row] = tasklib.human(gh, SLUG, tmp_path, escalations=broken)
     assert row["number"] == n and row["escalation"] is None
-    assert row["hash"] == tasklib.issue_hash("Pick a port", "-1\n")
+    # The fallback binds every comment body, so a new comment changes it (see below).
+    digest = hashlib.sha256(json.dumps(["first", "Escalation: which port?"]).encode("utf-8")).hexdigest()
+    assert row["hash"] == tasklib.issue_hash("Pick a port", f"-1\n{digest}")
     assert "escalation text unavailable" in row["note"] and "cannot run uv" in row["note"]
 
 
@@ -363,6 +397,22 @@ def test_answer_hash_uses_the_unreadable_fallback(tmp_path):
     assert out == {"number": n, "answers": 1}
 
 
+def test_answer_refuses_a_new_comment_while_the_helper_stays_broken(tmp_path):
+    """Helper broken at listing and at answer time: a newer escalation posted in between
+    must still be refused, so the fallback hash cannot bind the title alone."""
+    gh = FakeGh()
+    n = _human_issue(gh)
+    [row] = tasklib.human(gh, SLUG, tmp_path, escalations=broken)
+    gh.issues[n]["comments"].append({"body": "Escalation: and which host?"})
+    with pytest.raises(TaskError, match="changed since it was announced"):
+        tasklib.answer(gh, SLUG, n, row["hash"], "x", tmp_path, 1.0, escalations=broken)
+    with pytest.raises(TaskError, match="changed since it was announced"):
+        tasklib.take(gh, SLUG, n, row["hash"], escalations=broken, home=tmp_path)
+    _no_writes(gh, tmp_path, n)
+    [again] = tasklib.human(gh, SLUG, tmp_path, escalations=broken)
+    assert tasklib.answer(gh, SLUG, n, again["hash"], "x", tmp_path, 1.0, escalations=broken) == {"number": n, "answers": 1}
+
+
 def test_answer_refuses_solo(tmp_path):
     gh = FakeGh()
     n = _human_issue(gh, labels=("fleet:human", "fleet:solo"))
@@ -407,15 +457,17 @@ def test_answer_text_bounds_accepted(tmp_path, text):
     assert json.loads(_answers(tmp_path, n).read_text()) == [{"text": text.strip(), "at": 1.0}]
 
 
-def test_answer_refuses_to_overwrite_a_malformed_answers_file(tmp_path):
+@pytest.mark.parametrize("bad", ["{not json", "[1, 2]", "{}", '{"text": "x", "at": 1}'],
+                         ids=["not-json", "list-of-ints", "empty-object", "object"])
+def test_answer_refuses_to_overwrite_a_malformed_answers_file(tmp_path, bad):
     gh = FakeGh()
     n = _human_issue(gh)
     f = _answers(tmp_path, n)
     f.parent.mkdir(parents=True)
-    f.write_text("{not json")
+    f.write_text(bad)
     with pytest.raises(TaskError, match="answers file"):
         tasklib.answer(gh, SLUG, n, _hash(), "x", tmp_path, 1.0, escalations=stub({n: dict(ESC)}))
-    assert f.read_text() == "{not json"
+    assert f.read_text() == bad
     assert not [c for c in gh.calls if c[0][:2] in (("issue", "edit"), ("issue", "comment"))]
 
 
