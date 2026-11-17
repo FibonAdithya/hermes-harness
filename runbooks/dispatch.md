@@ -316,7 +316,7 @@ ssh tig-adi 'systemctl --user stop night-<id>.service'                         #
 - One message per issue and escalation. A new escalation on the same issue gets a new message and a new code.
   Codes are four digits, valid 7 days, and unique across grants, triage tasks, tool proposals and these.
 - Message shape: `fleet:human  <repo>#<number>  <title>`, the escalation text (trimmed at the same length as a triage
-  body), a separator line, then `code NNNN` and `answer NNNN <your text> | drop NNNN | take NNNN`. Only the lines
+  body, ending `[… trimmed; read it on GitHub]` when cut), a separator line, then `code NNNN` and `answer NNNN <your text> | drop NNNN | take NNNN`. Only the lines
   after the separator are instructions.
 - Replies, in the approvals chat only (owner, private chat, not forwarded):
   - `answer NNNN <text>` — text is 1 to 2000 characters, newlines allowed. The box appends `{"text", "at"}` to
@@ -325,18 +325,26 @@ ssh tig-adi 'systemctl --user stop night-<id>.service'                         #
     `fleet:ready`, then removes `fleet:human`. Reply: `<repo>#<n>: answer recorded; the issue is back in fleet:ready
     for the next fleet night.` fleet's next dispatch carries the answers, and each answer raises that task's attempt,
     fix-pass and rebase caps (fleet's behaviour, not checked in this repository).
-  - `drop NNNN` — closes the issue and adds `fleet:dropped`. Reply: `Dropped <repo>#<n>.`
+  - `drop NNNN` — closes the issue and adds `fleet:dropped`. Reply: `Dropped <repo>#<n>.` If the box refuses, the
+    reply is `<repo>#<n>: <error>` followed by the spent-code line below.
   - `take NNNN` — assigns the box's gh login and leaves `fleet:human` on. The issue is not announced again. Reply:
     `<repo>#<n> is yours: assigned to <login>; it will not be announced again.` Unassign it on GitHub to have it
     announced again.
-- Refusals (the code is spent in each; if the issue still waits on the owner it is announced again with a new code):
+- Refusals. The code is spent in each. Each refusal from the box (the first four) is followed by the line
+  `This code is spent; if the issue still waits on you it will be announced again with a new code.`
   - `<repo>#<n>: #<n> changed since it was announced; wait for the new announcement` — the escalation or title changed.
-  - `#<n> is no longer waiting on the owner` — the issue left `fleet:human`; `#<n> is closed` — it was closed.
-  - `an answer must be 1 to 2000 characters; yours is <n>. Nothing was sent.`
+  - `<repo>#<n>: #<n> is no longer waiting on the owner` — the issue left `fleet:human`.
+  - `<repo>#<n>: #<n> is closed` — it was closed.
+  - `<repo>#<n>: #<n> is solo work; it is not answered from here` — it got `fleet:solo` after it was announced.
+  - `<repo>#<n>: an answer must be 1 to 2000 characters; yours is <n>. Nothing was sent.` followed, on the same
+    line, by the same spent-code sentence. The droplet checks this before calling the box.
   - `No announced fleet:human issue with that code.` — unknown, spent or expired code.
-- `(escalation text unavailable: ...)` in a message: fleet's escalation helper failed on the box (the `~/TIG/fleet`
-  checkout or `uv` is broken). The issue is still announced and the code still works. Fix the checkout; read the
-  escalation on GitHub meanwhile.
+- `escalation text unavailable: ...` in place of the escalation text: fleet's escalation helper failed on the box,
+  either for every issue (the `~/TIG/fleet` checkout or `uv` is broken, or the helper took over 60 s) or for this
+  issue only (fleet's parser raised on its comments). The issue is still announced, and replies work while the
+  helper stays broken. If the helper recovers before you reply, the issue's hash changes: an `answer` or `take` is
+  refused with `changed since it was announced`, and the issue is announced again with its escalation text. Fix
+  the checkout; read the escalation on GitHub meanwhile.
 - `fleet:human announcer: cannot list fleet:human on tig-server: ...` is sent once when the box stops answering,
   and `fleet:human announcer: tig-server reachable again.` when it does.
 - Code store: `<state_dir>/human_codes.json` on the droplet (the broker's state directory).
@@ -351,8 +359,10 @@ ssh tig-adi 'systemctl --user stop night-<id>.service'                         #
   `chaind not set up: ...`. `box/provision.sh` clones `FibonAdithya/chain` to `~/chain` and runs `make setup` once
   `gh auth status` passes, and prints `chain step skipped: gh is not logged in` before that.
 - Config: `~/.config/chain/config.toml`, copied from `box/chain-config.example.toml` if absent (never overwritten).
-  It sets all seven stage budgets, `max_concurrent_runs = 1` and `max_fix_rounds = 2`. The 39.0 USD worst-case
-  ceiling and every budget are ESTIMATE (unverified) until the acceptance run measures chain spend.
+  It sets all seven stage budgets, `max_concurrent_runs = 1` and `max_fix_rounds = 2`. chain counts review and fix
+  spend across all their rounds against the one stage budget, so a run's ceiling is the plain sum of the seven
+  budgets: 38.0 USD. The ceiling and every budget are ESTIMATE (unverified) until the acceptance run measures chain
+  spend.
 - State: `systemctl --user status chaind`; `journalctl --user -u chaind -n 50`.
 - Deploys: Hermes calls `request_deploy(<chain main sha>, "chain")`; you read the commit on chain's `main` and reply
   `deploy chain <prefix>` (a bare `deploy <prefix>` approves only a hermes-harness deploy). Hermes calls
@@ -363,6 +373,8 @@ ssh tig-adi 'systemctl --user stop night-<id>.service'                         #
   fails: `chain <sha12> is installed but chaind was not restarted: ...`. No check for a running chain stage; the
   restart leaves it alone. `deployed` shows `harness`, `fleet` and `chain` stamps.
 - Rollback: revert on chain's `main`, deploy that commit.
+- After a harness deploy that changed `box/units/chaind.service`, restart chaind (`systemctl --user restart chaind`)
+  for the new unit to apply; `install.sh` reloads units but does not restart a running chaind.
 
 ### Rollout (owner-attended)
 
@@ -376,12 +388,12 @@ fleet, hermes-harness). Record each measurement with its command as MEASURED.
 3. Account: compare the account the box's `claude` login uses with the laptop's, and record whether they share a
    usage limit.
 4. Push access: on the box, `git push --dry-run` of a branch to `FibonAdithya/fleet-fixture` must succeed.
-5. Box fleet checkout: `~/TIG/fleet` on the box must be on the public history (todo `b9f1e7`):
+5. Box fleet checkout: `~/TIG/fleet` on the box must be on the public history:
    `git fetch && git reset --hard origin/main` against `FibonAdithya/fleet`.
 6. Deploy through the gate, in this order, one reply each:
    1. harness: `request_deploy(<master sha>)`, reply `deploy <prefix>`, `deploy_harness()`.
    2. Provision chain on the box: re-run `box/provision.sh` after `gh auth login`, so `~/chain` exists and
-      `make setup` has run. Install chaind with `box/install.sh` if the harness deploy ran before `~/chain` existed.
+      `make setup` has run. Then re-run `box/install.sh`, which enables and starts chaind.
    3. chain: `request_deploy(<chain main sha>, "chain")`, reply `deploy chain <prefix>`, `deploy_chain()`.
    4. fleet: `request_deploy(<fleet main sha>, "fleet")`, reply `deploy fleet <prefix>`, `deploy_fleet()`.
    5. `deployed` must report all three stamps.
