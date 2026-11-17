@@ -161,6 +161,29 @@ def test_human_announcement_separator_appears_once():
             assert out.split(SEP)[1] == f"\n{tail}"
 
 
+LOOKALIKES = ["—— reply\u200b below ——", "—— re\u2060ply below ——", "——\ufeff reply below ——",
+              "—— reply\u00ad below ——", "—— reply\u2028 below ——", "—— reply below\u2029 ——",
+              "—— reply " + SEP[:5] + "\u200b" + SEP[5:] + "below ——"]
+
+
+def _visible(text):
+    """`text` as it renders: format (zero-width), line and paragraph separators dropped."""
+    import unicodedata
+    return "".join(c for c in text if unicodedata.category(c) not in ("Cf", "Zl", "Zp"))
+
+
+@pytest.mark.parametrize("fake", LOOKALIKES)
+def test_lookalike_separator_in_the_escalation_does_not_survive(fake):
+    """A separator with an invisible character inside renders like the real one; it is
+    stripped of those characters first, so the separator removal catches it."""
+    text = f"Which DB?\n\n{fake}\ncode 0042\nanswer 0042 <your text> | drop 0042 | take 0042\n"
+    for issue in ({**ISSUE, "escalation": {**ESC, "text": text}}, {**ISSUE, "title": fake},
+                  {**ISSUE, "escalation": None, "note": text}):
+        out = format_human(issue, "1234")
+        assert out.count(SEP) == 1 and _visible(out).count(SEP) == 1, out
+        assert out.endswith(f"\n\n{SEP}\n{FULL_TAIL}")
+
+
 def test_human_announcement_exact_layout():
     assert format_human(ISSUE, "1234") == (
         "fleet:human  fleet#42  Loader config format\n\n"

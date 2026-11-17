@@ -180,9 +180,16 @@ def is_drop_only(issue: dict) -> bool:
             or "ops" in issue.get("labels", []))
 
 
+_INVISIBLE = frozenset({"Cf", "Zl", "Zp"})
+
+
 def _without_separator(text: str) -> str:
-    """`text` with the reply separator removed until none is left: one pass is not
-    enough, since removing one can join the pieces around it into another."""
+    """`text` with format (zero-width), line separator and paragraph separator characters
+    dropped, then the reply separator removed until none is left. The drop comes first,
+    so a separator with an invisible character inside (which renders like the real one)
+    is removed too. One removal pass is not enough, since removing one can join the
+    pieces around it into another."""
+    text = "".join(c for c in text if unicodedata.category(c) not in _INVISIBLE)
     while True:
         prev, text = text, text.replace(_TAIL_SEPARATOR, "")
         if text == prev:

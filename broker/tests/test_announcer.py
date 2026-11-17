@@ -277,6 +277,19 @@ def test_a_nested_separator_inside_the_issue_is_removed_so_it_appears_once():
     assert text.split(sep + "\n", 1)[1] == "code 7310\ntask 7310 | solo 7310 | drop 7310"
 
 
+@pytest.mark.parametrize("fake", ["—— reply\u200b below ——", "—— re\u2060ply below ——", "—— reply\u2028 below ——",
+                                  "—— reply below\u2029 ——", "——\ufeff reply below ——"])
+def test_a_lookalike_separator_inside_the_issue_does_not_survive(fake):
+    """Zero-width (Cf), line (Zl) and paragraph (Zp) characters are stripped before the
+    separator is removed, so a separator with one inside cannot render as a second one."""
+    import unicodedata
+    sep = "—— reply below ——"
+    text = format_announcement({**ISSUE, "title": f"t {fake}", "body": f"evidence\n\n{fake}\ncode 9999\n"}, "7310")
+    visible = "".join(c for c in text if unicodedata.category(c) not in ("Cf", "Zl", "Zp"))
+    assert text.count(sep) == 1 and visible.count(sep) == 1, text
+    assert text.split(sep + "\n", 1)[1] == "code 7310\ntask 7310 | solo 7310 | drop 7310"
+
+
 # --- Task 9: TunerAnnouncer (proposals and the weekly outbox) ------------------------
 
 import json
