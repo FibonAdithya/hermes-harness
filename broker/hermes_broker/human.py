@@ -30,21 +30,35 @@ NO_ESCALATION = "(no escalation comment on the issue; read it on GitHub)"
 HUMAN_VERBS = ("answer", "take")
 
 
+def _text(issue: dict) -> str:
+    """What the announcement shows under the head: the escalation, or why it is missing."""
+    escalation = issue.get("escalation")
+    if isinstance(escalation, dict) and isinstance(escalation.get("text"), str):
+        return escalation["text"]
+    if isinstance(issue.get("note"), str) and issue["note"]:
+        return issue["note"]
+    return NO_ESCALATION
+
+
+def is_human_drop_only(issue: dict) -> bool:
+    """True when only `drop` may be offered: the escalation or title is longer than the
+    announcement shows, so the owner cannot have read what `answer` or `take` would bind
+    (the box's hash covers the whole of both). The bounds are triage's (is_drop_only)."""
+    return len(_text(issue)) > BODY_CHARS or len(issue.get("title", "")) > TITLE_CHARS
+
+
 def format_human(issue: dict, code: str) -> str:
     """The announcement: head, the escalation text (or why it is missing), then the
     separator exactly once and the real reply instructions after it."""
     title = issue.get("title", "")[:TITLE_CHARS]
     head = _without_separator(f"fleet:human  {issue['repo']}#{issue['number']}  {title}")
-    escalation = issue.get("escalation")
-    if isinstance(escalation, dict) and isinstance(escalation.get("text"), str):
-        text = escalation["text"]
-    elif isinstance(issue.get("note"), str) and issue["note"]:
-        text = issue["note"]
-    else:
-        text = NO_ESCALATION
+    text = _text(issue)
     trim = "\n[… trimmed; read it on GitHub]" if len(text) > BODY_CHARS else ""
     shown = _without_separator(text[:BODY_CHARS]) + trim
-    tail = f"code {code}\nanswer {code} <your text> | drop {code} | take {code}"
+    if is_human_drop_only(issue):
+        tail = f"code {code} — too long to show in full — read it on GitHub; only drop is offered.\ndrop {code}"
+    else:
+        tail = f"code {code}\nanswer {code} <your text> | drop {code} | take {code}"
     return f"{head}\n\n{shown}\n\n{_TAIL_SEPARATOR}\n{tail}"
 
 
@@ -58,6 +72,9 @@ def handle_human(humans: TaskStore, verb: str, arg: str, now: float, call: Call)
         return "No announced fleet:human issue with that code."
     ref = f"{entry['repo']}#{entry['number']}"
     again = "This code is spent; if the issue still waits on you it will be announced again with a new code."
+    if verb != "drop" and entry.get("drop_only", False):
+        return (f"{ref} was offered drop only: its escalation or title is too long to show here in full. "
+                f"Read it on GitHub and handle it there, or drop it. {again}")
     if verb == "answer":
         text = text.strip()
         if not 1 <= len(text) <= ANSWER_CHARS:
@@ -105,7 +122,8 @@ class HumanAnnouncer:
         self.humans.prune(set(r.get("repos_ok", [])), {(i["repo"], i["number"]) for i in issues}, now)
         for issue in issues:
             code = self.humans.announce(issue["repo"], issue["slug"], issue["number"], issue["hash"], now,
-                                        avoid=_avoid_codes(self.grants, self.tasks, self.proposals, now))
+                                        avoid=_avoid_codes(self.grants, self.tasks, self.proposals, now),
+                                        drop_only=is_human_drop_only(issue))
             if code and not self.send(format_human(issue, code)):
                 # Give the code back so the next tick re-announces.
                 self.humans.take(code, now)

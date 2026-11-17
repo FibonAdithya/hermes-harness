@@ -321,6 +321,11 @@ ssh tig-adi 'systemctl --user stop night-<id>.service'                         #
 - Message shape: `fleet:human  <repo>#<number>  <title>`, the escalation text (trimmed at the same length as a triage
   body, ending `[… trimmed; read it on GitHub]` when cut), a separator line, then `code NNNN` and `answer NNNN <your text> | drop NNNN | take NNNN`. Only the lines
   after the separator are instructions.
+- An escalation over 3500 characters or a title over 200 (triage's bounds) is offered drop only, as triage does: the
+  tail is `code NNNN — too long to show in full — read it on GitHub; only drop is offered.` and `drop NNNN`, since
+  `answer` and `take` bind text the owner was not shown. `answer` or `take` on that code replies `<repo>#<n> was
+  offered drop only: its escalation or title is too long to show here in full. Read it on GitHub and handle it
+  there, or drop it.` plus the spent-code line. Handle it on GitHub: assign the box's gh login to stop the pings.
 - Replies, in the approvals chat only (owner, private chat, not forwarded):
   - `answer NNNN <text>` — text is 1 to 2000 characters, newlines allowed. The box adds `fleet:answered-N` (N is one
     past the highest `fleet:answered-*` label on the issue, which is what fleet reads) and `fleet:ready`, appends

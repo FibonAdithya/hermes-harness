@@ -14,7 +14,7 @@ from hermes_broker.approvals import (
     run_listener,
 )
 from hermes_broker.grants import GrantStore
-from hermes_broker.human import ANSWER_CHARS, HumanAnnouncer, format_human, handle_human
+from hermes_broker.human import ANSWER_CHARS, HumanAnnouncer, format_human, handle_human, is_human_drop_only
 from hermes_broker.proposals import ProposalStore
 from hermes_broker.tasks import TaskStore
 
@@ -183,6 +183,46 @@ def test_human_announcement_says_when_there_is_no_escalation_comment():
 def test_long_escalation_is_trimmed_with_a_marker():
     out = format_human({**ISSUE, "escalation": {**ESC, "text": "x" * 5000}}, "1234")
     assert "x" * 3500 in out and "x" * 3501 not in out and "\n[… trimmed; read it on GitHub]" in out
+
+
+DROP_TAIL = "code 1234 — too long to show in full — read it on GitHub; only drop is offered.\ndrop 1234"
+FULL_TAIL = "code 1234\nanswer 1234 <your text> | drop 1234 | take 1234"
+
+
+@pytest.mark.parametrize("issue, tail", [
+    ({**ISSUE, "escalation": {**ESC, "text": "e" * 3500}}, FULL_TAIL),
+    ({**ISSUE, "escalation": {**ESC, "text": "e" * 3501}}, DROP_TAIL),
+    ({**ISSUE, "title": "t" * 200}, FULL_TAIL),
+    ({**ISSUE, "title": "t" * 201}, DROP_TAIL),
+])
+def test_over_length_escalation_or_title_is_offered_drop_only(issue, tail):
+    """The owner cannot have read past what is shown, so `answer` and `take` (which bind
+    the hash of the whole escalation and title) are not offered; triage does the same."""
+    out = format_human(issue, "1234")
+    assert out.endswith(f"\n\n{SEP}\n{tail}"), out[-200:]
+    assert is_human_drop_only(issue) == (tail == DROP_TAIL)
+
+
+def test_over_length_escalation_answer_and_take_are_refused(st):
+    long = {**ISSUE, "escalation": {**ESC, "text": "A" * 3600 + "\nthe real question is hidden here"}}
+    sent = []
+    _announcer(st, Box({"list_human": _listing(long)}), _recording_sender(sent)).tick(now=1.0)
+    (text,) = sent
+    assert "hidden here" not in text
+    for verb, arg in (("answer", "\nyes"), ("take", "")):
+        code = _code(text)
+        box = Box({})
+        out = handle_human(st["humans"], verb, code + arg, 2.0, box)
+        assert box.calls == [], verb
+        assert out == ("fleet#42 was offered drop only: its escalation or title is too long to show here in full. "
+                       "Read it on GitHub and handle it there, or drop it. This code is spent; if the issue still "
+                       "waits on you it will be announced again with a new code."), out
+        sent.clear()
+        _announcer(st, Box({"list_human": _listing(long)}), _recording_sender(sent)).tick(now=3.0)
+        (text,) = sent
+    box = Box({"close_task": {"repo": "fleet", "number": 42, "closed": True}})
+    assert handle_human(st["humans"], "drop", _code(text), 4.0, box) == "Dropped fleet#42."
+    assert box.calls == [("close_task", {"repo": "fleet", "number": 42})]
 
 
 def test_worst_case_human_announcement_fits_telegram():
