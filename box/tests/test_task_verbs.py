@@ -305,18 +305,21 @@ def test_human_verbs_refuse_bad_payloads(tmp_path):
     before = (home / "gh.json").read_text()
     h = '"' + run("list_human", home, shims, {})[1]["issues"][0]["hash"] + '"'  # valid, so only the number is wrong
     cases = []
+    bad_number = "number must be a positive integer"
     for n in BAD_NUMBERS:
-        cases.append(("answer_human", f'{{"repo": "fleet-fixture", "number": {n}, "hash": {h}, "text": "x"}}'))
-        cases.append(("take_human", f'{{"repo": "fleet-fixture", "number": {n}, "hash": {h}}}'))
-    cases += [("answer_human", f'{{"repo": "fleet-fixture", "number": 1, "hash": 5, "text": "x"}}'),
-              ("answer_human", f'{{"repo": "fleet-fixture", "number": 1, "hash": {h}, "text": 5}}'),
-              ("answer_human", f'{{"repo": "fleet-fixture", "number": 1, "hash": {h}}}'),
-              ("take_human", f'{{"repo": "fleet-fixture", "number": 1, "hash": 5}}'),
-              ("take_human", f'{{"repo": "fleet-fixture", "number": 1}}')]
-    for verb, raw in cases:
+        cases.append(("answer_human", f'{{"repo": "fleet-fixture", "number": {n}, "hash": {h}, "text": "x"}}', bad_number))
+        cases.append(("take_human", f'{{"repo": "fleet-fixture", "number": {n}, "hash": {h}}}', bad_number))
+    # The verbs' own type checks answer these, not tasklib's later refusals.
+    strings = "hash and text must be strings"
+    cases += [("answer_human", f'{{"repo": "fleet-fixture", "number": 1, "hash": 5, "text": "x"}}', strings),
+              ("answer_human", f'{{"repo": "fleet-fixture", "number": 1, "hash": {h}, "text": 5}}', strings),
+              ("answer_human", f'{{"repo": "fleet-fixture", "number": 1, "hash": {h}}}', strings),
+              ("take_human", f'{{"repo": "fleet-fixture", "number": 1, "hash": 5}}', "hash must be a string"),
+              ("take_human", f'{{"repo": "fleet-fixture", "number": 1}}', "hash must be a string")]
+    for verb, raw, want in cases:
         p = _run_raw(verb, home, shims, raw)
         assert p.returncode == 2, (verb, raw, p.stderr[-200:])
-        assert "error" in json.loads(p.stdout), (verb, raw)
+        assert json.loads(p.stdout) == {"error": want}, (verb, raw)
         assert (home / "gh.json").read_text() == before, (verb, raw)
         assert not (home / ".local/state/fleet/answers").exists(), (verb, raw)
 
