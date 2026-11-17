@@ -267,8 +267,23 @@ def _login(gh: Gh) -> str:
     return login
 
 
-def _human_rows(issues: list[dict], home: Path, escalations) -> list[dict]:
+def _own_bodies(comments, login: str) -> list[str]:
+    """The bodies of the comments the box's gh login wrote, in order. fleet writes its
+    escalations (and its agents their handoff packets) as that login; anyone else's
+    comment is not an escalation, even with fleet's marker in it, since any GitHub user
+    can comment on a public repository's issue. A comment whose author is missing or
+    unreadable is left out."""
+    out = []
+    for c in comments or []:
+        author = c.get("author") if isinstance(c, dict) else None
+        if isinstance(author, dict) and isinstance(author.get("login"), str) and author["login"] == login:
+            out.append(str(c.get("body", "")))
+    return out
+
+
+def _human_rows(issues: list[dict], home: Path, escalations, login: str) -> list[dict]:
     """The rows human() lists, and the freshness hash answer() and take() check against.
+    Only comments by `login` (the box's gh login) are read; see _own_bodies.
 
     The hash binds the title and the escalation the owner read (its index and text), so
     a newer escalation or a reworded one changes it. An issue with no escalation comment
@@ -279,7 +294,7 @@ def _human_rows(issues: list[dict], home: Path, escalations) -> list[dict]:
     per issue, so one unreadable issue does not change the hash of the others."""
     if not issues:
         return []
-    comments = {int(r["number"]): [c.get("body", "") for c in r.get("comments") or []] for r in issues}
+    comments = {int(r["number"]): _own_bodies(r.get("comments"), login) for r in issues}
     whole_note = None
     try:
         found = escalations(home, comments)
@@ -313,7 +328,7 @@ def human(gh: Gh, repo_slug: str, home: Path, escalations=fleet_escalations) -> 
     # Comments come from the same view call _fresh_human makes (gh issue list may cap
     # them per issue), so the listing hashes the comment set answer() rechecks.
     views = [_view_human(gh, repo_slug, r["number"]) for r in issues if _waiting(r, login)]
-    return _human_rows([v for v in views if _waiting(v, login)], home, escalations)
+    return _human_rows([v for v in views if _waiting(v, login)], home, escalations, login)
 
 
 def _waiting(row: dict, login: str) -> bool:
@@ -329,7 +344,8 @@ def _view_human(gh: Gh, repo_slug: str, number: int) -> dict:
     return row
 
 
-def _fresh_human(gh: Gh, repo_slug: str, number: int, want_hash: str, home: Path, escalations) -> dict:
+def _fresh_human(gh: Gh, repo_slug: str, number: int, want_hash: str, home: Path, escalations,
+                 login: str) -> dict:
     """Refuse unless the issue still waits on the owner with the escalation they read."""
     row = _view_human(gh, repo_slug, number)
     names = {x["name"] for x in row.get("labels", [])}
@@ -339,7 +355,7 @@ def _fresh_human(gh: Gh, repo_slug: str, number: int, want_hash: str, home: Path
         raise TaskError(f"#{number} is no longer waiting on the owner")
     if SOLO in names:
         raise TaskError(f"#{number} is solo work; it is not answered from here")
-    [fresh] = _human_rows([row], home, escalations)
+    [fresh] = _human_rows([row], home, escalations, login)
     if fresh["hash"] != want_hash:
         raise TaskError(f"#{number} changed since it was announced; wait for the new announcement")
     return fresh
@@ -389,7 +405,7 @@ def answer(gh: Gh, repo_slug: str, number: int, want_hash: str, text: str, home:
     text = text.strip() if isinstance(text, str) else ""
     if not 1 <= len(text) <= MAX_ANSWER:
         raise TaskError(f"an answer must be 1..{MAX_ANSWER} characters")
-    _fresh_human(gh, repo_slug, number, want_hash, home, escalations)
+    _fresh_human(gh, repo_slug, number, want_hash, home, escalations, _login(gh))
     path = answers_path(home, repo_slug, number)
     entries = _read_answers(path)
     entries.append({"text": text, "at": float(now)})
@@ -410,7 +426,7 @@ def take(gh: Gh, repo_slug: str, number: int, want_hash: str, escalations=fleet_
     """The owner's `take` reply: assigns the box's gh login, so human() stops listing the
     issue. fleet:human stays on it; the owner works it by hand."""
     home = Path.home() if home is None else Path(home)
-    fresh = _fresh_human(gh, repo_slug, number, want_hash, home, escalations)
     login = _login(gh)
+    fresh = _fresh_human(gh, repo_slug, number, want_hash, home, escalations, login)
     _ok(gh, ["issue", "edit", str(int(number)), "--repo", repo_slug, "--add-assignee", login])
     return {"number": int(number), "title": fresh["title"], "assignee": login}

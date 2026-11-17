@@ -197,7 +197,8 @@ def _add_human_issue(home, number=1, labels=("fleet:human", "area:docs"), esc=ES
     st["labels"] = sorted(set(st["labels"]) | {"fleet:human", "fleet:solo", "area:docs"} | {x for x in labels})
     st["issues"][str(number)] = {"number": number, "title": title, "body": "b", "state": "OPEN",
                                  "labels": [{"name": x} for x in labels],
-                                 "comments": [{"body": "escalation comment"}], "assignees": []}
+                                 "comments": [{"author": {"login": "fibon-box"}, "body": "escalation comment"}],
+                                 "assignees": []}
     json.dump(st, open(f, "w"))
     if esc is not None:
         e = home / "escalations.json"

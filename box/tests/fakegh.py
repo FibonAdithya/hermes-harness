@@ -7,7 +7,8 @@ SLUG = "FibonAdithya/fleet-fixture"
 class FakeGh:
     """Stands in for the gh CLI. Labels must exist before they are applied, as with real gh.
 
-    Comments and assignees have gh's --json shape: [{"body": ...}] and [{"login": ...}].
+    Comments and assignees have gh's --json shape: [{"author": {"login": ...}, "body": ...}]
+    and [{"login": ...}]; a comment posted through the fake is authored by the box login.
     `issue list` and `issue view` return only the fields named in --json, as gh does."""
 
     def __init__(self):
@@ -64,7 +65,8 @@ class FakeGh:
             rows = [i for i in self.issues.values() if i["state"] == "OPEN" and label in [x["name"] for x in i["labels"]]]
             return 0, json.dumps([_fields(i, args) for i in rows]), ""
         if cmd == ["issue", "comment"]:
-            self.issues[int(args[2])]["comments"].append({"body": args[args.index("--body") + 1]})
+            self.issues[int(args[2])]["comments"].append({"author": {"login": self.login},
+                                                          "body": args[args.index("--body") + 1]})
             return 0, "", ""
         if args == ["api", "user", "--jq", ".login"]:
             return 0, self.login + "\n", ""
