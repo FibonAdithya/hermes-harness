@@ -31,7 +31,7 @@ def test_file_issue_refuses_an_area_the_repo_does_not_have():
     assert gh.issues == {}
 
 
-@pytest.mark.parametrize("cls", ["bug", "", "PATCH"])
+@pytest.mark.parametrize("cls", ["chore", "", "PATCH"])
 def test_file_issue_refuses_an_unknown_class(cls):
     with pytest.raises(TaskError, match="class"):
         tasklib.file_issue(FakeGh(), SLUG, "t", "b", "docs", cls, frozenset({"docs"}), "source:hermes")
@@ -209,3 +209,288 @@ def test_fleet_areas_runs_fleet_without_syncing_and_without_the_target_on_sys_pa
     assert rec["argv"][:5] == ["run", "--no-sync", "--project", str(tmp_path / "home" / "TIG" / "fleet"), "python"]
     assert rec["argv"][5:7] == ["-P", "-c"] and "area_names" in rec["argv"][7]
     assert rec["cwd"] == str(target)
+
+
+# --- fleet:human: list, answer and take -------------------------------------------------
+
+ESC = {"index": 3, "reason": "needs a decision", "text": "Which port should the daemon use?"}
+
+
+def stub(found):
+    """An escalations stand-in: returns found.get(n) for each issue, and records what it was given."""
+    seen = []
+
+    def escalations(home, comments):
+        seen.append((home, comments))
+        return {n: found.get(n) for n in comments}
+    escalations.seen = seen
+    return escalations
+
+
+def broken(home, comments):
+    raise TaskError("cannot run uv: [Errno 2] No such file or directory: 'uv'")
+
+
+def _human_issue(gh, title="Pick a port", labels=("fleet:human", "area:docs", "class:patch"),
+                 comments=("first", "Escalation: which port?"), assignees=()):
+    for name in labels:
+        gh.labels.add(name)
+    n = len(gh.issues) + 1
+    gh.issues[n] = {"number": n, "title": title, "body": "b", "state": "OPEN",
+                    "labels": [{"name": x} for x in labels], "comments": [{"body": c} for c in comments],
+                    "assignees": [{"login": x} for x in assignees]}
+    return n
+
+
+def _hash(title="Pick a port", esc=ESC):
+    return tasklib.issue_hash(title, f"{esc['index']}\n{esc['text']}")
+
+
+def test_human_lists_escalated_issue(tmp_path):
+    gh = FakeGh()
+    n = _human_issue(gh)
+    esc = stub({n: dict(ESC)})
+    rows = tasklib.human(gh, SLUG, tmp_path, escalations=esc)
+    assert rows == [{"number": n, "title": "Pick a port", "labels": ["fleet:human", "area:docs", "class:patch"],
+                     "escalation": {"index": 3, "reason": "needs a decision", "text": "Which port should the daemon use?"},
+                     "note": None, "hash": tasklib.issue_hash("Pick a port", "3\nWhich port should the daemon use?")}]
+    assert esc.seen == [(tmp_path, {n: ["first", "Escalation: which port?"]})]
+    # One list call reads comments and assignees together.
+    [lst] = [c[0] for c in gh.calls if c[0][:2] == ("issue", "list")]
+    assert "number,title,labels,assignees,comments" in lst
+
+
+def test_human_skips_solo(tmp_path):
+    gh = FakeGh()
+    _human_issue(gh, labels=("fleet:human", "fleet:solo"))
+    keep = _human_issue(gh)
+    rows = tasklib.human(gh, SLUG, tmp_path, escalations=stub({}))
+    assert [r["number"] for r in rows] == [keep]
+
+
+def test_human_skips_taken(tmp_path):
+    gh = FakeGh()
+    _human_issue(gh, assignees=(gh.login,))
+    other = _human_issue(gh, assignees=("someone-else",))
+    free = _human_issue(gh)
+    rows = tasklib.human(gh, SLUG, tmp_path, escalations=stub({}))
+    assert [r["number"] for r in rows] == [other, free]
+
+
+def test_human_lists_issue_when_escalation_unreadable(tmp_path):
+    gh = FakeGh()
+    n = _human_issue(gh)
+    [row] = tasklib.human(gh, SLUG, tmp_path, escalations=broken)
+    assert row["number"] == n and row["escalation"] is None
+    assert row["hash"] == tasklib.issue_hash("Pick a port", "-1\n")
+    assert "escalation text unavailable" in row["note"] and "cannot run uv" in row["note"]
+
+
+def test_human_row_without_an_escalation_comment_uses_the_fallback_hash(tmp_path):
+    gh = FakeGh()
+    _human_issue(gh)
+    [row] = tasklib.human(gh, SLUG, tmp_path, escalations=stub({}))
+    assert row["escalation"] is None and row["hash"] == tasklib.issue_hash("Pick a port", "-1\n")
+
+
+def _answers(tmp_path, n=1):
+    owner, name = SLUG.split("/")
+    return tmp_path / ".local/state/fleet/answers" / f"{owner}__{name}" / f"{n}.json"
+
+
+def test_answer_writes_file_comment_and_labels(tmp_path):
+    import json
+    gh = FakeGh()
+    n = _human_issue(gh)
+    out = tasklib.answer(gh, SLUG, n, _hash(), "  Use 8080.  ", tmp_path, 1700000000.5,
+                         escalations=stub({n: dict(ESC)}))
+    assert out == {"number": n, "answers": 1}
+    f = _answers(tmp_path, n)
+    assert json.loads(f.read_text()) == [{"text": "Use 8080.", "at": 1700000000.5}]
+    assert f.stat().st_mode & 0o777 == 0o600
+    assert [c["body"] for c in gh.issues[n]["comments"]][-1] == "Owner's answer (from Telegram):\n\n" + "Use 8080."
+    assert {"fleet:ready", "fleet:answered-1"} <= names(gh, n) and "fleet:human" not in names(gh, n)
+    edits = [c[0] for c in gh.calls if c[0][:2] == ("issue", "edit")]
+    assert len(edits) == 2 and "--add-label" in edits[0] and "--remove-label" in edits[1]  # add before remove
+    assert set(edits[0][edits[0].index("--add-label") + 1].split(",")) == {"fleet:answered-1", "fleet:ready"}
+    assert edits[1][edits[1].index("--remove-label") + 1] == "fleet:human"
+    assert list(f.parent.iterdir()) == [f]  # no temp file left behind
+
+
+def test_second_answer_is_answered_2(tmp_path):
+    import json
+    gh = FakeGh()
+    n = _human_issue(gh)
+    tasklib.answer(gh, SLUG, n, _hash(), "first", tmp_path, 1.0, escalations=stub({n: dict(ESC)}))
+    gh.issues[n]["labels"].append({"name": "fleet:human"})
+    newer = {"index": 7, "reason": "again", "text": "And the host?"}
+    out = tasklib.answer(gh, SLUG, n, _hash(esc=newer), "second", tmp_path, 2.0, escalations=stub({n: newer}))
+    assert out == {"number": n, "answers": 2}
+    assert json.loads(_answers(tmp_path, n).read_text()) == [{"text": "first", "at": 1.0}, {"text": "second", "at": 2.0}]
+    assert {"fleet:answered-1", "fleet:answered-2", "fleet:ready"} <= names(gh, n)
+
+
+def _no_writes(gh, tmp_path, n=1):
+    assert not _answers(tmp_path, n).exists()
+    assert not [c for c in gh.calls if c[0][:2] in (("issue", "edit"), ("issue", "comment"))]
+
+
+def test_answer_refuses_changed_escalation(tmp_path):
+    gh = FakeGh()
+    n = _human_issue(gh)
+    old = _hash()
+    newer = dict(ESC, index=4)  # a newer escalation, same words
+    with pytest.raises(TaskError, match="changed since it was announced"):
+        tasklib.answer(gh, SLUG, n, old, "x", tmp_path, 1.0, escalations=stub({n: newer}))
+    reworded = dict(ESC, text="Which host?")
+    with pytest.raises(TaskError, match="changed since it was announced"):
+        tasklib.answer(gh, SLUG, n, old, "x", tmp_path, 1.0, escalations=stub({n: reworded}))
+    gh.issues[n]["title"] = "Pick a port and host"
+    with pytest.raises(TaskError, match="changed since it was announced"):
+        tasklib.answer(gh, SLUG, n, old, "x", tmp_path, 1.0, escalations=stub({n: dict(ESC)}))
+    _no_writes(gh, tmp_path, n)
+
+
+def test_answer_hash_uses_the_unreadable_fallback(tmp_path):
+    """Announced while fleet's helper was broken: the hash is the fallback one, and a
+    working helper at answer time means the owner has not seen the text, so it is refused."""
+    gh = FakeGh()
+    n = _human_issue(gh)
+    [row] = tasklib.human(gh, SLUG, tmp_path, escalations=broken)
+    with pytest.raises(TaskError, match="changed since it was announced"):
+        tasklib.answer(gh, SLUG, n, row["hash"], "x", tmp_path, 1.0, escalations=stub({n: dict(ESC)}))
+    out = tasklib.answer(gh, SLUG, n, row["hash"], "x", tmp_path, 1.0, escalations=broken)
+    assert out == {"number": n, "answers": 1}
+
+
+def test_answer_refuses_solo(tmp_path):
+    gh = FakeGh()
+    n = _human_issue(gh, labels=("fleet:human", "fleet:solo"))
+    with pytest.raises(TaskError, match="solo"):
+        tasklib.answer(gh, SLUG, n, _hash(), "x", tmp_path, 1.0, escalations=stub({n: dict(ESC)}))
+    _no_writes(gh, tmp_path, n)
+
+
+def test_answer_refuses_issue_left_human(tmp_path):
+    gh = FakeGh()
+    n = _human_issue(gh, labels=("fleet:ready", "area:docs"))
+    with pytest.raises(TaskError, match="no longer waiting"):
+        tasklib.answer(gh, SLUG, n, _hash(), "x", tmp_path, 1.0, escalations=stub({n: dict(ESC)}))
+    _no_writes(gh, tmp_path, n)
+
+
+def test_answer_refuses_closed_issue(tmp_path):
+    gh = FakeGh()
+    n = _human_issue(gh)
+    gh.issues[n]["state"] = "CLOSED"
+    with pytest.raises(TaskError, match="closed"):
+        tasklib.answer(gh, SLUG, n, _hash(), "x", tmp_path, 1.0, escalations=stub({n: dict(ESC)}))
+    _no_writes(gh, tmp_path, n)
+
+
+@pytest.mark.parametrize("text", ["", "   ", "x" * 2001, " " + "x" * 2001 + " "],
+                         ids=["empty", "blank", "2001", "2001-padded"])
+def test_answer_text_bounds_refused(tmp_path, text):
+    gh = FakeGh()
+    n = _human_issue(gh)
+    with pytest.raises(TaskError, match="1..2000"):
+        tasklib.answer(gh, SLUG, n, _hash(), text, tmp_path, 1.0, escalations=stub({n: dict(ESC)}))
+    _no_writes(gh, tmp_path, n)
+
+
+@pytest.mark.parametrize("text", ["x", "x" * 2000, "  " + "x" * 2000 + "\n"], ids=["1", "2000", "2000-padded"])
+def test_answer_text_bounds_accepted(tmp_path, text):
+    import json
+    gh = FakeGh()
+    n = _human_issue(gh)
+    tasklib.answer(gh, SLUG, n, _hash(), text, tmp_path, 1.0, escalations=stub({n: dict(ESC)}))
+    assert json.loads(_answers(tmp_path, n).read_text()) == [{"text": text.strip(), "at": 1.0}]
+
+
+def test_answer_refuses_to_overwrite_a_malformed_answers_file(tmp_path):
+    gh = FakeGh()
+    n = _human_issue(gh)
+    f = _answers(tmp_path, n)
+    f.parent.mkdir(parents=True)
+    f.write_text("{not json")
+    with pytest.raises(TaskError, match="answers file"):
+        tasklib.answer(gh, SLUG, n, _hash(), "x", tmp_path, 1.0, escalations=stub({n: dict(ESC)}))
+    assert f.read_text() == "{not json"
+    assert not [c for c in gh.calls if c[0][:2] in (("issue", "edit"), ("issue", "comment"))]
+
+
+def test_take_assigns_login(tmp_path):
+    gh = FakeGh()
+    n = _human_issue(gh)
+    out = tasklib.take(gh, SLUG, n, _hash(), escalations=stub({n: dict(ESC)}), home=tmp_path)
+    assert out["number"] == n
+    assert [a["login"] for a in gh.issues[n]["assignees"]] == [gh.login]
+    assert "fleet:human" in names(gh, n)
+    assert tasklib.human(gh, SLUG, tmp_path, escalations=stub({n: dict(ESC)})) == []
+    assert not _answers(tmp_path, n).exists()
+
+
+def test_take_refuses_what_answer_refuses(tmp_path):
+    gh = FakeGh()
+    n = _human_issue(gh)
+    with pytest.raises(TaskError, match="changed since it was announced"):
+        tasklib.take(gh, SLUG, n, _hash(), escalations=stub({n: dict(ESC, index=9)}), home=tmp_path)
+    gh.issues[n]["labels"].append({"name": "fleet:solo"})
+    with pytest.raises(TaskError, match="solo"):
+        tasklib.take(gh, SLUG, n, _hash(), escalations=stub({n: dict(ESC)}), home=tmp_path)
+    gh.issues[n]["labels"] = [{"name": "fleet:ready"}]
+    with pytest.raises(TaskError, match="no longer waiting"):
+        tasklib.take(gh, SLUG, n, _hash(), escalations=stub({n: dict(ESC)}), home=tmp_path)
+    gh.issues[n]["state"] = "CLOSED"
+    with pytest.raises(TaskError, match="closed"):
+        tasklib.take(gh, SLUG, n, _hash(), escalations=stub({n: dict(ESC)}), home=tmp_path)
+    assert gh.issues[n]["assignees"] == []
+    assert not [c for c in gh.calls if c[0][:2] == ("issue", "edit")]
+
+
+def test_classes_match_fleet():
+    assert tasklib.CLASSES == ("patch", "spec", "investigation", "integration", "build", "bug")
+
+
+def _fake_uv(tmp_path, monkeypatch, script):
+    import os
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    (bin_ / "uv").write_text("#!/usr/bin/env python3\n" + script)
+    (bin_ / "uv").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_}:{os.environ['PATH']}")
+
+
+def test_fleet_escalations_reads_stdin_and_int_keys(tmp_path, monkeypatch):
+    import json
+    log = tmp_path / "uv.json"
+    _fake_uv(tmp_path, monkeypatch,
+             "import json, sys\n"
+             "d = json.load(sys.stdin)\n"
+             f"json.dump({{'argv': sys.argv[1:], 'stdin': d}}, open({str(log)!r}, 'w'))\n"
+             "print('noise from uv')\n"
+             "print(json.dumps({k: ({'index': len(v), 'reason': 'r', 'text': v[-1]} if v else None) for k, v in d.items()}))\n")
+    out = tasklib.fleet_escalations(tmp_path / "home", {4: ["a", "b"], 9: []})
+    assert out == {4: {"index": 2, "reason": "r", "text": "b"}, 9: None}
+    rec = json.loads(log.read_text())
+    assert rec["stdin"] == {"4": ["a", "b"], "9": []}
+    assert rec["argv"][:5] == ["run", "--no-sync", "--project", str(tmp_path / "home" / "TIG" / "fleet"), "python"]
+    assert rec["argv"][5:7] == ["-P", "-c"] and "fleet.escalation" in rec["argv"][7] and "latest" in rec["argv"][7]
+
+
+@pytest.mark.parametrize("script", ["import sys\nsys.stderr.write('ModuleNotFoundError: fleet.escalation')\nsys.exit(1)\n",
+                                    "print('not json')\n",
+                                    "print('[1, 2]')\n",
+                                    "print('{\"4\": {\"index\": \"x\"}}')\n",
+                                    "print('{}')\n"],
+                         ids=["exit-1", "not-json", "not-object", "bad-row", "missing-issue"])
+def test_fleet_escalations_raises_on_failure(tmp_path, monkeypatch, script):
+    _fake_uv(tmp_path, monkeypatch, "import sys; sys.stdin.read()\n" + script)
+    with pytest.raises(TaskError):
+        tasklib.fleet_escalations(tmp_path / "home", {4: ["a"]})
+
+
+def test_fleet_escalations_raises_when_uv_is_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    with pytest.raises(TaskError, match="cannot run uv"):
+        tasklib.fleet_escalations(tmp_path / "home", {4: ["a"]})

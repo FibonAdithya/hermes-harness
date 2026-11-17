@@ -5,9 +5,12 @@ SLUG = "FibonAdithya/fleet-fixture"
 
 
 class FakeGh:
-    """Stands in for the gh CLI. Labels must exist before they are applied, as with real gh."""
+    """Stands in for the gh CLI. Labels must exist before they are applied, as with real gh.
+
+    Comments and assignees have gh's --json shape: [{"body": ...}] and [{"login": ...}]."""
 
     def __init__(self):
+        self.login = "fibon-box"
         self.labels = {"fleet:triage", "fleet:ready", "fleet:auto-ok", "fleet:human", "area:docs", "class:patch"}
         self.issues = {}
         self.calls = []
@@ -28,7 +31,7 @@ class FakeGh:
             n = len(self.issues) + 1
             title = args[args.index("--title") + 1]
             self.issues[n] = {"number": n, "title": title, "body": stdin, "state": "OPEN",
-                              "labels": [{"name": x} for x in names], "comments": []}
+                              "labels": [{"name": x} for x in names], "comments": [], "assignees": []}
             return 0, f"https://github.com/{SLUG}/issues/{n}\n", ""
         if cmd == ["issue", "view"]:
             i = self.issues.get(int(args[2]))
@@ -44,6 +47,13 @@ class FakeGh:
             if "--remove-label" in args:
                 gone = set(args[args.index("--remove-label") + 1].split(","))
                 i["labels"] = [x for x in i["labels"] if x["name"] not in gone]
+            if "--add-assignee" in args:
+                for n in args[args.index("--add-assignee") + 1].split(","):
+                    if n not in [x["login"] for x in i["assignees"]]:
+                        i["assignees"].append({"login": n})
+            if "--remove-assignee" in args:
+                gone = set(args[args.index("--remove-assignee") + 1].split(","))
+                i["assignees"] = [x for x in i["assignees"] if x["login"] not in gone]
             return 0, "", ""
         if cmd == ["issue", "close"]:
             self.issues[int(args[2])]["state"] = "CLOSED"
@@ -53,6 +63,8 @@ class FakeGh:
             rows = [i for i in self.issues.values() if i["state"] == "OPEN" and label in [x["name"] for x in i["labels"]]]
             return 0, json.dumps(rows), ""
         if cmd == ["issue", "comment"]:
-            self.issues[int(args[2])]["comments"].append(args[args.index("--body") + 1])
+            self.issues[int(args[2])]["comments"].append({"body": args[args.index("--body") + 1]})
             return 0, "", ""
+        if args == ["api", "user", "--jq", ".login"]:
+            return 0, self.login + "\n", ""
         raise AssertionError(f"unexpected gh call {args}")
