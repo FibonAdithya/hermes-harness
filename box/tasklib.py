@@ -35,6 +35,10 @@ MAX_TITLE, MAX_BODY = 200, 3500
 ANSWERS_DIR = Path(".local/state/fleet/answers")
 MAX_ANSWER = 2000
 ANSWER_HEADER = "Owner's answer (from Telegram):\n\n"
+# fleet (herdr_executor._ANSWERS_MAX_BYTES) and chain (fleetmode.MAX_ANSWERS_BYTES) refuse
+# to read an answers file larger than this, so answer() never writes one.
+ANSWERS_MAX_BYTES = 65536
+ANSWERED = "fleet:answered-"
 
 
 class TaskError(ValueError):
@@ -368,6 +372,15 @@ def answers_path(home: Path, repo_slug: str, number: int) -> Path:
     return Path(home) / ANSWERS_DIR / f"{owner}__{name}" / f"{int(number)}.json"
 
 
+def _read_raw(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise TaskError(f"cannot read the answers file {path}: {exc}") from exc
+
+
 def _read_answers(path: Path) -> list[dict]:
     try:
         text = path.read_text()
@@ -384,13 +397,18 @@ def _read_answers(path: Path) -> list[dict]:
     return entries
 
 
-def _write_answers(path: Path, entries: list[dict]) -> None:
+def _answers_bytes(entries: list[dict]) -> bytes:
+    """The answers file as written. ASCII-escaped: lossless for any str, a lone surrogate
+    from the broker's JSON included, so the size measured here is the size on disk."""
+    return (json.dumps(entries, indent=1) + "\n").encode("ascii")
+
+
+def _write_answers(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
-        with os.fdopen(fd, "w") as f:  # mkstemp creates it mode 600
-            json.dump(entries, f, indent=1)
-            f.write("\n")
+        with os.fdopen(fd, "wb") as f:  # mkstemp creates it mode 600
+            f.write(data)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
@@ -399,26 +417,93 @@ def _write_answers(path: Path, entries: list[dict]) -> None:
         raise
 
 
+def _answered(labels: list[str]) -> int:
+    """The highest N among fleet:answered-N labels, as fleet's ledger reads it (0 if none)."""
+    found = [int(x[len(ANSWERED):]) for x in labels
+             if x.startswith(ANSWERED) and x[len(ANSWERED):].isascii() and x[len(ANSWERED):].isdecimal()]
+    return max(found, default=0)
+
+
+def _edit(gh: Gh, repo_slug: str, number: int, flag: str, names: list[str]) -> tuple[int, str, str]:
+    return gh(["issue", "edit", str(int(number)), "--repo", repo_slug, flag, ",".join(names)], None)
+
+
+def _undo_answer(gh: Gh, repo_slug: str, number: int, path: Path, before: bytes | None,
+                 added: list[str]) -> list[str]:
+    """Put the answers file and labels back as answer() found them. Returns what could
+    not be put back. fleet:human is re-added before the added labels go, so a remove
+    that GitHub applied but did not confirm never leaves the issue in no fleet state."""
+    left = []
+    try:
+        if before is None:
+            path.unlink(missing_ok=True)
+        else:
+            _write_answers(path, before)
+    except OSError as exc:
+        left.append(f"the answers file {path} still holds this answer ({exc}); remove its last entry by hand")
+    rc, _, err = _edit(gh, repo_slug, number, "--add-label", [HUMAN])
+    if rc != 0:
+        left.append(f"fleet:human could not be put back ({err.strip()[:200]}), so {', '.join(added)} "
+                    f"stay on the issue; fix its labels by hand")
+    elif added:
+        rc, _, err = _edit(gh, repo_slug, number, "--remove-label", added)
+        if rc != 0:
+            left.append(f"{', '.join(added)} are still on the issue ({err.strip()[:200]}); remove them by hand")
+    return left
+
+
 def answer(gh: Gh, repo_slug: str, number: int, want_hash: str, text: str, home: Path, now: float,
            escalations=fleet_escalations) -> dict:
-    """The owner's `answer` reply: records it for fleet and sends the issue back to ready."""
+    """The owner's `answer` reply: records it for fleet and sends the issue back to ready.
+
+    All or nothing as the owner sees it: a refusal leaves the answers file and labels as
+    they were, so a retry is not counted twice. N in fleet:answered-N is one past the
+    highest such label (what fleet reads), not the number of entries in the file.
+
+    Order: add fleet:answered-N and fleet:ready, write the file, remove fleet:human, then
+    post the record comment. Until the remove, the issue carries fleet:human and
+    fleet:ready together, which fleet's ledger refuses loudly instead of acting on, and
+    any failure is rolled back. If the process is killed instead, the window that leaves
+    a stray answer in the file is the one gh call between the file write and the remove;
+    a kill after the label add costs at most one extra fleet:answered label. The other
+    order, the file last, would let fleet act on fleet:ready with raised caps and no
+    answer text, or lose the text silently, so the file is written before the remove.
+    The comment is only the record on GitHub; it comes after the answer took effect, so
+    its failure is returned as a warning rather than told to the owner as a failure."""
     text = text.strip() if isinstance(text, str) else ""
     if not 1 <= len(text) <= MAX_ANSWER:
         raise TaskError(f"an answer must be 1..{MAX_ANSWER} characters")
-    _fresh_human(gh, repo_slug, number, want_hash, home, escalations, _login(gh))
+    fresh = _fresh_human(gh, repo_slug, number, want_hash, home, escalations, _login(gh))
     path = answers_path(home, repo_slug, number)
+    before = _read_raw(path)
     entries = _read_answers(path)
     entries.append({"text": text, "at": float(now)})
-    _write_answers(path, entries)
-    comment(gh, repo_slug, number, ANSWER_HEADER + text)
+    data = _answers_bytes(entries)
+    if len(data) > ANSWERS_MAX_BYTES:
+        raise TaskError(f"nothing was recorded: with this answer the answers file would be {len(data)} bytes, "
+                        f"over the {ANSWERS_MAX_BYTES} fleet and chain read ({len(before or b'')} used; "
+                        f"a non-ASCII character takes 6 or 12). Send a shorter answer, or take the issue")
     # fleet reads the highest fleet:answered-N; earlier ones stay on the issue.
-    add = (f"fleet:answered-{len(entries)}", READY)
+    add = [f"{ANSWERED}{_answered(fresh['labels']) + 1}", READY]
     for name in add:
         ensure_label(gh, repo_slug, name)
-    # Add before remove, as approve() does.
-    _ok(gh, ["issue", "edit", str(int(number)), "--repo", repo_slug, "--add-label", ",".join(add)])
-    _ok(gh, ["issue", "edit", str(int(number)), "--repo", repo_slug, "--remove-label", HUMAN])
-    return {"number": int(number), "answers": len(entries)}
+    added = [x for x in add if x not in fresh["labels"]]
+    try:
+        # Add before remove, as approve() does.
+        _ok(gh, ["issue", "edit", str(int(number)), "--repo", repo_slug, "--add-label", ",".join(add)])
+        _write_answers(path, data)
+        _ok(gh, ["issue", "edit", str(int(number)), "--repo", repo_slug, "--remove-label", HUMAN])
+    except (TaskError, OSError) as exc:
+        left = _undo_answer(gh, repo_slug, number, path, before, added)
+        if left:
+            raise TaskError(f"{exc}; undoing it failed: {'; '.join(left)}") from exc
+        raise TaskError(f"{exc}; nothing was recorded") from exc
+    out = {"number": int(number), "answers": len(entries)}
+    try:
+        comment(gh, repo_slug, number, ANSWER_HEADER + text)
+    except TaskError as exc:
+        out["warning"] = f"the answer is recorded, but the record comment on GitHub failed: {exc}"
+    return out
 
 
 def take(gh: Gh, repo_slug: str, number: int, want_hash: str, escalations=fleet_escalations,

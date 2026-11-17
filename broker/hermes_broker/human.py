@@ -67,7 +67,8 @@ def handle_human(humans: TaskStore, verb: str, arg: str, now: float, call: Call)
                                   "text": text}, 120)
         if "error" in r:
             return f"{ref}: {r['error']}\n{again}"
-        return f"{ref}: answer recorded; the issue is back in fleet:ready for the next fleet night."
+        done = f"{ref}: answer recorded; the issue is back in fleet:ready for the next fleet night."
+        return f"{done}\n{r['warning']}" if isinstance(r.get("warning"), str) else done
     if verb == "take":
         r = call("take_human", {"repo": entry["repo"], "number": entry["number"], "hash": entry["hash"]}, 120)
         if "error" in r:

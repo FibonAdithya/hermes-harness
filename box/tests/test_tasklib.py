@@ -680,3 +680,166 @@ def test_answer_and_take_ignore_a_strangers_comment_posted_after_listing(tmp_pat
     gh.issues[n]["assignees"] = []
     assert tasklib.answer(gh, SLUG, n, row["hash"], "postgres", tmp_path, 1.0,
                           escalations=marker_latest) == {"number": n, "answers": 1}
+
+
+# --- answer(): all or nothing, as the owner sees it -------------------------------------
+
+def failing(gh, when, apply=False):
+    """gh, except that calls matching `when` fail. apply=True first lets the call take
+    effect, as when GitHub applies an edit but the reply is lost."""
+    def run(args, stdin=None):
+        if when(args):
+            if apply:
+                gh(args, stdin)
+            else:
+                gh.calls.append((tuple(args), stdin))
+            return 1, "", "HTTP 502"
+        return gh(args, stdin)
+    return run
+
+
+def adds_answered(args):
+    return args[:2] == ["issue", "edit"] and "--add-label" in args and "fleet:ready" in args[args.index("--add-label") + 1]
+
+
+def removes_human(args):
+    return args[:2] == ["issue", "edit"] and "--remove-label" in args and args[args.index("--remove-label") + 1] == "fleet:human"
+
+
+def removes_any(args):
+    return args[:2] == ["issue", "edit"] and "--remove-label" in args
+
+
+@pytest.mark.parametrize("when", [adds_answered, removes_human], ids=["add-labels", "remove-human"])
+@pytest.mark.parametrize("earlier", [None, [{"text": "old", "at": 0.5}]], ids=["no-file", "earlier-answer"])
+def test_answer_that_fails_on_github_records_nothing(tmp_path, when, earlier):
+    """A refused answer leaves the answers file and labels as they were, so the retry is
+    answered-1 with only the retry's text: fleet raises its caps once, and the agent never
+    reads a text the owner was told failed."""
+    gh = FakeGh()
+    n = _human_issue(gh)
+    f = _answers(tmp_path, n)
+    if earlier is not None:
+        f.parent.mkdir(parents=True)
+        f.write_text(json.dumps(earlier))
+    before = f.read_bytes() if earlier is not None else None
+    labels_before = names(gh, n)
+    with pytest.raises(TaskError, match="nothing was recorded"):
+        tasklib.answer(failing(gh, when), SLUG, n, _hash(), "use postgres", tmp_path, 1.0,
+                       escalations=stub({n: dict(ESC)}))
+    assert names(gh, n) == labels_before
+    assert (f.read_bytes() if f.exists() else None) == before
+    assert (list(f.parent.iterdir()) if f.parent.exists() else []) == ([f] if earlier is not None else [])  # no temp file
+    assert not [c for c in gh.issues[n]["comments"] if c["body"].startswith(tasklib.ANSWER_HEADER)]
+    out = tasklib.answer(gh, SLUG, n, _hash(), "use sqlite", tmp_path, 2.0, escalations=stub({n: dict(ESC)}))
+    assert out == {"number": n, "answers": len(earlier or []) + 1}
+    assert json.loads(f.read_text()) == (earlier or []) + [{"text": "use sqlite", "at": 2.0}]
+    assert {x for x in names(gh, n) if x.startswith("fleet:answered-")} == {"fleet:answered-1"}
+
+
+def test_answer_rollback_puts_fleet_human_back_first(tmp_path):
+    """GitHub applied the remove but the reply was lost. Rolling back must not leave the
+    issue in no fleet state (fleet reads that as triage and forgets it)."""
+    gh = FakeGh()
+    n = _human_issue(gh)
+    with pytest.raises(TaskError, match="nothing was recorded"):
+        tasklib.answer(failing(gh, removes_human, apply=True), SLUG, n, _hash(), "x", tmp_path, 1.0,
+                       escalations=stub({n: dict(ESC)}))
+    assert names(gh, n) == {"fleet:human", "area:docs", "class:patch"}
+    assert not _answers(tmp_path, n).exists()
+
+
+def test_answer_says_what_a_failed_rollback_left(tmp_path):
+    gh = FakeGh()
+    n = _human_issue(gh)
+    with pytest.raises(TaskError) as exc:
+        tasklib.answer(failing(gh, removes_any), SLUG, n, _hash(), "x", tmp_path, 1.0,
+                       escalations=stub({n: dict(ESC)}))
+    msg = str(exc.value)
+    assert "nothing was recorded" not in msg
+    assert "fleet:answered-1" in msg and "fleet:ready" in msg and "by hand" in msg
+    assert not _answers(tmp_path, n).exists()
+
+
+def test_answer_whose_record_comment_fails_is_still_recorded(tmp_path):
+    """The comment is only the record on GitHub and comes after the answer took effect, so
+    its failure is a warning; the owner is not told an answer failed that fleet will use."""
+    gh = FakeGh()
+    n = _human_issue(gh)
+    out = tasklib.answer(failing(gh, lambda a: a[:2] == ["issue", "comment"]), SLUG, n, _hash(), "x",
+                         tmp_path, 1.0, escalations=stub({n: dict(ESC)}))
+    assert out["number"] == n and out["answers"] == 1 and "record comment" in out["warning"]
+    assert json.loads(_answers(tmp_path, n).read_text()) == [{"text": "x", "at": 1.0}]
+    assert {"fleet:answered-1", "fleet:ready"} <= names(gh, n) and "fleet:human" not in names(gh, n)
+
+
+@pytest.mark.parametrize("have, want", [
+    (("fleet:answered-1", "fleet:answered-2"), "fleet:answered-3"),
+    (("fleet:answered-9", "fleet:answered-10"), "fleet:answered-11"),
+    (("fleet:answered-2", "fleet:answered-x", "fleet:answered-"), "fleet:answered-3"),
+])
+def test_answer_label_is_one_past_the_highest_answered_label(tmp_path, have, want):
+    """fleet reads the highest fleet:answered-N, so N follows the labels, not the answers
+    file (here missing, e.g. a wiped state directory)."""
+    gh = FakeGh()
+    n = _human_issue(gh, labels=("fleet:human", "area:docs", *have))
+    out = tasklib.answer(gh, SLUG, n, _hash(), "x", tmp_path, 1.0, escalations=stub({n: dict(ESC)}))
+    assert out == {"number": n, "answers": 1}
+    assert want in names(gh, n)
+    assert {x for x in names(gh, n) if x.startswith("fleet:answered-")} == {*have, want}
+
+
+def _fill_answers(tmp_path, n, total):
+    """An answers file holding one earlier answer, sized so that adding the answer "x" at
+    1.0 makes the file exactly `total` bytes."""
+    base = len((json.dumps([{"text": "", "at": 0.5}, {"text": "x", "at": 1.0}], indent=1) + "\n").encode())
+    f = _answers(tmp_path, n)
+    f.parent.mkdir(parents=True)
+    f.write_text(json.dumps([{"text": "a" * (total - base), "at": 0.5}]))
+    return f
+
+
+def test_answer_fills_the_answers_file_to_the_limit(tmp_path):
+    gh = FakeGh()
+    n = _human_issue(gh)
+    f = _fill_answers(tmp_path, n, tasklib.ANSWERS_MAX_BYTES)
+    tasklib.answer(gh, SLUG, n, _hash(), "x", tmp_path, 1.0, escalations=stub({n: dict(ESC)}))
+    assert f.stat().st_size == tasklib.ANSWERS_MAX_BYTES == 65536
+
+
+def test_answer_refuses_past_the_answers_file_limit(tmp_path):
+    """fleet and chain refuse to read an answers file over 65536 bytes; an answer that
+    would pass it is refused before anything is written."""
+    gh = FakeGh()
+    n = _human_issue(gh)
+    f = _fill_answers(tmp_path, n, tasklib.ANSWERS_MAX_BYTES + 1)
+    before = f.read_bytes()
+    with pytest.raises(TaskError, match="65536"):
+        tasklib.answer(gh, SLUG, n, _hash(), "x", tmp_path, 1.0, escalations=stub({n: dict(ESC)}))
+    assert f.read_bytes() == before
+    assert not [c for c in gh.calls if c[0][:2] in (("issue", "edit"), ("issue", "comment"), ("label", "create"))]
+
+
+def test_answer_counts_escaped_bytes_against_the_limit(tmp_path):
+    """The file is written ASCII-escaped (a CJK character is 6 bytes), and that is what
+    the limit is measured on."""
+    gh = FakeGh()
+    n = _human_issue(gh)
+    for i in range(5):
+        h = _hash()
+        tasklib.answer(gh, SLUG, n, h, "答" * 2000, tmp_path, float(i), escalations=stub({n: dict(ESC)}))
+        gh.issues[n]["labels"].append({"name": "fleet:human"})
+    f = _answers(tmp_path, n)
+    assert f.read_bytes().isascii() and f.stat().st_size <= 65536
+    with pytest.raises(TaskError, match="65536"):
+        tasklib.answer(gh, SLUG, n, _hash(), "答" * 2000, tmp_path, 9.0, escalations=stub({n: dict(ESC)}))
+    assert len(json.loads(f.read_text())) == 5
+
+
+def test_answer_rollback_keeps_labels_the_issue_already_had(tmp_path):
+    gh = FakeGh()
+    n = _human_issue(gh, labels=("fleet:human", "fleet:ready", "area:docs"))
+    with pytest.raises(TaskError, match="nothing was recorded"):
+        tasklib.answer(failing(gh, removes_human), SLUG, n, _hash(), "x", tmp_path, 1.0,
+                       escalations=stub({n: dict(ESC)}))
+    assert names(gh, n) == {"fleet:human", "fleet:ready", "area:docs"}

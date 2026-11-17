@@ -314,28 +314,39 @@ ssh tig-adi 'systemctl --user stop night-<id>.service'                         #
   `fleet.toml`), checked every 5 minutes. Not announced: issues that also carry `fleet:solo` (those are `run_task`
   work), and issues assigned to the box's gh login (`take`, below).
 - One message per issue and escalation. A new escalation on the same issue gets a new message and a new code.
+  Only comments by the box's gh login count as escalations (fleet and its agents comment as that login); a comment
+  by anyone else, or with no readable author, is ignored even if it carries fleet's marker, since anyone can comment
+  on a public repository's issue.
   Codes are four digits, valid 7 days, and unique across grants, triage tasks, tool proposals and these.
 - Message shape: `fleet:human  <repo>#<number>  <title>`, the escalation text (trimmed at the same length as a triage
   body, ending `[… trimmed; read it on GitHub]` when cut), a separator line, then `code NNNN` and `answer NNNN <your text> | drop NNNN | take NNNN`. Only the lines
   after the separator are instructions.
 - Replies, in the approvals chat only (owner, private chat, not forwarded):
-  - `answer NNNN <text>` — text is 1 to 2000 characters, newlines allowed. The box appends `{"text", "at"}` to
-    `~/.local/state/fleet/answers/<owner>__<name>/<number>.json` (a JSON list, mode 600), comments
-    "Owner's answer (from Telegram):" with the text, adds `fleet:answered-N` (N is the number of answers so far) and
-    `fleet:ready`, then removes `fleet:human`. Reply: `<repo>#<n>: answer recorded; the issue is back in fleet:ready
-    for the next fleet night.` fleet's next dispatch carries the answers, and each answer raises that task's attempt,
-    fix-pass and rebase caps (fleet's behaviour, not checked in this repository).
+  - `answer NNNN <text>` — text is 1 to 2000 characters, newlines allowed. The box adds `fleet:answered-N` (N is one
+    past the highest `fleet:answered-*` label on the issue, which is what fleet reads) and `fleet:ready`, appends
+    `{"text", "at"}` to `~/.local/state/fleet/answers/<owner>__<name>/<number>.json` (a JSON list, ASCII-escaped,
+    mode 600, at most 65536 bytes: fleet and chain refuse to read a larger one), removes `fleet:human`, then
+    comments "Owner's answer (from Telegram):" with the text. If a GitHub call fails before `fleet:human` is
+    removed, the box puts the file and labels back and replies `...; nothing was recorded`; a retry is then counted
+    once. If putting them back fails too, the reply says what is left (`undoing it failed: ...`); fix those labels or
+    the file by hand. Reply: `<repo>#<n>: answer recorded; the issue is back in fleet:ready for the next fleet
+    night.`, with a second line `the answer is recorded, but the record comment on GitHub failed: ...` when only the
+    comment failed. fleet's next dispatch carries the answers, and each answer raises that task's attempt, fix-pass
+    and rebase caps (fleet's behaviour, not checked in this repository).
   - `drop NNNN` — closes the issue and adds `fleet:dropped`. Reply: `Dropped <repo>#<n>.` If the box refuses, the
     reply is `<repo>#<n>: <error>` followed by the spent-code line below.
   - `take NNNN` — assigns the box's gh login and leaves `fleet:human` on. The issue is not announced again. Reply:
     `<repo>#<n> is yours: assigned to <login>; it will not be announced again.` Unassign it on GitHub to have it
     announced again.
-- Refusals. The code is spent in each. Each refusal from the box (the first four) is followed by the line
+- Refusals. The code is spent in each. Each refusal from the box (the first five) is followed by the line
   `This code is spent; if the issue still waits on you it will be announced again with a new code.`
   - `<repo>#<n>: #<n> changed since it was announced; wait for the new announcement` — the escalation or title changed.
   - `<repo>#<n>: #<n> is no longer waiting on the owner` — the issue left `fleet:human`.
   - `<repo>#<n>: #<n> is closed` — it was closed.
   - `<repo>#<n>: #<n> is solo work; it is not answered from here` — it got `fleet:solo` after it was announced.
+  - `<repo>#<n>: nothing was recorded: with this answer the answers file would be <n> bytes, over the 65536 fleet
+    and chain read ...` — the issue's answers file is nearly full. The code is spent like any other box refusal, and
+    the issue is announced again with a new code; send a shorter answer, or `take` it.
   - `<repo>#<n>: an answer must be 1 to 2000 characters; yours is <n>. Nothing was sent.` followed, on the same
     line, by the same spent-code sentence. The droplet checks this before calling the box.
   - `No announced fleet:human issue with that code.` — unknown, spent or expired code.
