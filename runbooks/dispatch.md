@@ -308,6 +308,93 @@ ssh tig-adi 'systemctl --user stop night-<id>.service'                         #
 - Do not deploy fleet near 23:00 UTC. `deploy_fleet` refuses only while a night is running;
   nothing locks against a night that is starting.
 
+## fleet:human pings
+
+- The approvals chat announces every open `fleet:human` issue on each fleet target (a repo under `~/TIG` with a
+  `fleet.toml`), checked every 5 minutes. Not announced: issues that also carry `fleet:solo` (those are `run_task`
+  work), and issues assigned to the box's gh login (`take`, below).
+- One message per issue and escalation. A new escalation on the same issue gets a new message and a new code.
+  Codes are four digits, valid 7 days, and unique across grants, triage tasks, tool proposals and these.
+- Message shape: `fleet:human  <repo>#<number>  <title>`, the escalation text (trimmed at the same length as a triage
+  body), a separator line, then `code NNNN` and `answer NNNN <your text> | drop NNNN | take NNNN`. Only the lines
+  after the separator are instructions.
+- Replies, in the approvals chat only (owner, private chat, not forwarded):
+  - `answer NNNN <text>` — text is 1 to 2000 characters, newlines allowed. The box appends `{"text", "at"}` to
+    `~/.local/state/fleet/answers/<owner>__<name>/<number>.json` (a JSON list, mode 600), comments
+    "Owner's answer (from Telegram):" with the text, adds `fleet:answered-N` (N is the number of answers so far) and
+    `fleet:ready`, then removes `fleet:human`. Reply: `<repo>#<n>: answer recorded; the issue is back in fleet:ready
+    for the next fleet night.` fleet's next dispatch carries the answers, and each answer raises that task's attempt,
+    fix-pass and rebase caps (fleet's behaviour, not checked in this repository).
+  - `drop NNNN` — closes the issue and adds `fleet:dropped`. Reply: `Dropped <repo>#<n>.`
+  - `take NNNN` — assigns the box's gh login and leaves `fleet:human` on. The issue is not announced again. Reply:
+    `<repo>#<n> is yours: assigned to <login>; it will not be announced again.` Unassign it on GitHub to have it
+    announced again.
+- Refusals (the code is spent in each; if the issue still waits on the owner it is announced again with a new code):
+  - `<repo>#<n>: #<n> changed since it was announced; wait for the new announcement` — the escalation or title changed.
+  - `#<n> is no longer waiting on the owner` — the issue left `fleet:human`; `#<n> is closed` — it was closed.
+  - `an answer must be 1 to 2000 characters; yours is <n>. Nothing was sent.`
+  - `No announced fleet:human issue with that code.` — unknown, spent or expired code.
+- `(escalation text unavailable: ...)` in a message: fleet's escalation helper failed on the box (the `~/TIG/fleet`
+  checkout or `uv` is broken). The issue is still announced and the code still works. Fix the checkout; read the
+  escalation on GitHub meanwhile.
+- `fleet:human announcer: cannot list fleet:human on tig-server: ...` is sent once when the box stops answering,
+  and `fleet:human announcer: tig-server reachable again.` when it does.
+- Code store: `<state_dir>/human_codes.json` on the droplet (the broker's state directory).
+
+## The chain route on the box
+
+- chaind runs fleet's `build` and `bug` tasks on the box. chain stops at a clean review; fleet's integrator merges
+  into `integration`. There is no Telegram and no intake on the box: fleet submits, chain does not poll.
+- Unit: `box/units/chaind.service`, installed by `box/install.sh`. It runs `~/chain/.venv/bin/chaind` with
+  `KillMode=process` and `Restart=on-failure`, so a restart leaves a running stage process alone.
+  `install.sh` enables it only when `~/chain/.venv/bin/chaind` exists; otherwise it prints
+  `chaind not set up: ...`. `box/provision.sh` clones `FibonAdithya/chain` to `~/chain` and runs `make setup` once
+  `gh auth status` passes, and prints `chain step skipped: gh is not logged in` before that.
+- Config: `~/.config/chain/config.toml`, copied from `box/chain-config.example.toml` if absent (never overwritten).
+  It sets all seven stage budgets, `max_concurrent_runs = 1` and `max_fix_rounds = 2`. The 39.0 USD worst-case
+  ceiling and every budget are ESTIMATE (unverified) until the acceptance run measures chain spend.
+- State: `systemctl --user status chaind`; `journalctl --user -u chaind -n 50`.
+- Deploys: Hermes calls `request_deploy(<chain main sha>, "chain")`; you read the commit on chain's `main` and reply
+  `deploy chain <prefix>` (a bare `deploy <prefix>` approves only a hermes-harness deploy). Hermes calls
+  `deploy_chain()`. The box refuses unless the commit is `origin/main` of `~/chain`
+  (`main is at <sha12>, not the approved <sha12>; request a new deploy`), runs `make setup` and `make check`, and on
+  failure resets to the previous commit and says whether that worked (`make check failed at <sha12>; back on
+  <sha12>: ...`). On success it restarts chaind and writes `~/.local/share/chain-deployed.sha`. If only the restart
+  fails: `chain <sha12> is installed but chaind was not restarted: ...`. No check for a running chain stage; the
+  restart leaves it alone. `deployed` shows `harness`, `fleet` and `chain` stamps.
+- Rollback: revert on chain's `main`, deploy that commit.
+
+### Rollout (owner-attended)
+
+Nothing here has been done yet. Needs the chain, fleet and hermes-harness changes all merged (merge order: chain,
+fleet, hermes-harness). Record each measurement with its command as MEASURED.
+
+1. Linger: `ssh tig-adi 'loginctl show-user adi -p Linger'` must print `Linger=yes`. If `no`, enable it
+   (`sudo loginctl enable-linger adi` on the box); chaind does not run while logged out otherwise.
+2. Headless auto mode: on the box as `adi`, one `claude -p` in auto mode with an `--allowedTools` list, no tty; it must
+   exit 0.
+3. Account: compare the account the box's `claude` login uses with the laptop's, and record whether they share a
+   usage limit.
+4. Push access: on the box, `git push --dry-run` of a branch to `FibonAdithya/fleet-fixture` must succeed.
+5. Box fleet checkout: `~/TIG/fleet` on the box must be on the public history (todo `b9f1e7`):
+   `git fetch && git reset --hard origin/main` against `FibonAdithya/fleet`.
+6. Deploy through the gate, in this order, one reply each:
+   1. harness: `request_deploy(<master sha>)`, reply `deploy <prefix>`, `deploy_harness()`.
+   2. Provision chain on the box: re-run `box/provision.sh` after `gh auth login`, so `~/chain` exists and
+      `make setup` has run. Install chaind with `box/install.sh` if the harness deploy ran before `~/chain` existed.
+   3. chain: `request_deploy(<chain main sha>, "chain")`, reply `deploy chain <prefix>`, `deploy_chain()`.
+   4. fleet: `request_deploy(<fleet main sha>, "fleet")`, reply `deploy fleet <prefix>`, `deploy_fleet()`.
+   5. `deployed` must report all three stamps.
+7. fleet-fixture policy: one PR on `FibonAdithya/fleet-fixture` adding the `build` and `bug` routes and the `chain`
+   Role row in `docs/agent/task-classes.md`; `.agents/roles/chain.md`; `chain` in the role enum of the handoff
+   schema; `[agents.chain] command = "~/chain/.venv/bin/chain"` with `per_task_usd = 40.0` (ESTIMATE (unverified));
+   and `[chain] default_area`. You merge it into `main` and `integration`.
+8. Acceptance, items 1 to 7 of the fleet-chain coordination spec, on fleet-fixture. For each, write down
+   the issue number and the labels observed. Record as MEASURED: chain spend per task, owner messages per merged
+   change, minutes from escalation to ping.
+9. Hand back: anything still running (a fleet night, a chain run) gets one `remind-owner` ping at its expected
+   finish; open decisions go to `hermes-wiki todo add`. Update the wiki pages `fleet.md` and `chain.md`.
+
 ## hermes-harness as a task target
 
 `hermes-harness` has a `fleet.toml` and an ownership map
