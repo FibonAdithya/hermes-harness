@@ -6,10 +6,27 @@ Status: implemented and merged 2026-11-17 (chain PR #13, fleet PR #1,
 hermes-harness PR #58). The rollout (plan 3, Task 6 Steps 3-8) has not
 started yet.
 
+**Built differently.** This document is the design as approved. Where the
+build differs, the implementation PR bodies are the record. The differences
+that contradict text below:
+
+- The chain role hands to `review` only (`ROLE_MAY_HAND_TO["chain"] ==
+  {"review"}`), then writes the `approved` verdict that moves the task to
+  `integrating`. It never hands to `integrator` directly (owner decision 7
+  and section 2 say it may). fleet PR #1.
+- There is no per-day cap on adopting `agent-reported` issues (section 1).
+  Every adopted issue gets the same default area, so they run one at a
+  time. fleet PR #1, deviation 12.
+- fleet reads chain's `updated_at` as the liveness heartbeat for a chain
+  run. fleet PR #1.
+- Fleet-mode stages may push only the run's own branch. chain PR #13.
+- An escalation too long to show in full is offered `drop` only.
+  hermes-harness PR #58.
+
 Repos touched: `fleet`, `chain`, `hermes-harness` (box verbs, approvals
 listener, box install). This document lives in hermes-harness because the
-cross-repo design for sharing the workflow (`docs/ai/specs/2026-11-12-shared-workflow-design.md`
-on branch `docs/shared-workflow`) set that precedent. Each repo's
+cross-repo design for sharing the workflow (`docs/ai/specs/2026-11-12-shared-workflow-design.md`,
+on the local branch `docs/shared-workflow`, not pushed) set that precedent. Each repo's
 implementation may get its own short spec that points here.
 
 ## Intent
@@ -206,6 +223,7 @@ A composite executor sends each `StartAgent` to `HerdrExecutor` or
     stall under `stall_minutes = 10`. Builder's call how; the paused case gets
     a test.
 - `StopAgent(task)` → `chain abort <run>`.
+
 How outcomes reach `decide()` (my call). fleet advances a task only on a
 handoff packet bound to the current attempt (`decide.py:200-212`), and
 `AgentState` has no field for a question or a PR. So `ChainExecutor` writes
@@ -282,6 +300,9 @@ Differences from a hand-started run:
   marked as the owner's Telegram answer for the record, adds
   `fleet:answered-N` (N = answers so far), removes `fleet:human`, and adds
   `fleet:ready`.
+- `drop` reuses `close_task`.
+- `take {repo, number}`: assigns the owner; the issue keeps `fleet:human`; the
+  announcer stops announcing it (my call).
 
 **How the answer resets the counters (my call).** Stripping the attempt labels
 would make attempt numbers repeat, and an old handoff packet from attempt 1
@@ -297,9 +318,6 @@ model mismatch, stage produced nothing) write no comment today
 (`expand.py:104-109`). `Escalate` gains a comment with the reason, so every
 `fleet:human` issue has text for the ping and each escalation is a distinct
 comment the announcer can key on.
-- `drop` reuses `close_task`.
-- `take {repo, number}`: assigns the owner; the issue keeps `fleet:human`; the
-  announcer stops announcing it (my call).
 
 **Where answers reach the agent.** `ChainExecutor` passes the answers file to
 `chain start --answers`. For native fleet roles, `build_prompt`
@@ -337,7 +355,7 @@ The listener answers in chat with what the verb did.
 3. A run whose PR is merged or closed outside chain ends itself, wherever it is
    waiting (merge question included), with status `ended` and the reason.
 4. A merge refused because the branch is behind its base: `gh pr update-branch`,
-   wait for checks on the new head, run a fresh review, then ask again (laptop)
+   wait for checks on the new head, run a fresh review, then ask again
    (laptop only; fleet-mode runs do not merge). This replaces the failure
    question described in wiki `chain.md` "Merge-refusal gotcha". The refusal
    strings in `src/chain/engine.py::REVIEW_AGAIN_TEXTS` are ESTIMATE

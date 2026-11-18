@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.12, pytest (box suite runs under the executor image's pytest 7.2.1 too), httpx, systemd user units, shellcheck.
 
-**Spec:** `docs/ai/specs/2026-11-17-fleet-chain-coordination-design.md` (513f758). Sections 4 and 6, Constraints and Acceptance are this plan.
+**Spec:** `docs/ai/specs/2026-11-17-fleet-chain-coordination-design.md` (as merged with these plans). Sections 4 and 6, Constraints and Acceptance are this plan.
 
 **Repo:** hermes-harness, branch `feat/fleet-chain-coordination` from `master`.
 

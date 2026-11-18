@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.11+ (uv), pytest, ruff, the YAML scenario harness in `src/fleet/simulate.py`.
 
-**Spec:** `hermes-harness` `docs/ai/specs/2026-11-17-fleet-chain-coordination-design.md` (branch `docs/fleet-chain-coordination`, 513f758). Sections 1, 2 and 4 (fleet parts) are this plan. Owner decisions 6, 7 and 8 there approve the reserved changes this plan makes (`CLASSES`, `ROLE_MAY_HAND_TO`, `VERDICT_ROLES`, the handoff schema's role enum, the counter rule).
+**Spec:** `hermes-harness` `docs/ai/specs/2026-11-17-fleet-chain-coordination-design.md` (as merged with these plans). Sections 1, 2 and 4 (fleet parts) are this plan. Owner decisions 6, 7 and 8 there approve the reserved changes this plan makes (`CLASSES`, `ROLE_MAY_HAND_TO`, `VERDICT_ROLES`, the handoff schema's role enum, the counter rule).
 
 **Repo:** a fresh clone of public `FibonAdithya/fleet`, branch `feat/chain-route` from `main`. Do not work in `~/TIG/fleet`: its origin is a private mirror (an owner follow-up). MEASURED 2026-11-17: public main 2315427 and private main f03f1e0 have the same tree, 614b936.
 

@@ -2,13 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** chain gains a fleet mode (start from a fleet task, end at an approved review or an escalation, never merge or message), a `chain status --json` contract fleet reads, and three laptop fixes (fleet.toml base branch, intake skips fleet targets, runs notice PRs merged or closed elsewhere, behind-base merge refusals update the branch).
+**Goal:** chain gains a fleet mode (start from a fleet task, end at an approved review or an escalation, never merge or message), a `chain status --json` contract fleet reads, and four laptop fixes (fleet.toml base branch, intake skips fleet targets, runs notice PRs merged or closed elsewhere, behind-base merge refusals update the branch).
 
 **Architecture:** Fleet mode is a property of the run (`Run.mode == "fleet"`), set only by `chain start --fleet`. The engine's existing choke points (`_ask`, `_offer_merge_once`, `_close_out_issue`, the label re-read, the no-checks path) branch on it. The status contract is a new module that serialises runs; a golden fixture of its output is the file fleet's plan copies.
 
 **Tech Stack:** Python 3.12 (uv venv), argparse, pytest, ruff. No new dependencies.
 
-**Spec:** `hermes-harness` `docs/ai/specs/2026-11-17-fleet-chain-coordination-design.md` (branch `docs/fleet-chain-coordination`, commit 513f758). Sections 3 and 5 are this plan.
+**Spec:** `hermes-harness` `docs/ai/specs/2026-11-17-fleet-chain-coordination-design.md` (as merged with these plans). Sections 3 and 5 are this plan.
 
 **Repo:** `~/chain` (`FibonAdithya/chain`), branch `feat/fleet-mode` from `origin/main` (b3f288f at planning time). Work in a worktree.
 
