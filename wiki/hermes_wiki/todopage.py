@@ -7,6 +7,7 @@ from hermes_wiki import frontmatter
 from hermes_wiki.todorecords import Record, dumps
 
 DONE_WINDOW_DAYS = 7
+RECENT = "## Recently done"
 _TICK = re.compile(r"^- \[([ xX])\] .* id ([0-9a-f]{6})\)[ \t]*\r?$", re.MULTILINE)
 _MARKER = re.compile(r"^<!-- data: ([0-9a-f]{64}) -->$", re.MULTILINE)
 _NOTE = ("<!-- Generated from agent-todos.jsonl by hermes-wiki todo. "
@@ -70,7 +71,7 @@ def render(records: list[Record], today: date) -> str:
         if (today - date.fromisoformat(r.closed["at"])).days < DONE_WINDOW_DAYS:
             recent.append(r)
     if recent:
-        lines = ["## Recently done"]
+        lines = [RECENT]
         for r in _newest_first(recent):
             c = r.closed
             lines += _item(r, "x", True, f"Closed {c['at']} by {c.get('by', '')}: {c.get('reason', '')}")
@@ -91,3 +92,23 @@ def ticks(page_text: str) -> dict[str, bool]:
         checked = m.group(1) in "xX"
         out[m.group(2)] = out.get(m.group(2), True) and checked
     return out
+
+
+def owner_actions(page_text: str) -> tuple[set[str], set[str]]:
+    """(closes, reopens) the owner made on the page, by section.
+
+    closes: ids whose item lines are all [x] and all outside "## Recently done".
+    reopens: ids whose item lines are all [ ] and all inside "## Recently done".
+    """
+    seen: dict[str, list[tuple[bool, bool]]] = {}
+    recent = False
+    for line in page_text.split("\n"):
+        if line.startswith("## "):
+            recent = line.rstrip() == RECENT
+            continue
+        m = _TICK.fullmatch(line)
+        if m:
+            seen.setdefault(m.group(2), []).append((m.group(1) in "xX", recent))
+    closes = {i for i, v in seen.items() if all(c and not r for c, r in v)}
+    reopens = {i for i, v in seen.items() if all(not c and r for c, r in v)}
+    return closes, reopens

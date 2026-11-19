@@ -5,13 +5,14 @@ imports the owner's ticks from the page and any stray items old clients left
 under "## Agent follow-ups" in todos.md, applies the change, and commits the
 files whose text changed in a single commit on top of that head.
 """
+import copy
 import hashlib
 import random
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
 
-from hermes_wiki.todopage import data_marker, render, ticks
+from hermes_wiki.todopage import data_marker, owner_actions, render
 from hermes_wiki.todorecords import Record, dumps, loads, new_id as _new_id
 from hermes_wiki.todos import (ATTEMPTS, Conflict, StoreError, TodoError, WriteUncertain,
                                _ID_FORMAT, take_section_items)
@@ -35,16 +36,13 @@ class Change:
 def _import_ticks(records: list[Record], page: str, jsonl: str, today: date,
                   log: Callable[[str], None]) -> None:
     fresh = data_marker(page) == hashlib.sha256(jsonl.encode("utf-8")).hexdigest()
-    by_id = {r.id: r for r in records}
+    closes, reopens = owner_actions(page)
     ignored = False
-    for item_id, checked in ticks(page).items():
-        r = by_id.get(item_id)
-        if r is None:
-            continue
-        if checked and r.status in ("open", "suggested"):
+    for r in records:
+        if r.id in closes and r.status in ("open", "suggested"):
             r.status = "done"
             r.closed = {"at": today.isoformat(), "by": "owner", "reason": "ticked in Obsidian"}
-        elif not checked and r.status == "done":
+        elif r.id in reopens and r.status == "done":
             if fresh:
                 r.status = "open"
                 r.closed = None
@@ -58,11 +56,17 @@ def _import_strays(records: list[Record], todos_md: str, today: date, source: st
                    gen: Callable[[], str], log: Callable[[str], None]) -> str:
     items, rest = take_section_items(todos_md)
     titles = {r.id: r.title.strip() for r in records}
+    by_id = {r.id: r for r in records}
     for item, details in items:
         title = item.title.strip() or "(untitled)"
         item_id = item.id
         if item_id is not None and item_id in titles:
             if titles[item_id] == title:
+                dup = by_id[item_id]
+                if item.done and dup.status in ("open", "suggested"):
+                    dup.status = "done"
+                    dup.closed = {"at": today.isoformat(), "by": "owner",
+                                  "reason": "ticked in todos.md"}
                 continue
             item_id = None
         if item_id is None:
@@ -74,6 +78,7 @@ def _import_strays(records: list[Record], todos_md: str, today: date, source: st
             r.closed = {"at": today.isoformat(), "by": "owner", "reason": "ticked in todos.md"}
         records.append(r)
         titles[item_id] = title
+        by_id[item_id] = r
         log(f"imported {item_id} from todos.md")
     return rest
 
@@ -102,7 +107,7 @@ def transact(store, change: Change, *, today: date, source: str, new_id: Callabl
         if todos_md is not None:
             new_todos = _import_strays(records, todos_md, today, source, new_id, log)
 
-        out = change.fn(records, today)
+        out = change.fn(copy.deepcopy(records), today)
         applied = out is not None
         if applied:
             records = out

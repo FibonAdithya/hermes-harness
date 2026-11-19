@@ -3,7 +3,7 @@ from datetime import date, timedelta
 
 from hermes_wiki import schema
 from hermes_wiki.frontmatter import parse
-from hermes_wiki.todopage import data_marker, render, ticks
+from hermes_wiki.todopage import data_marker, owner_actions, render, ticks
 from hermes_wiki.todorecords import Record
 
 TODAY = date(2026, 11, 19)
@@ -119,3 +119,33 @@ def test_same_created_tie_breaks_by_id():
     assert p1 == p2
     assert p1.index("id aaaaaa") < p1.index("id bbbbbb")
     # catches dropping the id sort before the stable created sort
+
+
+def test_owner_actions_are_section_aware():
+    page = render([rec("111111"), rec("222222"), done("333333", 1), done("444444", 2)], TODAY)
+    page = page.replace("- [ ] t (2026-11-10, id 111111)", "- [x] t (2026-11-10, id 111111)")
+    page = page.replace("- [x] t (alpha, 2026-11-10, id 333333)", "- [ ] t (alpha, 2026-11-10, id 333333)")
+    assert owner_actions(page) == ({"111111"}, {"333333"})
+    # catches using ticks() directly: 444444 ([x] in Recently done) would close, 222222 ([ ]) would reopen
+
+
+def test_owner_actions_mixed_or_cross_section_lines_do_nothing():
+    page = ("## alpha\n- [x] a (2026-11-01, id 111111)\n- [ ] a (2026-11-01, id 222222)\n"
+            "## Recently done\n- [x] a (alpha, 2026-11-01, id 111111)\n"
+            "- [ ] a (alpha, 2026-11-01, id 222222)\n- [ ] b (alpha, 2026-11-01, id 333333)\r\n"
+            "- [x] c (alpha, 2026-11-01, id 444444)\n- [ ] c (alpha, 2026-11-01, id 444444)  \n")
+    assert owner_actions(page) == (set(), {"333333"})
+    # catches an id counted from one section only, or first-match-wins on duplicate lines; 333333 checks CRLF tolerance
+
+
+def test_owner_actions_ignore_detail_lookalikes():
+    r = done("111111", 1, details=["- [ ] fake (2026-11-01, id 222222)"])
+    assert owner_actions(render([r, rec("222222")], TODAY)) == (set(), set())
+    # catches an unanchored line regex reading a detail as an untick
+
+
+def test_owner_actions_section_after_recently_done():
+    page = ("## Recently done\n- [ ] a (alpha, 2026-11-01, id 111111)\n"
+            "## alpha\n- [x] b (2026-11-01, id 222222)\n")
+    assert owner_actions(page) == ({"222222"}, {"111111"})
+    # catches the Recently done flag sticking past the next heading

@@ -4,7 +4,7 @@ from datetime import date
 
 import pytest
 
-from hermes_wiki import todos, todostore
+from hermes_wiki import todos
 from hermes_wiki.todopage import data_marker, render
 from hermes_wiki.todorecords import Record, dumps, loads
 from hermes_wiki.todos import Conflict, StoreError, TodoError, WriteUncertain
@@ -118,16 +118,37 @@ def test_owner_untick_reopens_done_item():  # catches one-way import (ticks clos
 
 
 def test_stale_page_does_not_reopen():  # catches an old Obsidian copy reopening every item agents closed since
-    old = [rec("aaaaaa"), rec("cccccc")]
-    stale = tick(render(old, TODAY), "cccccc")  # owner ticked cccccc on an old copy
-    now = close([rec("aaaaaa"), rec("cccccc")], "aaaaaa")  # agent closed aaaaaa since
+    agent_done = {"at": "2026-11-18", "by": "agent", "reason": "r"}
+    old = [rec("aaaaaa", status="done", closed=agent_done), rec("cccccc"), rec("eeeeee")]
+    stale = tick(tick(render(old, TODAY), "aaaaaa", box=" "), "cccccc")  # untick in Recently done, tick cccccc
+    now = close([rec("aaaaaa", status="done", closed=agent_done), rec("cccccc"), rec("eeeeee")],
+                "eeeeee") + [rec("dddddd")]  # agent closed eeeeee and added dddddd since
     logs = []
     tree = FakeTree([("b", files(now, stale))])
     run(tree, logs=logs)
     got = committed(tree)
-    assert got["aaaaaa"].status == "done" and got["aaaaaa"].closed["by"] == "agent"
+    assert got["aaaaaa"].status == "done" and got["eeeeee"].status == "done"
+    assert got["eeeeee"].closed["by"] == "agent"
     assert got["cccccc"].status == "done" and got["cccccc"].closed["by"] == "owner"
     assert "agent-todos.md was stale; unticks ignored" in logs
+
+
+def test_stale_recently_done_tick_does_not_reclose():  # catches an old page copy closing an item the owner reopened
+    was_done = [rec("aaaaaa", status="done", closed={"at": "2026-11-18", "by": "agent", "reason": "r"})]
+    stale = render(was_done, TODAY)  # old copy: aaaaaa [x] under Recently done
+    tree = FakeTree([("b", files([rec("aaaaaa")], stale))])  # owner since reopened it
+    run(tree)
+    assert all(JSONL not in c[1] for c in tree.commits)
+
+
+def test_tick_inside_recently_done_does_not_close_open_item():  # catches closing from the Recently done section
+    rs = [rec("aaaaaa"), rec("bbbbbb", status="done", closed={"at": "2026-11-18", "by": "agent", "reason": "r"})]
+    page = render(rs, TODAY) + "- [x] Item aaaaaa (hermes, 2026-11-10, id aaaaaa)\n"  # appended under Recently done
+    assert page.index("## Recently done") < page.index("(hermes, 2026-11-10, id aaaaaa)")
+    page = page.replace("- [ ] Item aaaaaa (2026-11-10, id aaaaaa)\n", "")
+    tree = FakeTree([("b", files(rs, page))])
+    run(tree)
+    assert all(JSONL not in c[1] for c in tree.commits)
 
 
 def test_page_without_marker_counts_as_stale():  # catches treating a missing marker as fresh
@@ -207,6 +228,33 @@ def test_stray_same_id_and_title_dropped():  # catches double import after a par
     assert tree.commits[0][1][TODOS] == TODOS_MD
 
 
+def test_ticked_duplicate_stray_closes_its_record():  # catches dropping a duplicate stray before reading its tick
+    rs = [rec("aaaaaa", title="Existing")]
+    md = TODOS_MD.replace(SECTION_HEAD, SECTION_HEAD + "- [x] Existing (2026-11-12, claude-box, id aaaaaa)\n")
+    tree = FakeTree([("b", files(rs, todos_md=md))])
+    run(tree)
+    got = committed(tree)
+    assert list(got) == ["aaaaaa"] and got["aaaaaa"].status == "done"
+    assert got["aaaaaa"].closed == {"at": "2026-11-19", "by": "owner", "reason": "ticked in todos.md"}
+    assert tree.commits[0][1][TODOS] == TODOS_MD
+
+
+def test_unticked_duplicate_stray_does_not_reopen():  # catches an unticked old line reopening a done record
+    rs = [rec("aaaaaa", title="Existing", status="done",
+              closed={"at": "2026-11-18", "by": "agent", "reason": "r"})]
+    md = TODOS_MD.replace(SECTION_HEAD, SECTION_HEAD + "- [ ] Existing (2026-11-12, claude-box, id aaaaaa)\n")
+    tree = FakeTree([("b", files(rs, todos_md=md))])
+    run(tree)
+    assert set(tree.commits[0][1]) == {TODOS}
+
+
+def test_in_place_mutation_with_none_is_not_committed():  # catches passing fn the live list (in-place edit leaks into a no-op)
+    rs = [rec("aaaaaa")]
+    tree = FakeTree([("b", files(rs))])
+    assert run(tree, fn=lambda rs, today: (close(rs, "aaaaaa"), None)[1]) is False
+    assert tree.commits == []
+
+
 def test_stray_with_empty_title_imported_as_untitled():  # catches dropping an empty stray
     md = TODOS_MD.replace(SECTION_HEAD, SECTION_HEAD + "- [ ] \n")
     tree = FakeTree([("b", files([], todos_md=md))])
@@ -239,6 +287,17 @@ def test_conflict_rereads_and_reapplies():  # catches retrying stale state or re
     assert len(sleeps) == 1 and 0.5 <= sleeps[0] <= 1.0
 
 
+def test_conflict_retry_reimports_owner_edits_from_new_head():  # catches importing ticks/strays only once, before the loop
+    rs = [rec("aaaaaa"), rec("bbbbbb")]
+    md = TODOS_MD.replace(SECTION_HEAD, SECTION_HEAD + "- [ ] Late (2026-11-12, claude-box, id 4f6cc0)\n")
+    v2 = files(rs, tick(render(rs, TODAY), "aaaaaa"), todos_md=md)
+    tree = FakeTree([("base1", files(rs)), ("base2", v2)], commits=[Conflict(), None])
+    run(tree, fn=lambda rs, today: close(rs, "bbbbbb"))
+    got = committed(tree)
+    assert got["aaaaaa"].closed["by"] == "owner" and got["bbbbbb"].closed["by"] == "agent"
+    assert "4f6cc0" in got and tree.commits[1][1][TODOS] == TODOS_MD
+
+
 def test_five_conflicts_give_up():  # catches off-by-one on attempts
     rs = [rec("aaaaaa")]
     tree = FakeTree([("b", files(rs))] * 5, commits=[Conflict()] * 5)
@@ -264,6 +323,14 @@ def test_write_uncertain_names_id_and_is_not_retried():  # catches retrying a wr
         run(tree, fn=lambda rs, today: close(rs, "aaaaaa"), message="todo: done aaaaaa")
     assert str(e.value) == "timed out writing agent-todos; item aaaaaa may or may not have landed"
     assert e.value.code == 1 and len(tree.commits) == 1
+
+
+def test_write_uncertain_on_import_only_commit_says_the_write():  # catches naming a bogus id from the change message
+    rs = [rec("aaaaaa")]
+    tree = FakeTree([("b", files(rs, tick(render(rs, TODAY), "aaaaaa")))], commits=[WriteUncertain()])
+    with pytest.raises(TodoError) as e:
+        run(tree, message="todo: done 123456")
+    assert str(e.value) == "timed out writing agent-todos; the write may or may not have landed"
 
 
 @pytest.mark.parametrize("where", ["head", "commit"])
