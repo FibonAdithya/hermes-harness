@@ -22,6 +22,16 @@ if in_progress; then
   exit 1
 fi
 
+# Generated files: the nightly job owns them. A local edit (including a deletion) would be
+# snapshotted and pushed over the generated copy, so restore them from HEAD first.
+for p in agent-todos.jsonl agent-todos.md; do
+  git ls-files --error-unmatch -- "$p" >/dev/null 2>&1 || continue
+  if ! git diff --quiet HEAD -- "$p"; then
+    git restore --staged --worktree --source=HEAD -- "$p"
+    echo "discarded local edit to $p" >&2
+  fi
+done
+
 git add -A
 if ! git diff --cached --quiet; then
   git commit -q -m "wiki: auto-snapshot $(date -Iseconds)"

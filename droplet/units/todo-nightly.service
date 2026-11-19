@@ -1,0 +1,6 @@
+[Unit]
+Description=Nightly agent-todos checks and suggestion intake
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/todo-nightly.sh

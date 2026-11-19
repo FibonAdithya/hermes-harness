@@ -145,3 +145,39 @@ def test_pull_failure_is_not_called_a_conflict(repos, env, tmp_path):
     assert r.returncode == 1
     assert "FATAL: pull failed" in r.stderr
     assert "conflict" not in r.stderr
+
+
+def test_sync_discards_local_todo_edits(repos, env):
+    origin, droplet, outside = repos
+    outside_push(outside, env, "agent-todos.md", "generated\n")
+    git(droplet, env, "pull", "-q", "origin", "main")
+    (droplet / "agent-todos.md").write_text("local owner edit\n")
+    (droplet / "alpha.md").write_text("one\ntwo\nthree\nfour\n")
+    r = run(droplet, env)
+    assert r.returncode == 0, r.stderr
+    assert "discarded local edit to agent-todos.md" in r.stderr
+    assert git(origin, env, "show", "main:alpha.md").endswith("four")
+    assert git(origin, env, "show", "main:agent-todos.md") == "generated"
+    assert (droplet / "agent-todos.md").read_text() == "generated\n"
+    # catches: discarding every local edit, or discarding none of the todo edit
+
+
+def test_sync_restores_locally_deleted_todo_file(repos, env):
+    origin, droplet, outside = repos
+    outside_push(outside, env, "agent-todos.jsonl", "{}\n")
+    git(droplet, env, "pull", "-q", "origin", "main")
+    (droplet / "agent-todos.jsonl").unlink()
+    r = run(droplet, env)
+    assert r.returncode == 0, r.stderr
+    assert git(origin, env, "show", "main:agent-todos.jsonl") == "{}"
+    assert (droplet / "agent-todos.jsonl").exists()
+    # catches: a guard that only handles modified files and pushes the deletion
+
+
+def test_sync_untracked_todo_paths_ok(repos, env):
+    origin, droplet, outside = repos
+    (droplet / "alpha.md").write_text("one\ntwo\nthree\nfour\n")
+    r = run(droplet, env)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "pushed"
+    # catches: set -e dying when git ls-files --error-unmatch fails on untracked paths
