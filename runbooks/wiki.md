@@ -310,7 +310,11 @@ generated from.
   item was closed `by: check`, it also clears `done_when` and logs
   `cleared checks on reopened item ID` (stderr, not on a `public_only` wiki);
   otherwise the next nightly would close it again from the same check. Add a
-  new check with `todo edit --done-when` if one applies. On a suggested item it
+  new check with `todo edit --done-when` if one applies. An item closed
+  `by: owner` or `by: agent` keeps its `done_when`, so if one of its checks
+  already passes, the next nightly closes it again `by: check`; reopen it a
+  second time (which then clears the checks), or run
+  `todo edit ID --clear-done-when` before reopening. On a suggested item it
   sets `rejected: true` and returns the item to open. On an open item it exits 1.
 - `hermes-wiki todo list [--all] [--json] [--project NAME]` prints
   `ID TITLE` for open items, with ` [suggested]` or ` [done]` after the id.
