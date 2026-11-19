@@ -111,7 +111,7 @@ def test_list_all(env, monkeypatch, capsys):
     assert f"{b} Second" in out and f"{a} First" not in out
     assert cli.main(["todo", "list", "--all", "--config", conf]) == 0
     out = capsys.readouterr().out
-    assert f"{b} Second" in out and f"{a} First" in out
+    assert f"{b} Second" in out and f"{a} [done] First" in out
 
 
 def test_config_after_subcommand_args(env, monkeypatch, capsys):
@@ -124,3 +124,51 @@ def test_missing_todos_rc1(env, monkeypatch, capsys):
     monkeypatch.setenv("HERMES_WIKI_DRY_PUBLISH", "1")
     assert cli.main(["todo", "add", "T", "--config", str(env.conf())]) == 1
     assert not env.dry.exists()
+
+
+@pytest.fixture
+def migrated(env, monkeypatch):
+    from datetime import date
+    from hermes_wiki.todopage import render
+    from hermes_wiki.todorecords import dumps
+
+    monkeypatch.setenv("HERMES_WIKI_DRY_PUBLISH", "1")
+    d = env.dry.parent
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "agent-todos.jsonl").write_text("", encoding="utf-8")
+    (d / "agent-todos.md").write_text(render([], date(2026, 11, 19)), encoding="utf-8")
+    return d / "agent-todos.jsonl"
+
+
+def _recs(jl):
+    from hermes_wiki.todorecords import loads
+    return loads(jl.read_text(encoding="utf-8"))
+
+
+def test_migrated_flags_pass_through(env, migrated, capsys):
+    conf = str(env.conf())
+    assert cli.main(["todo", "add", "T", "--project", "x", "--done-when", "pr:a/b#1", "--config", conf]) == 0
+    i = capsys.readouterr().out.strip()
+    r = _recs(migrated)[0]
+    assert r.project == "x" and r.done_when == [{"pr": "a/b#1", "state": "merged"}]
+    assert cli.main(["todo", "done", i, "--reason", "r", "--config", conf]) == 0
+    assert _recs(migrated)[0].closed["reason"] == "r"
+    assert cli.main(["todo", "reopen", i, "--config", conf]) == 0
+    assert cli.main(["todo", "edit", i, "--add-detail", "d", "--config", conf]) == 0
+    assert _recs(migrated)[0].details == ["d"]
+    assert cli.main(["todo", "list", "--json", "--project", "x", "--config", conf]) == 0
+    assert json.loads(capsys.readouterr().out.strip())["id"] == i
+    assert cli.main(["todo", "rm", i, "--config", conf]) == 0
+    assert _recs(migrated) == []
+    assert cli.main(["todo", "rm", i, "--config", conf]) == 1
+    assert "no item with id" in capsys.readouterr().err  # catches flags parsed but not passed through
+
+
+def test_unmigrated_new_commands_exit_1(env, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_WIKI_DRY_PUBLISH", "1")
+    env.seed()
+    before = env.dry.read_text(encoding="utf-8")
+    for argv in (["edit", "aaaaaa", "--title", "x"], ["rm", "aaaaaa"], ["reopen", "aaaaaa"], ["list", "--json"]):
+        assert cli.main(["todo", *argv, "--config", str(env.conf())]) == 1
+        assert "run hermes-wiki todo migrate first" in capsys.readouterr().err
+    assert env.dry.read_text(encoding="utf-8") == before  # catches new commands touching todos.md
