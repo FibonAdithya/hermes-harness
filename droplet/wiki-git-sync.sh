@@ -26,6 +26,10 @@ fi
 # snapshotted and pushed over the generated copy, so restore them from HEAD first.
 for p in agent-todos.jsonl agent-todos.md; do
   git ls-files --error-unmatch -- "$p" >/dev/null 2>&1 || continue
+  if ! git cat-file -e "HEAD:$p" 2>/dev/null; then
+    echo "skipping $p: staged but not in HEAD" >&2
+    continue
+  fi
   if ! git diff --quiet HEAD -- "$p"; then
     git restore --staged --worktree --source=HEAD -- "$p"
     echo "discarded local edit to $p" >&2

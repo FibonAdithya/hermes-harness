@@ -169,6 +169,7 @@ def test_sync_restores_locally_deleted_todo_file(repos, env):
     (droplet / "agent-todos.jsonl").unlink()
     r = run(droplet, env)
     assert r.returncode == 0, r.stderr
+    assert "discarded local edit to agent-todos.jsonl" in r.stderr
     assert git(origin, env, "show", "main:agent-todos.jsonl") == "{}"
     assert (droplet / "agent-todos.jsonl").exists()
     # catches: a guard that only handles modified files and pushes the deletion
@@ -181,3 +182,13 @@ def test_sync_untracked_todo_paths_ok(repos, env):
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "pushed"
     # catches: set -e dying when git ls-files --error-unmatch fails on untracked paths
+
+
+def test_sync_staged_new_todo_file_not_in_head_does_not_die(repos, env):
+    origin, droplet, outside = repos
+    (droplet / "agent-todos.md").write_text("new\n")
+    git(droplet, env, "add", "agent-todos.md")
+    r = run(droplet, env)
+    assert r.returncode == 0, r.stderr
+    assert "staged but not in HEAD" in r.stderr
+    # catches: git restore --source=HEAD failing on a path absent from HEAD and set -e aborting

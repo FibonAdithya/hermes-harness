@@ -3,4 +3,5 @@ Description=Nightly agent-todos checks and suggestion intake
 
 [Service]
 Type=oneshot
+TimeoutStartSec=10min
 ExecStart=%h/.local/bin/todo-nightly.sh
