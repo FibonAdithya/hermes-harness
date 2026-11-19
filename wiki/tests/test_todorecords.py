@@ -113,3 +113,32 @@ def test_project_from_origin():
     for u in [None, "file:///x", "https://gitlab.com/a/b", ""]:
         assert tr.project_from_origin(u) == "unsorted"
     # catches returning owner or .git suffix
+
+
+@pytest.mark.parametrize("kw", [
+    dict(status="done"),
+    dict(status="done", closed={"by": "owner"}),
+    dict(status="done", closed={"at": "2026-13-40", "by": "owner"}),
+    dict(status="done", closed={"at": 20261119, "by": "owner"}),
+    dict(status="done", closed={"at": "2026-11-19", "by": "someone"}),
+    dict(status="done", closed={"at": "2026-11-19"}),
+    dict(status="suggested"),
+    dict(status="suggested", suggestion={"reason": "r"}),
+    dict(status="suggested", suggestion={"at": "yesterday"}),
+    dict(status="suggested", suggestion={"at": None}),
+])
+def test_loads_rejects_done_without_valid_closed_and_suggested_without_valid_suggestion(kw):
+    good = tr.dumps([rec("aaaaaa")])
+    with pytest.raises(TodoError, match="line 2"):
+        tr.loads(good + tr.dumps([rec("bbbbbb", **kw)]))
+    # catches loads accepting a done/suggested record whose closed/suggestion the nightly cannot read
+
+
+def test_loads_accepts_valid_closed_and_suggestion():
+    rs = [rec("aaaaaa", status="done", closed={"at": "2026-11-19", "by": by, "reason": "r"})
+          for by in ("check", "agent", "owner")]
+    rs = [tr.Record(**{**r.__dict__, "id": f"aaaaa{n}"}) for n, r in enumerate(rs)]
+    rs.append(rec("bbbbbb", status="suggested", suggestion={"at": "2026-11-18", "evidence": "e"}))
+    rs.append(rec("cccccc", suggestion={"at": "2026-11-01", "rejected": True}))
+    assert tr.loads(tr.dumps(rs)) == rs
+    # catches over-strict validation refusing a check/agent/owner close or an open item's old suggestion

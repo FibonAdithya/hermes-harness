@@ -175,6 +175,68 @@ def test_reopen_done_clears_closed(tmp_path):
     assert (r.status, r.closed) == ("open", None)  # catches keeping stale closed
 
 
+def test_reopen_check_closed_clears_checks_and_nightly_leaves_it_open(tmp_path, capsys):
+    from datetime import datetime, timezone
+    from hermes_wiki.todonightly import nightly
+
+    checks = [{"pr": "a/b#1", "state": "merged"}]
+    tree, jl = seed(tmp_path, [
+        rec("aaaaaa", "done", closed={"at": "2026-11-18", "by": "check", "reason": "PR #1 merged"},
+            done_when=list(checks)),
+        rec("bbbbbb", "done", closed={"at": "2026-11-18", "by": "owner", "reason": "r"}, done_when=list(checks)),
+        rec("cccccc", "done", closed={"at": "2026-11-18", "by": "agent", "reason": "r"}, done_when=list(checks))])
+    c = cfg_for(tmp_path)
+    for i in ("aaaaaa", "bbbbbb", "cccccc"):
+        todocmds.cmd_reopen(c, tree, i, **kw())
+    got = {r.id: r for r in loads(jl.read_text())}
+    assert got["aaaaaa"].done_when == []
+    assert got["bbbbbb"].done_when == checks and got["cccccc"].done_when == checks  # catches clearing on every reopen
+    err = capsys.readouterr().err
+    assert err.count("cleared checks on reopened item") == 1 and "cleared checks on reopened item aaaaaa" in err
+
+    def gh(argv, **k):
+        merged = {"state": "closed", "merged_at": "2026-11-18T10:00:00Z", "closed_at": "2026-11-18T10:00:00Z"}
+        return subprocess.CompletedProcess(argv, 0, json.dumps(merged), "")
+
+    nightly(c, tree, suggestions_text="", evidence_path=tmp_path / "ev.json", state_path=tmp_path / "st.json",
+            today=TODAY, now=datetime(2026, 11, 19, tzinfo=timezone.utc), run=gh, sleep=lambda s: None,
+            log=lambda m: None, new_id=lambda: "ffffff")
+    assert {r.id: r.status for r in loads(jl.read_text())}["aaaaaa"] == "open"  # catches the nightly re-closing it
+
+
+def test_reopen_logs_nothing_on_public_only(tmp_path, capsys):
+    tree, jl = seed(tmp_path, [rec("aaaaaa", "done", closed={"at": "2026-11-18", "by": "check", "reason": "r"},
+                                   done_when=[{"pr": "a/b#1", "state": "merged"}])])
+    todocmds.cmd_reopen(cfg_for(tmp_path, public_only=True), tree, "aaaaaa", **kw())
+    assert loads(jl.read_text())[0].done_when == []
+    assert capsys.readouterr().err == ""  # catches printing the log on the box
+
+
+def test_edit_clear_done_when_replaces_checks(tmp_path):
+    tree, jl = seed(tmp_path, [rec("aaaaaa", done_when=[{"pr": "a/b#1", "state": "merged"}])])
+    todocmds.cmd_edit(cfg_for(tmp_path), tree, "aaaaaa", None, [], None, ["pr:a/b#2"],
+                      clear_done_when=True, clear_details=False, **kw())
+    assert loads(jl.read_text())[0].done_when == [{"pr": "a/b#2", "state": "merged"}]  # catches clearing after adding, or not at all
+    todocmds.cmd_edit(cfg_for(tmp_path), tree, "aaaaaa", None, [], None, [],
+                      clear_done_when=True, clear_details=False, **kw())
+    assert loads(jl.read_text())[0].done_when == []  # catches a clear that needs a replacement check
+
+
+def test_edit_clear_details_replaces_details_and_revalidates(tmp_path):
+    tree, jl = seed(tmp_path, [Record(id="aaaaaa", title="T", details=["old1", "old2"], project="hermes",
+                                      created="2026-11-10", source="s",
+                                      done_when=[{"pr": "a/b#1", "state": "merged"}])])
+    c = cfg_for(tmp_path)
+    todocmds.cmd_edit(c, tree, "aaaaaa", None, ["new"], None, [], clear_done_when=False, clear_details=True, **kw())
+    r = loads(jl.read_text())[0]
+    assert r.details == ["new"] and r.done_when == [{"pr": "a/b#1", "state": "merged"}]  # catches clear_details touching checks
+    before = jl.read_text()
+    with pytest.raises(TodoRejected):
+        todocmds.cmd_edit(c, tree, "aaaaaa", None, ["x" * 301], None, [], clear_done_when=False,
+                          clear_details=True, **kw())
+    assert jl.read_text() == before  # catches skipping validation on the cleared result
+
+
 def test_reopen_open_item_exits_1(tmp_path):
     tree, _ = seed(tmp_path, [rec("aaaaaa")])
     with pytest.raises(TodoError, match="already open") as e:

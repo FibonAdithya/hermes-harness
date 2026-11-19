@@ -117,6 +117,27 @@ def test_owner_untick_reopens_done_item():  # catches one-way import (ticks clos
     assert not any("stale" in m for m in logs)
 
 
+def test_owner_untick_of_check_closed_item_clears_its_checks():  # catches the nightly re-closing an item the owner reopened
+    checks = [{"pr": "a/b#1", "state": "merged"}]
+    rs = [replace(rec("aaaaaa", status="done", closed={"at": "2026-11-18", "by": "check", "reason": "PR #1 merged"}),
+                  done_when=list(checks)),
+          replace(rec("bbbbbb", status="done", closed={"at": "2026-11-18", "by": "owner", "reason": "r"}),
+                  done_when=list(checks)),
+          replace(rec("cccccc", status="done", closed={"at": "2026-11-18", "by": "agent", "reason": "r"}),
+                  done_when=list(checks))]
+    page = render(rs, TODAY)
+    for i in ("aaaaaa", "bbbbbb", "cccccc"):
+        page = tick(page, i, box=" ")
+    logs = []
+    tree = FakeTree([("b", files(rs, page))])
+    run(tree, logs=logs)
+    got = committed(tree)
+    assert all(got[i].status == "open" for i in ("aaaaaa", "bbbbbb", "cccccc"))
+    assert got["aaaaaa"].done_when == []
+    assert got["bbbbbb"].done_when == checks and got["cccccc"].done_when == checks  # catches clearing on every reopen
+    assert logs == ["cleared checks on reopened item aaaaaa"]
+
+
 def test_stale_page_does_not_reopen():  # catches an old Obsidian copy reopening every item agents closed since
     agent_done = {"at": "2026-11-18", "by": "agent", "reason": "r"}
     old = [rec("aaaaaa", status="done", closed=agent_done), rec("cccccc"), rec("eeeeee")]

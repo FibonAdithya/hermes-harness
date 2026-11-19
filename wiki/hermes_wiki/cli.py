@@ -210,7 +210,8 @@ def _cmd_todo(args, cfg) -> int:
                 print(f"hermes-wiki: {args.id} is already done", file=sys.stderr)
         elif args.todo_cmd == "edit":
             todocmds.cmd_edit(cfg, tree, args.id, args.title, args.add_detail, args.project,
-                              args.done_when, **common)
+                              args.done_when, clear_done_when=args.clear_done_when,
+                              clear_details=args.clear_details, **common)
         elif args.todo_cmd == "rm":
             todocmds.cmd_rm(cfg, tree, args.id, **common)
         elif args.todo_cmd == "reopen":
@@ -280,6 +281,10 @@ def _add_todo(sub) -> None:
     e.add_argument("--project")
     e.add_argument("--done-when", action="append", default=[],
                    help="check to append: pr:OWNER/REPO#N or issue:OWNER/REPO#N (repeatable)")
+    e.add_argument("--clear-done-when", action="store_true",
+                   help="remove every check first (then --done-when adds the new ones)")
+    e.add_argument("--clear-details", action="store_true",
+                   help="remove every detail line first (then --add-detail adds the new ones)")
     r = tsub.add_parser("rm", help="remove an item")
     r.add_argument("id")
     ro = tsub.add_parser("reopen", help="reopen a done item or reject a suggestion")

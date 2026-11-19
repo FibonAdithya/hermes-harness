@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import date
 
 from hermes_wiki.todopage import data_marker, owner_actions, render
-from hermes_wiki.todorecords import Record, dumps, loads, new_id as _new_id
+from hermes_wiki.todorecords import Record, dumps, loads, new_id as _new_id, reopen
 from hermes_wiki.todos import (ATTEMPTS, Conflict, StoreError, TodoError, WriteUncertain,
                                _ID_FORMAT, take_section_items)
 
@@ -44,8 +44,7 @@ def _import_ticks(records: list[Record], page: str, jsonl: str, today: date,
             r.closed = {"at": today.isoformat(), "by": "owner", "reason": "ticked in Obsidian"}
         elif r.id in reopens and r.status == "done":
             if fresh:
-                r.status = "open"
-                r.closed = None
+                reopen(r, log)
             else:
                 ignored = True
     if ignored:

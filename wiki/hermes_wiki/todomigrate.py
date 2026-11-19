@@ -80,7 +80,7 @@ def _done_dates(cfg: WikiConfig, run) -> dict[str, str]:
         try:
             obj = json.loads(line)
             first = obj["m"].split("\n", 1)[0]
-            day = obj["d"][:10]
+            day = date.fromisoformat(obj["d"][:10]).isoformat()
         except (ValueError, KeyError, TypeError, AttributeError):
             raise TodoError("GitHub: commit history of todos.md unavailable (unexpected response)") from None
         if first.startswith("todo: done "):

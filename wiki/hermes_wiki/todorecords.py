@@ -3,10 +3,12 @@ import json
 import re
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
+from datetime import date
 
 from hermes_wiki.todos import TodoError, TodoRejected, validate
 
 STATUSES = ("open", "suggested", "done")
+CLOSERS = ("check", "agent", "owner")
 _PROJECT = re.compile(r"[a-z0-9][a-z0-9._-]{0,39}")
 _PART = r"[A-Za-z0-9_.-]+"
 _CHECK = re.compile(rf"(pr|issue):({_PART}/{_PART})#([1-9][0-9]*)")
@@ -30,6 +32,14 @@ class Record:
 
 
 _REQUIRED = ("id", "title", "details", "project", "created", "source")
+
+
+def _iso_day(value) -> bool:
+    try:
+        date.fromisoformat(value)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _record(obj, n: int) -> Record:
@@ -57,6 +67,17 @@ def _record(obj, n: int) -> Record:
     for k in ("closed", "suggestion"):
         if obj.get(k) is not None and not isinstance(obj[k], dict):
             raise bad(f"{k} must be an object or null")
+    status = obj.get("status", "open")
+    if status == "done":
+        c = obj.get("closed")
+        if not isinstance(c, dict) or not _iso_day(c.get("at")):
+            raise bad("a done item needs closed.at as an ISO date")
+        if c.get("by") not in CLOSERS:
+            raise bad(f"closed.by must be one of {', '.join(CLOSERS)}")
+    if status == "suggested":
+        s = obj.get("suggestion")
+        if not isinstance(s, dict) or not _iso_day(s.get("at")):
+            raise bad("a suggested item needs suggestion.at as an ISO date")
     known = {f.name for f in fields(Record)}
     extra = set(obj) - known
     if extra:
@@ -102,6 +123,15 @@ def validate_item(title: str, details: list[str], project: str,
     if errors:
         raise TodoRejected(errors)
     return title, details, parsed
+
+
+def reopen(r: Record, log: Callable[[str], None]) -> None:
+    """Reopen a done item. A check-closed item loses its checks, or the nightly closes it again."""
+    if (r.closed or {}).get("by") == "check" and r.done_when:
+        r.done_when = []
+        log(f"cleared checks on reopened item {r.id}")
+    r.status = "open"
+    r.closed = None
 
 
 def new_id(used: set[str], gen: Callable[[], str]) -> str:

@@ -10,7 +10,8 @@ from hermes_wiki import todos
 from hermes_wiki.config import WikiConfig
 from hermes_wiki.notes import _CONTROL
 from hermes_wiki.secretscan import find_secrets
-from hermes_wiki.todorecords import Record, loads, new_id as _new_id, project_from_origin, validate_item
+from hermes_wiki.todorecords import (Record, loads, new_id as _new_id, project_from_origin, reopen,
+                                     validate_item)
 from hermes_wiki.todostore import JSONL, Change, NotMigrated, transact
 from hermes_wiki.todotree import DryTree, GhTree
 from hermes_wiki.todos import StoreError, TodoError
@@ -124,14 +125,18 @@ def cmd_done(cfg: WikiConfig, tree, item_id: str, reason: str | None, *, today: 
 
 
 def cmd_edit(cfg: WikiConfig, tree, item_id: str, title: str | None, add_details: list[str],
-             project: str | None, checks: list[str], *, today: date, new_id, sleep) -> bool:
+             project: str | None, checks: list[str], *, clear_done_when: bool = False,
+             clear_details: bool = False, today: date, new_id, sleep) -> bool:
     def fn(records, today_):
         r = _find(records, item_id)
+        kept = [] if clear_details else r.details  # clearing comes before the additions
         new_title, details, parsed = validate_item(
-            r.title if title is None else title, r.details + add_details,
+            r.title if title is None else title, kept + add_details,
             r.project if project is None else project, checks)
         r.title, r.details = new_title, details
         r.project = r.project if project is None else project
+        if clear_done_when:
+            r.done_when = []
         for c in parsed:
             if c not in r.done_when:
                 r.done_when.append(c)
@@ -156,13 +161,17 @@ def cmd_reopen(cfg: WikiConfig, tree, item_id: str, *, today: date, new_id, slee
             raise TodoError(f"{item_id} is already open", 1)
         if r.status == "suggested":
             r.suggestion = dict(r.suggestion or {}, rejected=True)
+            r.status = "open"
         else:
-            r.closed = None
-        r.status = "open"
+            reopen(r, logs.append)  # logged once below, not on every conflict retry
         return records
 
+    logs: list[str] = []
     _strict(cfg, tree, Change(f"todo: reopen {item_id}", fn),
             today=today, new_id=new_id, sleep=sleep)
+    log = _log(cfg)
+    for m in dict.fromkeys(logs):
+        log(m)
 
 
 def cmd_list(cfg: WikiConfig, tree, include_done: bool, as_json: bool,

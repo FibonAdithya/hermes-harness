@@ -312,3 +312,12 @@ def test_history_garbage_line_refuses(cfg, tree):
         run_migrate(cfg, tree, run=Garbage())
     assert e.value.code == 1 and "commit history" in str(e.value)
     # catches: ignoring a malformed history line and falling back to today
+
+
+def test_history_bad_date_refuses(cfg, tree):
+    hist = HISTORY + [{"m": "todo: done a1b2c3", "d": "not-a-date-at-all"}]
+    with pytest.raises(TodoError) as e:
+        run_migrate(cfg, tree, run=FakeRun(history=hist))
+    assert "commit history" in str(e.value)
+    assert not (tree.dir / "agent-todos.jsonl").exists()
+    # catches: writing a closed.at that loads() later rejects, which would break every todo command

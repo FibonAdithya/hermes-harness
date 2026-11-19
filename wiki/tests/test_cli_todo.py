@@ -166,6 +166,19 @@ def test_migrated_flags_pass_through(env, migrated, capsys):
     assert "no item with id" in capsys.readouterr().err  # catches flags parsed but not passed through
 
 
+def test_edit_clear_flags_pass_through(env, migrated, capsys):
+    conf = str(env.conf())
+    assert cli.main(["todo", "add", "T", "--project", "x", "--detail", "d1", "--done-when", "pr:a/b#1",
+                     "--config", conf]) == 0
+    i = capsys.readouterr().out.strip()
+    assert cli.main(["todo", "edit", i, "--clear-done-when", "--done-when", "pr:a/b#2", "--config", conf]) == 0
+    r = _recs(migrated)[0]
+    assert r.done_when == [{"pr": "a/b#2", "state": "merged"}] and r.details == ["d1"]
+    assert cli.main(["todo", "edit", i, "--clear-details", "--add-detail", "d2", "--config", conf]) == 0
+    r = _recs(migrated)[0]
+    assert r.details == ["d2"] and r.done_when == [{"pr": "a/b#2", "state": "merged"}]  # catches flags parsed but not passed, or swapped
+
+
 def test_unmigrated_new_commands_exit_1(env, monkeypatch, capsys):
     monkeypatch.setenv("HERMES_WIKI_DRY_PUBLISH", "1")
     env.seed()

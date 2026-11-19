@@ -165,6 +165,31 @@ def test_check_failure_leaves_item_and_counts(tmp_path):
     assert evidence(tmp_path)["check_failures"] == []  # catches never resetting / off-by-one at 3 / double counting
 
 
+def test_check_failures_lists_only_done_when_checks(tmp_path):
+    tree = Tree([rec("aaaaaa", done_when=[pr("o/r#5")], details=["see https://github.com/o/r/pull/7"])])
+    for n in range(3):
+        go(tmp_path, tree, Gh(), today=TODAY + timedelta(days=n))
+    ev = evidence(tmp_path)
+    assert ev["check_failures"] == ["pr:o/r#5"]  # catches alarming on a context URL in the details
+    assert [x["error"] for x in ev["items"][0]["refs"] if x["key"] == "pr:o/r#7"] == ["gh: Not Found (HTTP 404)"]
+
+
+def test_owner_untick_of_check_closed_item_stays_open_through_nightlies(tmp_path):
+    r = rec("aaaaaa", "done", done_when=[pr("o/r#5")],
+            closed={"at": "2026-11-18", "by": "check", "reason": "PR #5 merged 2026-11-18"})
+    tree = Tree([r])
+    page = tree.files[PAGE].split("\n")
+    hit = [n for n, ln in enumerate(page) if ln.endswith("id aaaaaa)")]
+    assert len(hit) == 1 and page[hit[0]].startswith("- [x]")
+    page[hit[0]] = "- [ ]" + page[hit[0]][5:]
+    tree.files[PAGE] = "\n".join(page)
+    gh = Gh({"repos/o/r/pulls/5": merged()})
+    for n in range(2):
+        go(tmp_path, tree, gh, today=TODAY + timedelta(days=n))
+        got = tree.records()["aaaaaa"]
+        assert got.status == "open" and got.done_when == []  # catches the nightly re-closing a reopened item
+
+
 def test_corrupt_state_file_starts_empty(tmp_path):
     (tmp_path / "state.json").write_text("{not json", encoding="utf-8")
     logs = []

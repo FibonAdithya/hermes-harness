@@ -216,9 +216,12 @@ def nightly(cfg, tree, *, suggestions_text: str, evidence_path: Path, state_path
     if files.get(JSONL) is None:
         raise NotMigrated()
     keys: list[str] = []
+    check_keys: set[str] = set()  # the alarm covers done_when checks, not context URLs in details
     for r in loads(files[JSONL]):
         if r.status in _LIVE:
-            for k in [k for k, _ in _check_keys(r)] + _text_keys(r):
+            checks = [k for k, _ in _check_keys(r)]
+            check_keys.update(checks)
+            for k in checks + _text_keys(r):
                 if k not in keys:
                     keys.append(k)
     results = {k: _fetch(cfg, run, k) for k in keys}
@@ -316,7 +319,8 @@ def nightly(cfg, tree, *, suggestions_text: str, evidence_path: Path, state_path
              if r.status in _LIVE]
     _write_json(evidence_path, {
         "generated_at": now.isoformat(),
-        "check_failures": sorted(k for k, v in failures.items() if len(v) >= FAILURE_ALARM),
+        "check_failures": sorted(k for k, v in failures.items()
+                                 if len(v) >= FAILURE_ALARM and k in check_keys),
         "items": items})
     return {**final["counts"], "suggestions_dropped": len(shape_drops) + len(final["drops"]),
             "fetch_failures": sum("error" in res for res in results.values()),
