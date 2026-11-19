@@ -193,7 +193,8 @@ def _cmd_todo(args, cfg) -> int:
     from . import todocmds, todomigrate, todos
 
     run, sleep = subprocess.run, time.sleep
-    today = datetime.now(timezone.utc).date()
+    now = datetime.now(timezone.utc)
+    today = now.date()
     new_id = lambda: secrets.token_hex(3)  # noqa: E731
     tree = todocmds.tree_for(cfg, run)
     common = {"today": today, "new_id": new_id, "sleep": sleep}
@@ -233,11 +234,10 @@ def _cmd_todo(args, cfg) -> int:
                 text = ""
             except (OSError, UnicodeDecodeError) as e:
                 raise todos.TodoError(f"cannot read suggestions file: {type(e).__name__}", 1) from None
-            now = datetime.now(timezone.utc)
             try:
                 summary = todonightly.nightly(
                     cfg, tree, suggestions_text=text, evidence_path=Path(args.evidence).expanduser(),
-                    state_path=Path(args.state).expanduser(), today=now.date(), now=now, run=run,
+                    state_path=Path(args.state).expanduser(), today=today, now=now, run=run,
                     sleep=sleep, log=todocmds._log(cfg), new_id=new_id)
             except todostore.NotMigrated:
                 raise todos.TodoError(todocmds.MIGRATE_FIRST, 1) from None

@@ -62,6 +62,20 @@ def _text_keys(r: Record) -> list[str]:
     return keys
 
 
+def _gh_error(r) -> str:
+    text = _CONTROL.sub("", _first_line(r.stderr))[:MAX_DETAIL]
+    if not text or find_secrets(text):
+        return f"gh failed (rc {r.returncode})"
+    return text
+
+
+def _day(value) -> str | None:
+    try:
+        return date.fromisoformat(value[:10]).isoformat()
+    except (TypeError, ValueError):
+        return None
+
+
 def _fetch(cfg, run, key: str) -> dict:
     kind, repo, num = _split(key)
     endpoint = f"repos/{repo}/{'pulls' if kind == 'pr' else 'issues'}/{num}"
@@ -70,7 +84,7 @@ def _fetch(cfg, run, key: str) -> dict:
     except (subprocess.TimeoutExpired, OSError) as e:
         return {"error": type(e).__name__}
     if r.returncode != 0:
-        return {"error": _first_line(r.stderr) or f"gh exited {r.returncode}"}
+        return {"error": _gh_error(r)}
     try:
         data = json.loads(r.stdout)
     except ValueError as e:
@@ -150,9 +164,30 @@ def _parse_suggestions(text: str) -> tuple[list[tuple[int, str, str, str]], list
     return good, drops
 
 
+def _refused(s: dict) -> bool:
+    return bool(s.get("rejected")) or bool(s.get("expired"))
+
+
+def _blocked_list(s: dict) -> list[str]:
+    b = s.get("blocked_evidence")
+    return [x for x in b if isinstance(x, str)] if isinstance(b, list) else []
+
+
 def _blocked(r: Record, evidence: str) -> bool:
     s = r.suggestion or {}
-    return (bool(s.get("rejected")) or bool(s.get("expired"))) and s.get("evidence") == evidence
+    return evidence in _blocked_list(s) or (_refused(s) and s.get("evidence") == evidence)
+
+
+def _suggest(r: Record, day: str, reason: str, evidence: str) -> None:
+    """Replace the suggestion, carrying forward every evidence the owner or expiry refused."""
+    old = r.suggestion or {}
+    blocked = set(_blocked_list(old))
+    if _refused(old) and isinstance(old.get("evidence"), str):
+        blocked.add(old["evidence"])
+    r.status = "suggested"
+    r.suggestion = {"at": day, "reason": reason, "evidence": evidence}
+    if blocked:
+        r.suggestion["blocked_evidence"] = sorted(blocked)
 
 
 def _ref(key: str, results: dict[str, dict]) -> dict:
@@ -192,7 +227,7 @@ def nightly(cfg, tree, *, suggestions_text: str, evidence_path: Path, state_path
     day = today.isoformat()
     for k, res in results.items():
         if "error" in res:
-            failures[k] = sorted(set(failures.get(k, [])) | {day})
+            failures[k] = sorted(set(failures.get(k, [])) | {day})[-FAILURE_ALARM:]
         else:
             failures.pop(k, None)
     failures = {k: v for k, v in failures.items() if k in results}  # drop items no longer checked
@@ -219,8 +254,7 @@ def nightly(cfg, tree, *, suggestions_text: str, evidence_path: Path, state_path
             elif _blocked(r, evidence):
                 why = "evidence matches a rejected or expired suggestion"
             else:
-                r.status = "suggested"
-                r.suggestion = {"at": day, "reason": reason, "evidence": evidence}
+                _suggest(r, day, reason, evidence)
                 accepted.add(item_id)
                 counts["suggestions_accepted"] += 1
                 continue
@@ -235,9 +269,9 @@ def nightly(cfg, tree, *, suggestions_text: str, evidence_path: Path, state_path
             for k, c, res in checks:
                 kind, _, num = _split(k)
                 if kind == "pr" and res["merged_at"]:
-                    closed = f"PR #{num} merged {res['merged_at'][:10]}"
+                    closed = f"PR #{num} merged {_day(res['merged_at']) or ''}".rstrip()
                 elif kind == "issue" and res["state"] == "closed":
-                    closed = f"issue #{num} closed {(res['closed_at'] or '')[:10]}".rstrip()
+                    closed = f"issue #{num} closed {_day(res['closed_at']) or ''}".rstrip()
                 if closed:
                     break
             if closed:
@@ -253,9 +287,7 @@ def nightly(cfg, tree, *, suggestions_text: str, evidence_path: Path, state_path
                     evidence = f"{k} closed unmerged"
                     if _blocked(r, evidence):
                         continue
-                    r.status = "suggested"
-                    r.suggestion = {"at": day, "reason": f"PR #{num} was closed unmerged",
-                                    "evidence": evidence}
+                    _suggest(r, day, f"PR #{num} was closed unmerged", evidence)
                     counts["suggested_by_checks"] += 1
                     break
 

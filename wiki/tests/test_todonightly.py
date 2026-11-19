@@ -1,5 +1,6 @@
 import json
 import subprocess
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -78,6 +79,8 @@ class Gh:
             raise a
         if isinstance(a, str):
             return subprocess.CompletedProcess(argv, 0, a, "")
+        if isinstance(a, tuple):
+            return subprocess.CompletedProcess(argv, a[0], "", a[1])
         return subprocess.CompletedProcess(argv, 0, json.dumps(a), "")
 
 
@@ -361,6 +364,104 @@ def test_not_migrated(tmp_path):
     with pytest.raises(NotMigrated):
         go(tmp_path, tree, gh)
     assert gh.calls == [] and not (tmp_path / "ev.json").exists()  # catches running on an unmigrated wiki
+
+
+def test_rejected_evidence_survives_a_later_cycle_curator(tmp_path):
+    rej = {"at": "2026-11-01", "reason": "r", "evidence": "E", "rejected": True}
+    tree = Tree([rec("aaaaaa", suggestion=rej)])
+    go(tmp_path, tree, suggestions=sline(id="aaaaaa", reason="r", evidence="F"))
+    s = tree.records()["aaaaaa"].suggestion
+    assert s["evidence"] == "F" and s["blocked_evidence"] == ["E"]
+    assert evidence(tmp_path)["items"][0]["suggestion"]["blocked_evidence"] == ["E"]
+    go(tmp_path, tree, today=TODAY + timedelta(days=7))
+    r = tree.records()["aaaaaa"]
+    assert r.status == "open" and r.suggestion["expired"] is True
+    out = go(tmp_path, tree, suggestions=sline(id="aaaaaa", reason="again", evidence="E"),
+             today=TODAY + timedelta(days=8))
+    assert tree.records()["aaaaaa"].status == "open" and out["suggestions_dropped"] == 1
+    go(tmp_path, tree, suggestions=sline(id="aaaaaa", reason="new", evidence="G"), today=TODAY + timedelta(days=8))
+    assert tree.records()["aaaaaa"].suggestion["blocked_evidence"] == ["E", "F"]  # catches rejection memory lost after one cycle
+
+
+def test_rejected_unmerged_evidence_survives_a_later_cycle_check(tmp_path):
+    ev = "pr:o/r#6 closed unmerged"
+    tree = Tree([rec("aaaaaa", done_when=[pr("o/r#6")],
+                     suggestion={"at": "2026-11-01", "reason": "r", "evidence": ev, "rejected": True})])
+    answers = {"repos/o/r/pulls/6": UNMERGED}
+    go(tmp_path, tree, Gh(answers), suggestions=sline(id="aaaaaa", reason="r", evidence="F"))
+    assert tree.records()["aaaaaa"].suggestion["blocked_evidence"] == [ev]
+    go(tmp_path, tree, Gh(answers), today=TODAY + timedelta(days=7))
+    assert tree.records()["aaaaaa"].status == "open"
+    out = go(tmp_path, tree, Gh(answers), today=TODAY + timedelta(days=8))
+    r = tree.records()["aaaaaa"]
+    assert r.status == "open" and r.suggestion["evidence"] == "F"
+    assert out["suggested_by_checks"] == 0  # catches the check re-suggesting a rejected unmerged PR one cycle later
+
+
+def test_check_suggestion_blocked_by_expired_evidence(tmp_path):
+    exp = {"at": "2026-11-01", "reason": "r", "evidence": "pr:o/r#6 closed unmerged", "expired": True}
+    tree = Tree([rec("aaaaaa", done_when=[pr("o/r#6")], suggestion=exp)])
+    out = go(tmp_path, tree, Gh({"repos/o/r/pulls/6": UNMERGED}))
+    assert tree.records()["aaaaaa"].status == "open" and out["suggested_by_checks"] == 0  # catches blocking only rejected, not expired
+
+
+def test_passing_check_closes_suggested_item(tmp_path):
+    sug = {"at": "2026-11-18", "reason": "x", "evidence": "y"}
+    tree = Tree([rec("aaaaaa", "suggested", done_when=[pr("o/r#5")], suggestion=sug)])
+    out = go(tmp_path, tree, Gh({"repos/o/r/pulls/5": merged()}))
+    r = tree.records()["aaaaaa"]
+    assert r.status == "done" and r.closed["by"] == "check" and out["closed"] == 1  # catches checks applied to open items only
+
+
+def test_unparseable_dates_omitted_from_reason(tmp_path):
+    tree = Tree([rec("aaaaaa", done_when=[pr("o/r#5")]), rec("bbbbbb", done_when=[issue("o/r#9")])])
+    gh = Gh({"repos/o/r/pulls/5": {"state": "closed", "merged_at": "garbage", "closed_at": None},
+             "repos/o/r/issues/9": {"state": "closed", "closed_at": None}})
+    go(tmp_path, tree, gh)
+    got = tree.records()
+    assert got["aaaaaa"].closed["reason"] == "PR #5 merged"
+    assert got["bbbbbb"].closed["reason"] == "issue #9 closed"  # catches a garbage date slice in the reason
+
+
+def test_fetch_error_sanitised(tmp_path):
+    token = "ghp_" + "a" * 36
+    tree = Tree([rec("aaaaaa", details=[f"https://github.com/o/r/pull/{n}" for n in (1, 2, 3, 4)])])
+    gh = Gh({"repos/o/r/pulls/1": (1, "\x1b[31mgh: boom\x1b[0m\nsecond"), "repos/o/r/pulls/2": (1, "x" * 500),
+             "repos/o/r/pulls/3": (4, f"bad {token}"), "repos/o/r/pulls/4": (5, "")})
+    go(tmp_path, tree, gh)
+    errors = {r["key"]: r["error"] for r in evidence(tmp_path)["items"][0]["refs"]}
+    assert errors == {"pr:o/r#1": "[31mgh: boom[0m", "pr:o/r#2": "x" * 300,
+                      "pr:o/r#3": "gh failed (rc 4)", "pr:o/r#4": "gh failed (rc 5)"}
+    assert token not in (tmp_path / "ev.json").read_text()  # catches raw stderr (secrets, escapes, length) reaching the evidence file
+
+
+def test_failure_dates_trimmed_to_last_three(tmp_path):
+    tree = Tree([rec("aaaaaa", done_when=[pr("o/r#5")])])
+    for n in range(4):
+        go(tmp_path, tree, Gh(), today=TODAY + timedelta(days=n))
+    assert json.loads((tmp_path / "state.json").read_text())["failures"] == {
+        "pr:o/r#5": ["2026-11-20", "2026-11-21", "2026-11-22"]}
+    assert evidence(tmp_path)["check_failures"] == ["pr:o/r#5"]  # catches unbounded date lists
+
+
+@pytest.mark.parametrize("field,value,same", [
+    ("title", "Other title", False),
+    ("details", ["https://github.com/o/r/pull/5", "extra"], False),
+    ("project", "other", False),
+    ("status", "suggested", False),
+    ("created", "2026-11-01", True),
+])
+def test_evidence_hash_covers_fields(tmp_path, field, value, same):
+    base = rec("aaaaaa", details=["https://github.com/o/r/pull/5"])
+    changed = replace(base, **{field: value})
+    if field == "status":
+        changed.suggestion = {"at": TODAY.isoformat(), "reason": "r", "evidence": "e"}
+    hashes = []
+    for name, r in (("a", base), ("b", changed)):
+        (tmp_path / name).mkdir()
+        go(tmp_path / name, Tree([r]), Gh({"repos/o/r/pulls/5": OPEN_PR}))
+        hashes.append(evidence(tmp_path / name)["items"][0]["hash"])
+    assert (hashes[0] == hashes[1]) is same  # catches a hashed field left out, or created hashed
 
 
 # --- CLI
