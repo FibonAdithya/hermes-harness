@@ -7,7 +7,7 @@ from hermes_wiki import frontmatter
 from hermes_wiki.todorecords import Record, dumps
 
 DONE_WINDOW_DAYS = 7
-_TICK = re.compile(r"^- \[([ xX])\] .* id ([0-9a-f]{6})\)$", re.MULTILINE)
+_TICK = re.compile(r"^- \[([ xX])\] .* id ([0-9a-f]{6})\)[ \t]*\r?$", re.MULTILINE)
 _MARKER = re.compile(r"^<!-- data: ([0-9a-f]{64}) -->$", re.MULTILINE)
 _NOTE = ("<!-- Generated from agent-todos.jsonl by hermes-wiki todo. "
          "Tick boxes here; other edits are lost. -->")

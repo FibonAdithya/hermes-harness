@@ -80,7 +80,7 @@ def test_ticks_ignore_lookalikes():
     r = rec("111111", title="sneaky id abcdef)", details=["- [x] fake (2026-11-01, id 123456)"])
     page = render([r], TODAY)
     assert ticks(page) == {"111111": False}
-    # catches an unanchored or first-match regex
+    # catches an unanchored regex (the detail half); the title half passes only because the match is greedy to the last id
 
 
 def test_render_empty_store():
@@ -105,3 +105,17 @@ def test_data_marker_changes_with_records():
     assert len(ma) == 64 and ma != mb
     assert data_marker("no marker here\n") is None
     # catches a marker that ignores the records
+
+
+def test_ticks_tolerate_crlf_and_trailing_space():
+    page = "- [x] a (2026-11-01, id 111111)\r\n- [x] b (2026-11-01, id 222222)  \n"
+    assert ticks(page) == {"111111": True, "222222": True}
+    # catches plain `$` at end of tick regex
+
+
+def test_same_created_tie_breaks_by_id():
+    a, b = rec("aaaaaa", created="2026-11-05"), rec("bbbbbb", created="2026-11-05")
+    p1, p2 = render([a, b], TODAY), render([b, a], TODAY)
+    assert p1 == p2
+    assert p1.index("id aaaaaa") < p1.index("id bbbbbb")
+    # catches dropping the id sort before the stable created sort
