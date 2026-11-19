@@ -75,7 +75,7 @@ Your reply is sent to the owner on Telegram.
 
 - If the worklist is exactly `NOTHING TO DO`, reply with exactly `[SILENT]`.
 - If the worklist contains `notes withheld`, `lines withheld` or `lint withheld`, say so in your report and never reply `[SILENT]`. The same applies to any line in the `withheld` section.
-- If the worklist contains `todos withheld`, `todo evidence stale since`, `todo evidence unreadable` or a `todo_check_failures` section, say so in your report and never reply `[SILENT]`.
+- If the worklist contains `todos withheld`, `todo evidence stale`, `todo evidence unreadable` or a `todo_check_failures` section, say so in your report and never reply `[SILENT]`.
 - Otherwise, if you changed no file and nothing was quarantined, reply with exactly `[SILENT]` and nothing else.
 
 In every other case reply with one short message in this form, leaving out any line that would be empty:
