@@ -222,6 +222,26 @@ def _cmd_todo(args, cfg) -> int:
                                          new_id=new_id, history=not dry):
                 check = f"pr:{r.done_when[0]['pr']}" if r.done_when else "--"
                 print(f"{r.id} {r.project} {check} {r.title}")
+        elif args.todo_cmd == "nightly":
+            from . import todonightly, todostore
+
+            if cfg.public_only:
+                raise todos.TodoError("todo nightly is not available on a public_only wiki", code=2)
+            try:
+                text = Path(args.suggestions).expanduser().read_text(encoding="utf-8")
+            except FileNotFoundError:
+                text = ""
+            except (OSError, UnicodeDecodeError) as e:
+                raise todos.TodoError(f"cannot read suggestions file: {type(e).__name__}", 1) from None
+            now = datetime.now(timezone.utc)
+            try:
+                summary = todonightly.nightly(
+                    cfg, tree, suggestions_text=text, evidence_path=Path(args.evidence).expanduser(),
+                    state_path=Path(args.state).expanduser(), today=now.date(), now=now, run=run,
+                    sleep=sleep, log=todocmds._log(cfg), new_id=new_id)
+            except todostore.NotMigrated:
+                raise todos.TodoError(todocmds.MIGRATE_FIRST, 1) from None
+            print(json.dumps(summary, sort_keys=True))
         else:
             for r in todocmds.cmd_list(cfg, tree, args.all, args.json, args.project, run=run):
                 if args.json:
@@ -265,11 +285,15 @@ def _add_todo(sub) -> None:
     ro = tsub.add_parser("reopen", help="reopen a done item or reject a suggestion")
     ro.add_argument("id")
     mg = tsub.add_parser("migrate", help="one-off: move todos.md items into agent-todos.jsonl")
+    nt = tsub.add_parser("nightly", help="droplet job: run checks, apply curator suggestions, write evidence")
+    nt.add_argument("--suggestions", required=True, help="curator suggestions JSONL (missing reads as empty)")
+    nt.add_argument("--evidence", required=True, help="evidence JSON file to write for the curator")
+    nt.add_argument("--state", required=True, help="check failure state JSON file")
     ls = tsub.add_parser("list", help="list open items (--all includes done)")
     ls.add_argument("--all", action="store_true")
     ls.add_argument("--json", action="store_true", help="one JSON record per line")
     ls.add_argument("--project", help="only items of this project")
-    for child in (a, d, e, r, ro, ls, mg):
+    for child in (a, d, e, r, ro, ls, mg, nt):
         child.add_argument("--config", default=argparse.SUPPRESS, help="config file path")
 
 
