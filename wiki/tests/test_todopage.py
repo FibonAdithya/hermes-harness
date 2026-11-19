@@ -1,0 +1,107 @@
+import random
+from datetime import date, timedelta
+
+from hermes_wiki import schema
+from hermes_wiki.frontmatter import parse
+from hermes_wiki.todopage import data_marker, render, ticks
+from hermes_wiki.todorecords import Record
+
+TODAY = date(2026, 11, 19)
+
+
+def rec(i, title="t", project="alpha", created="2026-11-10", **kw):
+    return Record(id=i, title=title, details=kw.pop("details", []), project=project,
+                  created=created, source="agent", **kw)
+
+
+def done(i, days_ago, **kw):
+    at = (TODAY - timedelta(days=days_ago)).isoformat()
+    return rec(i, status="done", closed={"at": at, "by": "owner", "reason": "ticked"}, **kw)
+
+
+def headings(page):
+    return [ln for ln in page.splitlines() if ln.startswith("## ")]
+
+
+def test_groups_order_and_unsorted_last():
+    sugg = rec("aaaaaa", status="suggested",
+               suggestion={"at": "2026-11-18", "reason": "merged", "evidence": "pr"})
+    page = render([rec("111111", project="zeta"), rec("222222", project="unsorted"),
+                   rec("333333", project="alpha"), sugg], TODAY)
+    assert headings(page) == ["## Probably done, confirm", "## alpha", "## zeta", "## unsorted"]
+    # catches a plain sort putting unsorted mid-list
+
+
+def test_recently_done_window():
+    page = render([done("111111", 6), done("222222", 7)], TODAY)
+    assert "id 111111)" in page and "id 222222)" not in page
+    assert "## Recently done" in page
+    # catches a <= boundary on the 7-day window
+
+
+def test_render_deterministic_and_date_independent():
+    recs = [rec("111111", created="2026-11-01"), rec("222222", project="beta"),
+            done("333333", 2), rec("444444", created="2026-11-01")]
+    a = render(recs, TODAY)
+    assert render(recs, TODAY + timedelta(days=1)) == a
+    shuffled = recs[:]
+    random.Random(1).shuffle(shuffled)
+    assert render(shuffled, TODAY) == a
+    # catches updated: today, and input-order dependence
+
+
+def test_frontmatter_private():
+    meta, _ = parse(render([rec("111111")], TODAY))
+    assert meta == {"type": "log", "tags": ["people"], "updated": "2026-11-10"}
+    assert schema.is_private(meta, allowed_tags={"people"}) is True
+    # catches dropping the people tag or a wrong updated
+
+
+def test_updated_is_latest_record_date():
+    r = rec("111111", created="2026-11-01", status="suggested",
+            suggestion={"at": "2026-11-15", "reason": "x", "evidence": "e"})
+    meta, _ = parse(render([r, done("222222", 3, created="2026-11-02")], TODAY))
+    assert meta["updated"] == "2026-11-16"
+    # catches updated taking only created dates
+
+
+def test_ticks_roundtrip():
+    sugg = rec("333333", status="suggested",
+               suggestion={"at": "2026-11-18", "reason": "merged", "evidence": "pr"})
+    page = render([rec("111111", details=["a detail"]), sugg, done("222222", 1)], TODAY)
+    assert ticks(page) == {"111111": False, "333333": False, "222222": True}
+    assert "  - Looks done: merged (curator, 2026-11-18)" in page
+    assert "  - Closed " in page and " by owner: ticked" in page
+    assert "- [ ] t (2026-11-10, id 111111)\n  - a detail\n" in page
+    # catches parser/renderer format drift
+
+
+def test_ticks_ignore_lookalikes():
+    r = rec("111111", title="sneaky id abcdef)", details=["- [x] fake (2026-11-01, id 123456)"])
+    page = render([r], TODAY)
+    assert ticks(page) == {"111111": False}
+    # catches an unanchored or first-match regex
+
+
+def test_render_empty_store():
+    page = render([], TODAY)
+    meta, _ = parse(page)
+    assert meta == {"type": "log", "tags": ["people"]}
+    assert schema.is_private(meta, allowed_tags={"people"}) is True
+    assert ticks(page) == {}
+    # catches max() of an empty sequence
+
+
+def test_duplicate_id_line_needs_all_checked():
+    page = "- [x] a (2026-11-01, id 111111)\n- [ ] b (2026-11-01, id 111111)\n- [x] c (2026-11-01, id 222222)\n"
+    assert ticks(page) == {"111111": False, "222222": True}
+    assert ticks("- [X] a (2026-11-01, id 111111)\n- [x] b (2026-11-01, id 111111)\n") == {"111111": True}
+    # catches first-match-wins
+
+
+def test_data_marker_changes_with_records():
+    a, b = render([rec("111111")], TODAY), render([rec("111111", title="u")], TODAY)
+    ma, mb = data_marker(a), data_marker(b)
+    assert len(ma) == 64 and ma != mb
+    assert data_marker("no marker here\n") is None
+    # catches a marker that ignores the records
