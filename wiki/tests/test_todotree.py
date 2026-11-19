@@ -48,7 +48,7 @@ class FakeRun:
             if path not in self.files:
                 return cp(stderr="gh: Not Found (HTTP 404)", rc=1)
             raw = base64.encodebytes(self.files[path].encode()).decode()
-            return cp(json.dumps({"content": raw}))
+            return cp(json.dumps({"content": raw, "encoding": "base64"}))
         if key == ("GET", f"git/commits/{SHA}"):
             return cp(json.dumps({"tree": {"sha": TREE}}))
         if key == ("POST", "git/trees"):
@@ -144,3 +144,36 @@ def test_dry_tree_conflict(tmp_path):
         d.commit(base2, {"agent-todos.jsonl": "2"}, "m")
     assert (tmp_path / "dry" / "agent-todos.jsonl").read_text() == "1"
     # catches dry mode ignoring base
+
+
+def test_head_refuses_files_too_large_for_contents_api():
+    run = FakeRun(files={"todos.md": "x"})
+    orig = run.__call__
+
+    def big(argv, **kw):
+        if any(a.startswith("repos/o/r/contents/agent-todos.md") for a in argv):
+            return cp(json.dumps({"content": "", "encoding": "none"}))
+        return orig(argv, **kw)
+
+    with pytest.raises(StoreError, match="agent-todos.md is too large"):
+        tree(big).head()
+    # catches decode without checking encoding
+
+
+@pytest.mark.parametrize("step,route", [
+    ("commit", ("GET", f"git/commits/{SHA}")),
+    ("trees", ("POST", "git/trees")),
+    ("commits", ("POST", "git/commits")),
+])
+@pytest.mark.parametrize("kind", ["rc", "malformed", "oserror"])
+def test_commit_errors_before_ref_update_are_store_errors(step, route, kind):
+    out = {
+        "rc": cp(json.dumps({"tree": {"sha": TREE}, "sha": NEW_TREE}), stderr="gh: boom (HTTP 500)", rc=1),
+        "malformed": cp(json.dumps({"unexpected": 1})),
+        "oserror": OSError("no gh"),
+    }[kind]
+    run = FakeRun(fail={route: out})
+    with pytest.raises(StoreError):
+        tree(run).commit(SHA, {"a": "1"}, "m")
+    assert not [c for c in run.calls if c[0] == "PATCH"]
+    # catches `_json` ignoring returncode / unguarded response parsing

@@ -55,8 +55,11 @@ class GhTree:
                 files[p] = None
                 continue
             try:
-                files[p] = base64.b64decode(self._json(r)["content"]).decode("utf-8")
-            except (ValueError, KeyError, TypeError) as e:
+                data = self._json(r)
+                if data.get("encoding") != "base64":
+                    raise StoreError(f"{p} is too large for the contents API")
+                files[p] = base64.b64decode(data["content"]).decode("utf-8")
+            except (ValueError, KeyError, TypeError, AttributeError) as e:
                 raise StoreError(f"unexpected response: {type(e).__name__}") from None
         return sha, files
 
