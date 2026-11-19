@@ -156,10 +156,12 @@ def test_migrated_flags_pass_through(env, migrated, capsys):
     assert cli.main(["todo", "reopen", i, "--config", conf]) == 0
     assert cli.main(["todo", "edit", i, "--add-detail", "d", "--config", conf]) == 0
     assert _recs(migrated)[0].details == ["d"]
+    assert cli.main(["todo", "add", "Other", "--project", "y", "--config", conf]) == 0
+    other = capsys.readouterr().out.strip()
     assert cli.main(["todo", "list", "--json", "--project", "x", "--config", conf]) == 0
     assert json.loads(capsys.readouterr().out.strip())["id"] == i
     assert cli.main(["todo", "rm", i, "--config", conf]) == 0
-    assert _recs(migrated) == []
+    assert [r.id for r in _recs(migrated)] == [other]
     assert cli.main(["todo", "rm", i, "--config", conf]) == 1
     assert "no item with id" in capsys.readouterr().err  # catches flags parsed but not passed through
 

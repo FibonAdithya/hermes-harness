@@ -86,12 +86,23 @@ def test_add_records_checks_source_created(tmp_path):
     assert (r.source, r.created) == ("claude-box", "2026-11-19")  # catches dropped checks/metadata
 
 
-def test_add_invalid_project_rejected_without_write(tmp_path):
-    tree, jl = seed(tmp_path, [])
-    before = jl.read_text()
+class NoHead:
+    def head(self, paths=None):
+        raise AssertionError("GitHub was called before validation")
+
+    def commit(self, *a):
+        raise AssertionError("GitHub was called before validation")
+
+
+@pytest.mark.parametrize("title,project,checks", [
+    ("x" * 121, "ok", []),
+    ("T", "Bad Name", []),
+    ("T", "ok", ["pr:nonsense"]),
+])
+def test_add_validates_before_any_github_call(tmp_path, title, project, checks):
     with pytest.raises(TodoRejected):
-        add(cfg_for(tmp_path), tree, Run(), project="Bad Name")
-    assert jl.read_text() == before  # catches writing before validating
+        add(cfg_for(tmp_path), NoHead(), Run(), title=title, project=project, checks=checks)
+    # catches validating after the head read or commit
 
 
 def test_add_commit_message_and_id_unique(tmp_path):
@@ -106,6 +117,13 @@ def test_done_sets_closed_by_agent(tmp_path):
     r = loads(jl.read_text())[0]
     assert r.status == "done"
     assert r.closed == {"at": "2026-11-19", "by": "agent", "reason": "shipped"}  # catches wrong closer
+
+
+@pytest.mark.parametrize("reason", ["line one\nforged", "token ghp_" + "a" * 36, "   ", "x" * 301])
+def test_done_rejects_bad_reason_before_any_github_call(tmp_path, reason):
+    with pytest.raises(TodoRejected) as e:
+        todocmds.cmd_done(cfg_for(tmp_path), NoHead(), "aaaaaa", reason, run=Run(), **kw())
+    assert e.value.code == 2  # catches storing an unvalidated reason (page forgery, secrets)
 
 
 def test_done_default_reason_and_already_done(tmp_path):
@@ -192,23 +210,49 @@ def test_list_json_refused_on_public_only_without_gh_call(tmp_path):
     assert run.calls == []  # catches leaking private items to the box
 
 
-def test_box_add_prints_only_id(tmp_path, capsys):
+STRAY = ("---\ntype: log\ntags: [people]\nupdated: 2026-11-07\n---\n\n# Todos\n\n"
+         "## Agent follow-ups\n![[agent-todos]]\n- [ ] Stray one (2026-11-12, box, id 111111)\n")
+
+
+def _box_env(tmp_path, monkeypatch, **extra):
+    conf = tmp_path / "c.json"
+    conf.write_text(json.dumps({"root": str(tmp_path), "source": "box",
+                                "state_dir": str(tmp_path / "state"), **extra}))
+    _, jl = seed(tmp_path / "state", [rec("aaaaaa")])
+    (jl.parent / "todos.md").write_text(STRAY, encoding="utf-8")
+    monkeypatch.setenv("HERMES_WIKI_DRY_PUBLISH", "1")
+    return str(conf)
+
+
+def test_box_add_prints_only_id(tmp_path, monkeypatch, capsys):
+    import re
     from hermes_wiki import cli
 
-    conf = tmp_path / "c.json"
-    conf.write_text(json.dumps({"root": str(tmp_path), "source": "box", "public_only": True,
-                                "state_dir": str(tmp_path / "state")}))
-    seed(tmp_path / "state", [rec("aaaaaa")])
-    import os
-    os.environ["HERMES_WIKI_DRY_PUBLISH"] = "1"
-    try:
-        assert cli.main(["todo", "add", "Secret-ish title", "--project", "x", "--config", str(conf)]) == 0
-    finally:
-        del os.environ["HERMES_WIKI_DRY_PUBLISH"]
+    conf = _box_env(tmp_path, monkeypatch, public_only=True)
+    assert cli.main(["todo", "add", "Secret-ish title", "--project", "x", "--config", conf]) == 0
     cap = capsys.readouterr()
-    import re
     assert re.fullmatch(r"[0-9a-f]{6}\n", cap.out)
-    assert cap.err == ""  # catches printing content or logs on the box
+    assert cap.err == ""  # catches printing transact logs on the box
+
+
+def test_non_box_add_logs_the_import(tmp_path, monkeypatch, capsys):
+    from hermes_wiki import cli
+
+    conf = _box_env(tmp_path, monkeypatch)
+    assert cli.main(["todo", "add", "T", "--project", "x", "--config", conf]) == 0
+    assert "hermes-wiki: imported 111111 from todos.md" in capsys.readouterr().err
+    # control: proves the box test's empty stderr comes from public_only, not from a quiet state
+
+
+def test_box_rejection_prints_no_item_text(tmp_path, monkeypatch, capsys):
+    from hermes_wiki import cli
+
+    conf = _box_env(tmp_path, monkeypatch, public_only=True)
+    title = "Visible-title ghp_" + "a" * 36
+    assert cli.main(["todo", "add", title, "--detail", "Visible-detail", "--config", conf]) == 2
+    cap = capsys.readouterr()
+    assert "Visible" not in cap.out + cap.err and "ghp_" not in cap.out + cap.err
+    # catches echoing item text in refusals on the box
 
 
 def _gh(puts, todos_md=None):
@@ -249,7 +293,7 @@ def test_unmigrated_edit_exits_1(tmp_path):
         with pytest.raises(TodoError, match="run hermes-wiki todo migrate first") as e:
             fn()
         assert e.value.code == 1
-    assert run.calls == []  # catches writing to todos.md for new commands
+    assert run.calls == []  # catches new commands falling back to the old todos.md path
 
 
 def test_unmigrated_list_uses_old_path(tmp_path):

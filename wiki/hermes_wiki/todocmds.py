@@ -8,6 +8,8 @@ from pathlib import Path
 
 from hermes_wiki import todos
 from hermes_wiki.config import WikiConfig
+from hermes_wiki.notes import _CONTROL
+from hermes_wiki.secretscan import find_secrets
 from hermes_wiki.todorecords import Record, loads, new_id as _new_id, project_from_origin, validate_item
 from hermes_wiki.todostore import JSONL, Change, NotMigrated, transact
 from hermes_wiki.todotree import DryTree, GhTree
@@ -65,24 +67,18 @@ def cmd_add(cfg: WikiConfig, tree, title: str, details: list[str], project: str 
     resolved = project if project is not None else _project_of(cwd, run)
     title, details, done_when = validate_item(title, details, resolved, checks)
     landed: list[str] = []
+    change = Change(message="todo: add", fn=lambda records, today_: records)
 
     def fn(records: list[Record], today_: date) -> list[Record]:
         item_id = _new_id({r.id for r in records}, new_id)
         landed[:] = [item_id]
+        change.message = f"todo: add {item_id}"  # the id is only known here
         records.append(Record(id=item_id, title=title, details=details, project=resolved,
                               created=today.isoformat(), source=cfg.source,
                               done_when=done_when))
         return records
 
-    change = Change(message="todo: add", fn=fn)  # message gets the id once fn has run
-    inner = fn
-
-    def fn_msg(records, today_):
-        out = inner(records, today_)
-        change.message = f"todo: add {landed[0]}"
-        return out
-
-    change.fn = fn_msg
+    change.fn = fn
     try:
         _transact(cfg, tree, change, today=today, new_id=new_id, sleep=sleep)
     except NotMigrated:
@@ -93,8 +89,25 @@ def cmd_add(cfg: WikiConfig, tree, title: str, details: list[str], project: str 
     return landed[0]
 
 
+def _validate_reason(reason: str) -> str:
+    reason = reason.strip()
+    errors = []
+    if not reason:
+        errors.append("reason: empty")
+    elif len(reason) > todos.MAX_DETAIL:
+        errors.append(f"reason: longer than {todos.MAX_DETAIL} characters")
+    if _CONTROL.search(reason):
+        errors.append("reason: must be one line without control characters")
+    errors += [f"secret pattern: {n}" for n in find_secrets(reason)]
+    if errors:
+        raise todos.TodoRejected(errors)
+    return reason
+
+
 def cmd_done(cfg: WikiConfig, tree, item_id: str, reason: str | None, *, today: date,
              new_id, sleep, run) -> bool:
+    if reason is not None:
+        reason = _validate_reason(reason)
     def fn(records, today_):
         r = _find(records, item_id)
         if r.status == "done":
@@ -131,7 +144,7 @@ def cmd_edit(cfg: WikiConfig, tree, item_id: str, title: str | None, add_details
 def cmd_rm(cfg: WikiConfig, tree, item_id: str, *, today: date, new_id, sleep) -> None:
     def fn(records, today_):
         r = _find(records, item_id)
-        return [x for x in records if x is not r and x.id != item_id]
+        return [x for x in records if x is not r]
 
     _strict(cfg, tree, Change(f"todo: rm {item_id}", fn), today=today, new_id=new_id, sleep=sleep)
 
@@ -164,6 +177,7 @@ def cmd_list(cfg: WikiConfig, tree, include_done: bool, as_json: bool,
     if text is None:
         if as_json:
             raise TodoError(MIGRATE_FIRST, 1)
+        # old items have no project, so --project is not applied to them
         items = todos.cmd_list(cfg, todos.store_for(cfg, run), include_done)
         records = [Record(id=i.id or "-", title=i.title, details=[], project="unsorted",
                           created=i.created or "", source=i.source or "",
@@ -171,4 +185,4 @@ def cmd_list(cfg: WikiConfig, tree, include_done: bool, as_json: bool,
     else:
         records = loads(text)
     return [r for r in records
-            if (include_done or r.status != "done") and (project is None or r.project == project)]
+            if (include_done or r.status != "done") and (project is None or text is None or r.project == project)]
