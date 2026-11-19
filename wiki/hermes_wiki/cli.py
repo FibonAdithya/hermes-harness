@@ -190,7 +190,7 @@ def _cmd_todo(args, cfg) -> int:
     from dataclasses import asdict
     from datetime import datetime, timezone
 
-    from . import todocmds, todos
+    from . import todocmds, todomigrate, todos
 
     run, sleep = subprocess.run, time.sleep
     today = datetime.now(timezone.utc).date()
@@ -214,6 +214,14 @@ def _cmd_todo(args, cfg) -> int:
             todocmds.cmd_rm(cfg, tree, args.id, **common)
         elif args.todo_cmd == "reopen":
             todocmds.cmd_reopen(cfg, tree, args.id, **common)
+        elif args.todo_cmd == "migrate":
+            if cfg.public_only:
+                raise todos.TodoError("todo migrate is not available on a public_only wiki", code=2)
+            dry = os.environ.get("HERMES_WIKI_DRY_PUBLISH") == "1"
+            for r in todomigrate.migrate(cfg, tree, today=today, run=run, log=todocmds._log(cfg),
+                                         new_id=new_id, history=not dry):
+                check = f"pr:{r.done_when[0]['pr']}" if r.done_when else "--"
+                print(f"{r.id} {r.project} {check} {r.title}")
         else:
             for r in todocmds.cmd_list(cfg, tree, args.all, args.json, args.project, run=run):
                 if args.json:
@@ -256,11 +264,12 @@ def _add_todo(sub) -> None:
     r.add_argument("id")
     ro = tsub.add_parser("reopen", help="reopen a done item or reject a suggestion")
     ro.add_argument("id")
+    mg = tsub.add_parser("migrate", help="one-off: move todos.md items into agent-todos.jsonl")
     ls = tsub.add_parser("list", help="list open items (--all includes done)")
     ls.add_argument("--all", action="store_true")
     ls.add_argument("--json", action="store_true", help="one JSON record per line")
     ls.add_argument("--project", help="only items of this project")
-    for child in (a, d, e, r, ro, ls):
+    for child in (a, d, e, r, ro, ls, mg):
         child.add_argument("--config", default=argparse.SUPPRESS, help="config file path")
 
 
