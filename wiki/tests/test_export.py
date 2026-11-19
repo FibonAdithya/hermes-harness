@@ -323,3 +323,36 @@ def test_infra_symlink_to_private_page_inside_wiki_not_exported(tmp_path):
     dest = tmp_path / "pub"
     export_public(src, dest, "h1", 1000)
     assert not (dest / "CONVENTIONS.md").exists()
+
+
+def _todo_wiki(tmp_path, page_transform=lambda s: s):
+    from datetime import date
+
+    from hermes_wiki import todopage
+    from hermes_wiki.todorecords import Record, dumps
+
+    src = _src(tmp_path)
+    rec = Record(id="abc123", title="Private todo", details=[], project="unsorted",
+                 created="2026-11-19", source="laptop")
+    (src / "agent-todos.jsonl").write_text(dumps([rec]), encoding="utf-8")
+    (src / "agent-todos.md").write_text(
+        page_transform(todopage.render([rec], date(2026, 11, 19))), encoding="utf-8")
+    return src
+
+
+def test_export_excludes_agent_todo_files(tmp_path):
+    src = _todo_wiki(tmp_path)
+    dest = tmp_path / "pub"
+    export_public(src, dest, "h1", 1000)
+    files = _files(dest.resolve())
+    assert "alpha.md" in files  # the export ran and kept a public page
+    assert "agent-todos.md" not in files and "agent-todos.jsonl" not in files
+    assert "Private todo" not in "".join(p.read_text() for p in dest.resolve().rglob("*") if p.is_file())
+    # catches: a page frontmatter without the private `people` tag, or a jsonl export
+
+
+def test_export_pin_fails_when_page_loses_private_tag(tmp_path):
+    src = _todo_wiki(tmp_path, lambda s: s.replace("tags: [people]", "tags: [ops]"))
+    dest = tmp_path / "pub"
+    export_public(src, dest, "h1", 1000)
+    assert "agent-todos.md" in _files(dest.resolve())  # control: the pin above does discriminate

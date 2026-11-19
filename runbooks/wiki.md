@@ -21,6 +21,8 @@ export it fails with "Failed to connect to bus: No medium found".
 | droplet | `~/.local/bin/hermes-wiki-sync.sh` (symlink), pull-rebase then push | `droplet/hermes-wiki-sync.sh`, `droplet/wiki-git-sync.sh` |
 | droplet | `~/.hermes/scripts/wiki-worklist.py` (copy; Hermes only runs `--script` files from there), refreshed by `harness-pull` | `droplet/wiki-worklist.py` |
 | droplet | `~/.hermes/skills/wiki/delegate-with-context/` | `droplet/skills/delegate-with-context/` |
+| droplet | `todo-nightly.timer` (00:45) runs `todo-nightly.service`, which runs `~/.local/bin/todo-nightly.sh` (symlink) | `droplet/units/todo-nightly.{service,timer}`, `droplet/todo-nightly.sh` |
+| droplet | `~/.config/hermes-wiki/config.json` (written only if absent), used by the nightly job | `droplet/hermes-wiki-droplet.json` |
 | droplet | `wiki-curator` cron job, 01:00 (moved from 03:00 on 2026-11-09 so it ends before the tuner's 02:00–05:00 restart window) | prompt in `droplet/wiki-curator-prompt.md` |
 | laptop | `hermes-wiki` CLI, `wiki` MCP server, SessionEnd hook | `wiki/install-laptop.sh` |
 | box | wiki mirror and public export at `~/TIG/hermes-wiki-public` | `box/install.sh` |
@@ -238,55 +240,228 @@ check (acceptance check 13).
 
 ## Todo items
 
-The owner's todo list is `todos.md` at the root of the wiki repo. Agents add
-follow-up items under its `## Agent follow-ups` section.
+The owner's todo list lives in the wiki repo on `main`, in three files:
 
-**Who writes where.** Laptop and box sessions run `hermes-wiki todo`, which
-edits `todos.md` on `main` through the GitHub contents API (GET, then PUT with
-the file's `sha`; on HTTP 409 it re-reads and retries, 5 attempts at most).
-Hermes on the droplet edits its own checkout of `todos.md` directly; there is
-no droplet todo command.
+| File | Owner | Contents |
+|---|---|---|
+| `agent-todos.jsonl` | `hermes-wiki todo` (laptop, box, and the droplet nightly job) | The records. One JSON object per line, sorted by id. This is the source of truth. |
+| `agent-todos.md` | generated from the jsonl by every write | The page the owner reads and ticks in Obsidian. Frontmatter is `type: log`, `tags: [people]`, `updated: DATE`, so the export to the box never includes it. |
+| `todos.md` | the owner | The owner's own list. After migration its `## Agent follow-ups` section holds only `![[agent-todos]]` and a link line to the page. |
 
-**The section.** It starts at the line `## Agent follow-ups` and ends before the
-next line that starts with `## ` (or at the end of the file). A `### ` line
-does not end it. Existing lines outside the section are never edited, the
-frontmatter included. When `add` has to create the heading, it may add a blank
-separator line, and a missing final newline on the line before the heading. If
-the heading is missing, `add` creates it before the first `## ` heading after
-the `# ` title; with no `# ` title it goes before the first `## ` heading after
-the frontmatter, or at the end of the file. If the heading appears twice, the
-command is refused. Each item is
-`- [ ] TITLE (YYYY-MM-DD, SOURCE, id XXXXXX)` with optional `  - DETAIL` lines
-under it. The date is UTC, SOURCE is the config's `source`, and the id is 6
-lowercase hex characters.
+`agent-todos.md` and `agent-todos.jsonl` are also kept out of the public
+export by `wiki/tests/test_export.py::test_export_excludes_agent_todo_files`.
+Nothing edits these files by hand and Hermes on the droplet no longer edits
+`todos.md`: every change goes through `hermes-wiki todo`, which commits all
+changed files in one commit through the GitHub git-data API. On the droplet
+only the nightly job runs it (`todo nightly`).
 
-**Commands.**
+**Records.** Fields: `id` (6 lowercase hex), `title` (1-120 characters, one
+line), `details` (at most 15 lines of 1-300 characters), `project`
+(`[a-z0-9][a-z0-9._-]{0,39}`, `unsorted` when unknown), `created` (UTC date),
+`source` (the config's `source`), `status`, `done_when`, `closed` and
+`suggestion`.
 
-- `hermes-wiki todo add TITLE [--detail LINE]... [--detail-stdin]` adds an item
-  and prints its id. The title is one line of 1-120 characters. Each detail is
-  one line of at most 300 characters, and there are at most 15.
-  `--detail-stdin` strips each line and drops blank lines. Any secret-scan hit
-  refuses the item.
-- `hermes-wiki todo done ID` ticks the item. An item that is already ticked
-  exits 0 with a message on stderr.
-- `hermes-wiki todo list [--all]` prints `ID TITLE` for open items (all items
-  with `--all`). It is refused on the box, where the config has `public_only`,
-  and makes no GitHub call there.
+- `status` is `open`, `suggested` (the curator or a check thinks it is done and
+  the owner has not confirmed) or `done`.
+- `done_when` is a list of checks, `{"pr": "OWNER/REPO#N", "state": "merged"}`
+  or `{"issue": "OWNER/REPO#N", "state": "closed"}`. The nightly job closes an
+  item when any check passes.
+- `closed` is `{"at": DATE, "by": "check" | "agent" | "owner", "reason": TEXT}`.
+  `by` is `agent` for `todo done`, `owner` for a tick in Obsidian or in
+  `todos.md`, and `check` for the nightly job.
+- `suggestion` is `{"at": DATE, "reason": TEXT, "evidence": TEXT}` plus
+  optional `rejected: true`, `expired: true` and `blocked_evidence: [TEXT, ...]`.
+  `rejected` is set by `todo reopen` on a suggested item. `expired` is set when
+  a suggestion is 7 days old without an answer. `blocked_evidence` is a sorted
+  list that collects the evidence of every rejected or expired suggestion on
+  the item, so a replaced suggestion does not make the old evidence usable
+  again.
 
-Exit codes: 2 for a validation failure, a secret hit, or `list` on a
-`public_only` config. 1 for a missing `todos.md` on `main`, a duplicate
-heading, an unknown id, 5 conflicts in a row, a PUT timeout, or any other
-GitHub failure. After a PUT timeout the write may or may not have landed. The
-error message names the item id; run `hermes-wiki todo list --all` on the
-laptop and look for that id before adding the item again (`list` is refused on
-the box). Otherwise 0. `add` validates its input before any GitHub call.
-Output never includes `todos.md` content except the `list` output.
+The page groups items as: `## Probably done, confirm` (suggested items), one
+`## PROJECT` heading per project with open items (alphabetical, `unsorted`
+last), and `## Recently done` (items closed fewer than 7 days ago). Each item is
+`- [ ] TITLE (DATE, id XXXXXX)` in a project group and
+`- [ ] TITLE (PROJECT, DATE, id XXXXXX)` elsewhere, with its details indented
+two spaces. A hidden comment on the page carries the sha256 of the jsonl it was
+generated from.
 
-Setting `HERMES_WIKI_DRY_PUBLISH=1` reads and writes `<state_dir>/dry/todos.md`
-instead of GitHub.
+**Commands.** All take `--config PATH`. Item text must not contain a secret
+(any secret-scan hit refuses it), and input is validated before any GitHub call.
 
-**The curator** never edits, moves, splits, trims or files anything into the
-`## Agent follow-ups` section. The rest of `todos.md` follows the usual rules.
+- `hermes-wiki todo add TITLE [--detail LINE]... [--detail-stdin] [--project NAME] [--done-when CHECK]...`
+  adds an item and prints its id. `--detail-stdin` also reads detail lines from
+  stdin, stripping each and dropping blank ones. `--project` defaults to the repo
+  name in the `origin` remote of the current directory (`unsorted` when there is
+  none). A `CHECK` is `pr:OWNER/REPO#N` or `issue:OWNER/REPO#N`.
+- `hermes-wiki todo edit ID [--title T] [--add-detail LINE]... [--project NAME] [--done-when CHECK]...`
+  changes the title or project and appends details and checks.
+- `hermes-wiki todo done ID [--reason TEXT]` closes the item with `by: agent`
+  (reason defaults to `done`; it is one line, at most 300 characters, and is
+  secret-scanned). An item that is already done exits 0 with a message on stderr.
+- `hermes-wiki todo rm ID` deletes the record (use it for duplicates).
+- `hermes-wiki todo reopen ID` reopens a done item (clears `closed`). On a
+  suggested item it sets `rejected: true` and returns the item to open. On an
+  open item it exits 1.
+- `hermes-wiki todo list [--all] [--json] [--project NAME]` prints
+  `ID TITLE` for open items, with ` [suggested]` or ` [done]` after the id.
+  `--all` includes done items. `--json` prints one record per line.
+- `hermes-wiki todo migrate` is a one-off, see "Migration".
+- `hermes-wiki todo nightly --suggestions PATH --evidence PATH --state PATH` is
+  the droplet job's command, see "Nightly job".
+
+Exit codes: 2 for a validation failure, a secret hit, or a `public_only`
+refusal. 1 for an unknown id, `reopen` on an open item, a missing
+`agent-todos.jsonl` where the command needs it (`run hermes-wiki todo migrate
+first`), 5 conflicts in a row, a timeout, or any other GitHub failure. Otherwise
+0. Each write retries a conflict at most 5 times (reads the three files again,
+re-imports the owner's ticks, re-applies the change). A timeout on the commit is
+not retried: the error names the item id, and the write may or may not have
+landed. Run `hermes-wiki todo list --all` on the laptop and look for that id
+before adding the item again.
+
+**Box (`public_only`).** `list` (with or without `--json`), `migrate` and
+`nightly` are refused with exit 2 and make no GitHub call. The other commands
+run, but print only ids and error messages, never file content, and write no
+progress log.
+
+**Dry mode.** `HERMES_WIKI_DRY_PUBLISH=1` reads and writes a local tree under
+`<state_dir>/dry/` instead of GitHub. `migrate` skips the commit-history lookup
+in dry mode.
+
+**Dual mode until migrated.** Until `hermes-wiki todo migrate` has run (no
+`agent-todos.jsonl` on `main`), `add`, `done` and `list` keep the old behaviour:
+they edit `## Agent follow-ups` in `todos.md` through the GitHub contents API
+(GET, then PUT with the file's `sha`; HTTP 409 re-reads and retries, 5 attempts
+at most), items are `- [ ] TITLE (YYYY-MM-DD, SOURCE, id XXXXXX)` with optional
+`  - DETAIL` lines, and `list` prints old items with project `unsorted`.
+`add` ignores `--project` and `--done-when` (it prints a notice on stderr), and
+`done --reason` is not recorded. `edit`, `rm`, `reopen`, `list --json` and
+`nightly` refuse with exit 1 and the message `run hermes-wiki todo migrate
+first`. So an older laptop or box checkout keeps working before and after
+migration for `add` and `done`: after migration, items it adds under the
+heading are imported (see "Owner edits").
+
+**Migration.** `hermes-wiki todo migrate` (laptop, once) reads the items under
+`## Agent follow-ups` in `todos.md` and writes, in one commit `todo: migrate`:
+`agent-todos.jsonl`, `agent-todos.md`, `todos.md` with the items replaced by
+`![[agent-todos]]` and `Open the page to tick: [[agent-todos]]`, and a
+`.gitignore` line for `.todo-suggestions.jsonl`. It prints one line per item,
+`ID PROJECT CHECK TITLE`. It guesses the project from repo names in the item
+text (`unsorted` when none or more than one), adds a `pr:` check to an item that
+starts with `Merge` or `Review and merge` and names exactly one PR URL, and takes
+the closed date of a ticked item from the commit history of `todos.md` (the
+`todo: done ID` commit; otherwise today with `by: owner`). Exit 1 when the
+records already exist, when `todos.md` or its heading is missing, when the wiki
+changed during the run (re-run), or when the history lookup fails. It does not
+run on the box.
+
+**Owner edits.** The owner ticks boxes on `agent-todos.md` in Obsidian. The
+next `hermes-wiki todo` write (any command, including the nightly job) reads the
+page and the jsonl at the same commit and applies the ticks before its own
+change:
+
+- A `[x]` counts only on an item line outside `## Recently done`. It closes an
+  open or suggested item with `by: owner`, reason `ticked in Obsidian`.
+- Unticking counts only on a line inside `## Recently done`. It reopens a done
+  item. An item with lines that disagree is left alone.
+- Stale-page rule: an untick is applied only when the page's hidden data marker
+  equals the sha256 of the current jsonl. A stale page can show an item as done
+  that was reopened since, so its unticks are ignored (logged as
+  `agent-todos.md was stale; unticks ignored`). Ticks are applied either way.
+- Every other edit to the page (text, moved lines, new lines) is lost at the
+  next write, which regenerates the page. Change items with `todo edit`.
+- Stray items: an old client can still add `- [ ] TITLE (...)` lines under
+  `## Agent follow-ups` in `todos.md`. The next write imports each one as a
+  record (project `unsorted`, same id and date when they parse, a fresh id when
+  the id already belongs to a different title; a ticked one is imported done,
+  `by: owner`, reason `ticked in todos.md`), removes it from `todos.md`, and
+  commits that with the write. A write with an owner tick or stray import and no
+  change of its own commits as `todo: import owner edits`.
+- If two sides touched the page, obsidian-git can report a conflict on
+  `agent-todos.md`. Take the remote version of that file and tick again. The
+  jsonl keeps every tick that was already imported.
+
+**Nightly job (droplet).** `todo-nightly.timer` starts `todo-nightly.service` at
+00:45 (`Persistent=true`, so a missed run catches up), 15 minutes before the
+01:00 curator. The service runs `~/.local/bin/todo-nightly.sh`
+(`droplet/todo-nightly.sh`) as `hermes` with `GH_CONFIG_DIR=~/.hermes/gh-config`
+and a 10 minute timeout. In order:
+
+1. Read `.todo-suggestions.jsonl` from the sandbox checkout
+   (`~/.hermes/sandboxes/docker/default/home/hermes-wiki/`, root-owned, read
+   through a `hermes-sandbox:latest` container with no network). A failed read
+   stops the job before anything else runs. Record the file's sha256.
+2. Run `hermes-wiki todo nightly` with `~/.config/hermes-wiki/config.json`,
+   `--evidence ~/.hermes/state/todo-evidence.json` and
+   `--state ~/.hermes/state/todo-nightly.json`. It fetches the state of every PR
+   or issue named in a `done_when` check or in the text (a
+   `github.com/OWNER/REPO/pull/N` or `/issues/N` URL) of an open or suggested
+   item, once per distinct reference, then, in one write (`todo: nightly`):
+   imports owner ticks and stray items, applies the curator's suggestions
+   (open items only), closes items whose check passes (`by: check`, reason
+   `PR #N merged DATE` or `issue #N closed DATE`), turns an open item with a
+   `pr` check on a PR that was closed unmerged into a suggestion, and
+   returns suggestions older than 7 days to open with `expired: true`. It
+   re-renders the page, so "Recently done" ages out every night, then writes the
+   evidence file for the curator. It prints one JSON summary line
+   (`closed`, `suggested_by_checks`, `suggestions_accepted`,
+   `suggestions_dropped`, `expired`, `fetch_failures`, `committed`).
+3. Delete the suggestions file only if its sha256 still equals the one read in
+   step 1. If the curator wrote to it in between, it is kept and
+   `suggestions changed since read; kept` goes to stderr; the next night reads
+   it again, and ids that already have a suggestion are dropped.
+
+The state file keeps, per reference, the dates (UTC) of nights its fetch
+failed. A success removes the reference. A reference that failed on 3 or more
+distinct nights is listed under `check_failures` in the evidence file and
+appears in the curator's worklist as `## todo_check_failures`, which the curator
+must report. If the evidence file is older than 36 hours, the worklist says
+`todo evidence stale since TIMESTAMP` (the job is failing, or the token
+expired); an unreadable file shows `todo evidence unreadable`. Check with
+`systemctl --user status todo-nightly.service` and `journalctl --user -u
+todo-nightly.service` as `hermes`.
+
+`droplet/install-wiki.sh` links `todo-nightly.sh` into `~/.local/bin`, installs
+the two unit files into `~/.config/systemd/user/`, runs `daemon-reload`, and
+copies `droplet/hermes-wiki-droplet.json` to
+`~/.config/hermes-wiki/config.json` only if that file is absent. It does not
+enable the timer: `systemctl --user enable --now todo-nightly.timer` is a
+separate step, taken after the checks below.
+
+**Curator suggestions.** The curator never edits `agent-todos.jsonl` or
+`agent-todos.md`, and never edits, moves, splits, trims or files anything in the
+`## Agent follow-ups` section of `todos.md`. The rest of `todos.md` follows the
+usual rules. For an item whose referenced PR or issue is
+finished, or that a page or note says is finished, it appends one line to
+`~/hermes-wiki/.todo-suggestions.jsonl` (the file is git-ignored):
+`{"id": "XXXXXX", "reason": "a few words", "evidence": "what it saw"}`. Both text
+fields are 1-300 characters, one line, secret-scanned. The next nightly run
+accepts a line only for an open item, shows the item on the page under
+`## Probably done, confirm`, and drops anything else (logged as `dropped
+suggestion line N: WHY`, without the text). The owner confirms by ticking it
+(`by: owner`) or rejects it with `hermes-wiki todo reopen ID`, which marks the
+suggestion `rejected` and returns the item to open. An unanswered suggestion
+expires after 7 days the same way. The nightly job never accepts a suggestion
+whose evidence equals the rejected or expired evidence of that item, including
+every entry in `blocked_evidence`, even when the curator ignores its prompt. The
+curator sees each item once per change (the worklist keeps a seen-file), and
+item text reaches it as data between `BEGIN TODO` and `END TODO` lines.
+
+**Sync guard.** `droplet/wiki-git-sync.sh` runs before each snapshot commit. If
+`agent-todos.jsonl` or `agent-todos.md` is tracked and differs from `HEAD` in the
+droplet checkout (edited, deleted or staged), it restores the file from `HEAD`
+and prints `discarded local edit to FILE`. A local edit on the droplet therefore
+cannot be pushed over the generated copy.
+
+**Droplet token.** The nightly job needs, for the token in
+`~/.hermes/gh-config`: read access to pull requests and issues on every
+repository a todo item references, and contents write on
+`FibonAdithya/hermes-wiki`. MEASURED 2026-11-19 on `hermes-vm` as `hermes` with
+that config: `gh api repos/FibonAdithya/chain-acceptance/pulls/5` returned HTTP
+403, and `gh api -X POST repos/FibonAdithya/hermes-wiki/git/blobs ...` returned
+HTTP 403. PR and issue reads worked only on `hermes-harness`. So the current
+token cannot run the job: widen it (and update the rotation reminder) before
+enabling the timer. Nothing is deployed yet.
 
 **Reminder or todo item.** Anything tied to a time goes through `remind-owner`.
 Everything else is a todo item.
