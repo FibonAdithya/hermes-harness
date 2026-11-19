@@ -250,10 +250,13 @@ The owner's todo list lives in the wiki repo on `main`, in three files:
 
 `agent-todos.md` and `agent-todos.jsonl` are also kept out of the public
 export by `wiki/tests/test_export.py::test_export_excludes_agent_todo_files`.
-Nothing edits these files by hand and Hermes on the droplet no longer edits
-`todos.md`: every change goes through `hermes-wiki todo`, which commits all
-changed files in one commit through the GitHub git-data API. On the droplet
-only the nightly job runs it (`todo nightly`).
+Nothing edits `agent-todos.jsonl` or `agent-todos.md` by hand: every change
+goes through `hermes-wiki todo`, which commits all changed files in one commit
+through the GitHub git-data API. On the droplet only the nightly job runs it
+(`todo nightly`). The curator on the droplet may still edit the owner's other
+sections of `todos.md` under its usual page rules, but never the
+`## Agent follow-ups` section and never `agent-todos.*` (see "Curator
+suggestions").
 
 **Records.** Fields: `id` (6 lowercase hex), `title` (1-120 characters, one
 line), `details` (at most 15 lines of 1-300 characters), `project`
@@ -293,15 +296,22 @@ generated from.
   stdin, stripping each and dropping blank ones. `--project` defaults to the repo
   name in the `origin` remote of the current directory (`unsorted` when there is
   none). A `CHECK` is `pr:OWNER/REPO#N` or `issue:OWNER/REPO#N`.
-- `hermes-wiki todo edit ID [--title T] [--add-detail LINE]... [--project NAME] [--done-when CHECK]...`
+- `hermes-wiki todo edit ID [--title T] [--clear-details] [--add-detail LINE]... [--project NAME] [--clear-done-when] [--done-when CHECK]...`
   changes the title or project and appends details and checks.
+  `--clear-details` and `--clear-done-when` remove every detail line or every
+  check first, then the `--add-detail` and `--done-when` lines are added, so
+  `--clear-done-when --done-when pr:OWNER/REPO#2` replaces the checks and
+  `--clear-done-when` alone removes them. The result is validated as for `add`.
 - `hermes-wiki todo done ID [--reason TEXT]` closes the item with `by: agent`
   (reason defaults to `done`; it is one line, at most 300 characters, and is
   secret-scanned). An item that is already done exits 0 with a message on stderr.
 - `hermes-wiki todo rm ID` deletes the record (use it for duplicates).
-- `hermes-wiki todo reopen ID` reopens a done item (clears `closed`). On a
-  suggested item it sets `rejected: true` and returns the item to open. On an
-  open item it exits 1.
+- `hermes-wiki todo reopen ID` reopens a done item (clears `closed`). If the
+  item was closed `by: check`, it also clears `done_when` and logs
+  `cleared checks on reopened item ID` (stderr, not on a `public_only` wiki);
+  otherwise the next nightly would close it again from the same check. Add a
+  new check with `todo edit --done-when` if one applies. On a suggested item it
+  sets `rejected: true` and returns the item to open. On an open item it exits 1.
 - `hermes-wiki todo list [--all] [--json] [--project NAME]` prints
   `ID TITLE` for open items, with ` [suggested]` or ` [done]` after the id.
   `--all` includes done items. `--json` prints one record per line.
@@ -352,8 +362,10 @@ starts with `Merge` or `Review and merge` and names exactly one PR URL, and take
 the closed date of a ticked item from the commit history of `todos.md` (the
 `todo: done ID` commit; otherwise today with `by: owner`). Exit 1 when the
 records already exist, when `todos.md` or its heading is missing, when the wiki
-changed during the run (re-run), or when the history lookup fails. It does not
-run on the box.
+changed during the run (re-run), or when the history lookup fails (including a
+commit date that is not a date). It does not run on the box. Correct a wrong
+project or check from the printed table with `todo edit ID --project NAME` or
+`todo edit ID --clear-done-when [--done-when CHECK]`.
 
 **Owner edits.** The owner ticks boxes on `agent-todos.md` in Obsidian. The
 next `hermes-wiki todo` write (any command, including the nightly job) reads the
@@ -363,7 +375,9 @@ change:
 - A `[x]` counts only on an item line outside `## Recently done`. It closes an
   open or suggested item with `by: owner`, reason `ticked in Obsidian`.
 - Unticking counts only on a line inside `## Recently done`. It reopens a done
-  item. An item with lines that disagree is left alone.
+  item. As with `todo reopen`, an item closed `by: check` also loses its
+  `done_when` (logged `cleared checks on reopened item ID`). An item with lines
+  that disagree is left alone.
 - Stale-page rule: an untick is applied only when the page's hidden data marker
   equals the sha256 of the current jsonl. A stale page can show an item as done
   that was reopened since, so its unticks are ignored (logged as
@@ -412,10 +426,14 @@ and a 10 minute timeout. In order:
    it again, and ids that already have a suggestion are dropped.
 
 The state file keeps, per reference, the dates (UTC) of nights its fetch
-failed. A success removes the reference. A reference that failed on 3 or more
-distinct nights is listed under `check_failures` in the evidence file and
+failed. A success removes the reference. A reference that is a `done_when`
+check of an open or suggested item and failed on 3 or more distinct nights is
+listed under `check_failures` in the evidence file and
 appears in the curator's worklist as `## todo_check_failures`, which the curator
-must report. If the evidence file is older than 36 hours, the worklist says
+must report. A PR or issue URL that appears only in an item's title or
+details is context, not a check: its fetch failures never reach
+`check_failures`, and show only as `error` on that ref in the evidence. If the
+evidence file is older than 36 hours, the worklist says
 `todo evidence stale since TIMESTAMP` (the job is failing, or the token
 expired); an unreadable file shows `todo evidence unreadable`. Check with
 `systemctl --user status todo-nightly.service` and `journalctl --user -u
@@ -448,10 +466,13 @@ curator sees each item once per change (the worklist keeps a seen-file), and
 item text reaches it as data between `BEGIN TODO` and `END TODO` lines.
 
 **Sync guard.** `droplet/wiki-git-sync.sh` runs before each snapshot commit. If
-`agent-todos.jsonl` or `agent-todos.md` is tracked and differs from `HEAD` in the
-droplet checkout (edited, deleted or staged), it restores the file from `HEAD`
-and prints `discarded local edit to FILE`. A local edit on the droplet therefore
-cannot be pushed over the generated copy.
+`agent-todos.jsonl` or `agent-todos.md` is in `HEAD` and the droplet checkout
+differs from it (edited, deleted or staged), it restores the file from `HEAD`
+and prints `discarded local edit to FILE`. If the file is not in `HEAD` but
+exists locally (untracked, or newly staged), it unstages and deletes it and
+prints `removed local FILE; only the todo commands write it`. A local edit or a
+locally created copy on the droplet therefore cannot be pushed over or in place
+of the generated files.
 
 **Droplet token.** The nightly job needs, for the token in
 `~/.hermes/gh-config`: read access to pull requests and issues on every

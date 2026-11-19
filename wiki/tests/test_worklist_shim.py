@@ -616,4 +616,9 @@ def test_prompt_states_todo_rules():  # catches a todo rule dropped or reworded 
         "Suggested done: 4f6cc0 (PR merged)", "Todo checks failing:", "Todo evidence stale since",
     ):
         assert sentence in text, sentence
-    assert "## Agent follow-ups" not in text
+
+
+def test_prompt_keeps_curator_out_of_agent_follow_ups():  # catches a curator-written line there imported as an owner close
+    text = " ".join(PROMPT.read_text(encoding="utf-8").split())
+    assert ("Never edit, move, split, trim or file anything into the `## Agent follow-ups` section of `todos.md`; "
+            "todo items live in agent-todos.jsonl and are changed only by the commands and the nightly job.") in text
