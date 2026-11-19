@@ -145,3 +145,81 @@ def test_pull_failure_is_not_called_a_conflict(repos, env, tmp_path):
     assert r.returncode == 1
     assert "FATAL: pull failed" in r.stderr
     assert "conflict" not in r.stderr
+
+
+def test_sync_discards_local_todo_edits(repos, env):
+    origin, droplet, outside = repos
+    outside_push(outside, env, "agent-todos.md", "generated\n")
+    git(droplet, env, "pull", "-q", "origin", "main")
+    (droplet / "agent-todos.md").write_text("local owner edit\n")
+    (droplet / "alpha.md").write_text("one\ntwo\nthree\nfour\n")
+    r = run(droplet, env)
+    assert r.returncode == 0, r.stderr
+    assert "discarded local edit to agent-todos.md" in r.stderr
+    assert git(origin, env, "show", "main:alpha.md").endswith("four")
+    assert git(origin, env, "show", "main:agent-todos.md") == "generated"
+    assert (droplet / "agent-todos.md").read_text() == "generated\n"
+    # catches: discarding every local edit, or discarding none of the todo edit
+
+
+def test_sync_restores_locally_deleted_todo_file(repos, env):
+    origin, droplet, outside = repos
+    outside_push(outside, env, "agent-todos.jsonl", "{}\n")
+    git(droplet, env, "pull", "-q", "origin", "main")
+    (droplet / "agent-todos.jsonl").unlink()
+    r = run(droplet, env)
+    assert r.returncode == 0, r.stderr
+    assert "discarded local edit to agent-todos.jsonl" in r.stderr
+    assert git(origin, env, "show", "main:agent-todos.jsonl") == "{}"
+    assert (droplet / "agent-todos.jsonl").exists()
+    # catches: a guard that only handles modified files and pushes the deletion
+
+
+def test_sync_untracked_todo_paths_ok(repos, env):
+    origin, droplet, outside = repos
+    (droplet / "alpha.md").write_text("one\ntwo\nthree\nfour\n")
+    r = run(droplet, env)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "pushed"
+    # catches: set -e dying when git ls-files --error-unmatch fails on untracked paths
+
+
+def test_sync_untracked_todo_file_is_removed_not_pushed(repos, env):
+    origin, droplet, outside = repos
+    (droplet / "agent-todos.jsonl").write_text('{"id": "forged"}\n')
+    (droplet / "alpha.md").write_text("one\ntwo\nthree\nfour\n")
+    r = run(droplet, env)
+    assert r.returncode == 0, r.stderr
+    assert "removed local agent-todos.jsonl; only the todo commands write it" in r.stderr
+    assert git(origin, env, "ls-tree", "--name-only", "main") == "alpha.md"
+    assert not (droplet / "agent-todos.jsonl").exists()
+    # catches: git add -A snapshotting a locally created todo file and pushing it
+
+
+def test_sync_staged_new_todo_file_is_removed_not_pushed(repos, env):
+    origin, droplet, outside = repos
+    (droplet / "agent-todos.md").write_text("new\n")
+    git(droplet, env, "add", "agent-todos.md")
+    r = run(droplet, env)
+    assert r.returncode == 0, r.stderr
+    assert "removed local agent-todos.md; only the todo commands write it" in r.stderr
+    assert git(origin, env, "ls-tree", "--name-only", "main") == "alpha.md"
+    assert not (droplet / "agent-todos.md").exists()
+    assert git(droplet, env, "status", "--porcelain") == ""
+    # catches: a staged-new todo file skipped by the guard and then pushed by the snapshot
+
+
+def test_sync_restores_tracked_and_removes_untracked_in_one_run(repos, env):
+    origin, droplet, outside = repos
+    outside_push(outside, env, "agent-todos.md", "generated\n")
+    git(droplet, env, "pull", "-q", "origin", "main")
+    (droplet / "agent-todos.md").write_text("local edit\n")
+    (droplet / "agent-todos.jsonl").write_text("{}\n")
+    r = run(droplet, env)
+    assert r.returncode == 0, r.stderr
+    assert "discarded local edit to agent-todos.md" in r.stderr
+    assert "removed local agent-todos.jsonl" in r.stderr
+    assert git(origin, env, "show", "main:agent-todos.md") == "generated"
+    assert (droplet / "agent-todos.md").read_text() == "generated\n"
+    assert "agent-todos.jsonl" not in git(origin, env, "ls-tree", "--name-only", "main")
+    # catches: the new removal branch also deleting a tracked generated file instead of restoring it

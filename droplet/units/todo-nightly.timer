@@ -1,0 +1,9 @@
+[Unit]
+Description=Run the agent-todos nightly job at 00:45, before the wiki curator
+
+[Timer]
+OnCalendar=*-*-* 00:45:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

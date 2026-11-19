@@ -185,21 +185,71 @@ def _add_seed(sub) -> None:
 
 
 def _cmd_todo(args, cfg) -> int:
-    from . import todos
+    import json
+    import secrets
+    from dataclasses import asdict
+    from datetime import datetime, timezone
 
-    store = todos.store_for(cfg, subprocess.run)
+    from . import todocmds, todomigrate, todos
+
+    run, sleep = subprocess.run, time.sleep
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    new_id = lambda: secrets.token_hex(3)  # noqa: E731
+    tree = todocmds.tree_for(cfg, run)
+    common = {"today": today, "new_id": new_id, "sleep": sleep}
     try:
         if args.todo_cmd == "add":
             details = list(args.detail)
             if args.detail_stdin:
                 details += [ln.strip() for ln in sys.stdin.read().splitlines() if ln.strip()]
-            print(todos.cmd_add(cfg, store, args.title, details))
+            print(todocmds.cmd_add(cfg, tree, args.title, details, args.project, args.done_when,
+                                   Path.cwd(), run=run, **common))
         elif args.todo_cmd == "done":
-            if not todos.cmd_done(cfg, store, args.id):
+            if not todocmds.cmd_done(cfg, tree, args.id, args.reason, run=run, **common):
                 print(f"hermes-wiki: {args.id} is already done", file=sys.stderr)
+        elif args.todo_cmd == "edit":
+            todocmds.cmd_edit(cfg, tree, args.id, args.title, args.add_detail, args.project,
+                              args.done_when, clear_done_when=args.clear_done_when,
+                              clear_details=args.clear_details, **common)
+        elif args.todo_cmd == "rm":
+            todocmds.cmd_rm(cfg, tree, args.id, **common)
+        elif args.todo_cmd == "reopen":
+            todocmds.cmd_reopen(cfg, tree, args.id, **common)
+        elif args.todo_cmd == "migrate":
+            if cfg.public_only:
+                raise todos.TodoError("todo migrate is not available on a public_only wiki", code=2)
+            dry = os.environ.get("HERMES_WIKI_DRY_PUBLISH") == "1"
+            for r in todomigrate.migrate(cfg, tree, today=today, run=run, log=todocmds._log(cfg),
+                                         new_id=new_id, history=not dry):
+                check = f"pr:{r.done_when[0]['pr']}" if r.done_when else "--"
+                print(f"{r.id} {r.project} {check} {r.title}")
+        elif args.todo_cmd == "nightly":
+            from . import todonightly, todostore
+
+            if cfg.public_only:
+                raise todos.TodoError("todo nightly is not available on a public_only wiki", code=2)
+            try:
+                text = Path(args.suggestions).expanduser().read_text(encoding="utf-8")
+            except FileNotFoundError:
+                text = ""
+            except (OSError, UnicodeDecodeError) as e:
+                raise todos.TodoError(f"cannot read suggestions file: {type(e).__name__}", 1) from None
+            try:
+                summary = todonightly.nightly(
+                    cfg, tree, suggestions_text=text, evidence_path=Path(args.evidence).expanduser(),
+                    state_path=Path(args.state).expanduser(), today=today, now=now, run=run,
+                    sleep=sleep, log=todocmds._log(cfg), new_id=new_id)
+            except todostore.NotMigrated:
+                raise todos.TodoError(todocmds.MIGRATE_FIRST, 1) from None
+            print(json.dumps(summary, sort_keys=True))
         else:
-            for item in todos.cmd_list(cfg, store, args.all):
-                print(f"{item.id or '-'} {item.title}")
+            for r in todocmds.cmd_list(cfg, tree, args.all, args.json, args.project, run=run):
+                if args.json:
+                    print(json.dumps(asdict(r), sort_keys=True, ensure_ascii=False))
+                else:
+                    tag = {"suggested": " [suggested]", "done": " [done]"}.get(r.status, "")
+                    print(f"{r.id}{tag} {r.title}")
     except todos.TodoRejected as e:
         for err in e.errors:
             print(f"hermes-wiki: todo refused: {err}", file=sys.stderr)
@@ -211,18 +261,44 @@ def _cmd_todo(args, cfg) -> int:
 
 
 def _add_todo(sub) -> None:
-    p = sub.add_parser("todo", help="add, tick or list the owner todo list (todos.md in the wiki repo)")
+    p = sub.add_parser("todo", help="add, edit, tick or list agent follow-ups (agent-todos in the wiki repo)")
     p.set_defaults(func=_cmd_todo)
     tsub = p.add_subparsers(dest="todo_cmd", required=True)
-    a = tsub.add_parser("add", help="add an item under 'Agent follow-ups'; prints its id")
+    a = tsub.add_parser("add", help="add an item; prints its id")
     a.add_argument("title")
     a.add_argument("--detail", action="append", default=[], help="detail line (repeatable)")
     a.add_argument("--detail-stdin", action="store_true", help="also read detail lines from stdin")
+    a.add_argument("--project", help="project name (default: from the git origin of the cwd)")
+    a.add_argument("--done-when", action="append", default=[],
+                   help="pr:OWNER/REPO#N or issue:OWNER/REPO#N (repeatable)")
     d = tsub.add_parser("done", help="tick an item by id")
     d.add_argument("id")
-    ls = tsub.add_parser("list", help="list open items (--all includes ticked)")
+    d.add_argument("--reason", help="why it is done")
+    e = tsub.add_parser("edit", help="change an item")
+    e.add_argument("id")
+    e.add_argument("--title")
+    e.add_argument("--add-detail", action="append", default=[], help="detail line to append (repeatable)")
+    e.add_argument("--project")
+    e.add_argument("--done-when", action="append", default=[],
+                   help="check to append: pr:OWNER/REPO#N or issue:OWNER/REPO#N (repeatable)")
+    e.add_argument("--clear-done-when", action="store_true",
+                   help="remove every check first (then --done-when adds the new ones)")
+    e.add_argument("--clear-details", action="store_true",
+                   help="remove every detail line first (then --add-detail adds the new ones)")
+    r = tsub.add_parser("rm", help="remove an item")
+    r.add_argument("id")
+    ro = tsub.add_parser("reopen", help="reopen a done item or reject a suggestion")
+    ro.add_argument("id")
+    mg = tsub.add_parser("migrate", help="one-off: move todos.md items into agent-todos.jsonl")
+    nt = tsub.add_parser("nightly", help="droplet job: run checks, apply curator suggestions, write evidence")
+    nt.add_argument("--suggestions", required=True, help="curator suggestions JSONL (missing reads as empty)")
+    nt.add_argument("--evidence", required=True, help="evidence JSON file to write for the curator")
+    nt.add_argument("--state", required=True, help="check failure state JSON file")
+    ls = tsub.add_parser("list", help="list open items (--all includes done)")
     ls.add_argument("--all", action="store_true")
-    for child in (a, d, ls):
+    ls.add_argument("--json", action="store_true", help="one JSON record per line")
+    ls.add_argument("--project", help="only items of this project")
+    for child in (a, d, e, r, ro, ls, mg, nt):
         child.add_argument("--config", default=argparse.SUPPRESS, help="config file path")
 
 

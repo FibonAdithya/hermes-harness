@@ -32,6 +32,7 @@ MAX_DETAILS = 15
 _LINE = re.compile(r"[^\n]*\n|[^\n]+\Z")
 _ITEM = re.compile(r"^- \[([ xX])\] (.*)$")
 _TITLE_ID = re.compile(r"^(.*) \(\d{4}-\d{2}-\d{2}, [^,()]*, id ([0-9a-f]{6})\)$")
+_SUFFIX = re.compile(r"^(.*) \((\d{4}-\d{2}-\d{2}), ([^,()]*), id ([0-9a-f]{6})\)$")
 _ID_IN_TEXT = re.compile(r"id ([0-9a-f]{6})\)")
 _ID_FORMAT = re.compile(r"[0-9a-f]{6}")
 
@@ -53,6 +54,8 @@ class Item:
     id: str | None
     title: str
     done: bool
+    created: str | None = None
+    source: str | None = None
 
 
 def validate(title: str, details: list[str]) -> tuple[str, list[str]]:
@@ -188,6 +191,50 @@ def list_items(text: str, include_done: bool) -> list[Item]:
         t = _TITLE_ID.match(rest)
         out.append(Item(t.group(2), t.group(1), done) if t else Item(None, rest, done))
     return out
+
+
+def take_section_items(text: str) -> tuple[list[tuple[Item, list[str]]], str]:
+    """Remove every item line (and its indented detail lines) from the section.
+
+    Returns the items with their details, and the text without those lines.
+    Non-item lines in the section and everything outside it are kept as they are.
+    """
+    lines = _split(text)
+    sec = _section(lines)
+    if sec is None:
+        return [], text
+    h, end = sec
+    items: list[tuple[Item, list[str]]] = []
+    drop: set[int] = set()
+    i = h + 1
+    while i < end:
+        m = _ITEM.match(lines[i].rstrip("\r\n"))
+        if not m:
+            i += 1
+            continue
+        drop.add(i)
+        done = m.group(1) in "xX"
+        rest = m.group(2).rstrip()
+        s = _SUFFIX.match(rest)
+        if s:
+            item = Item(s.group(4), s.group(1).strip(), done,
+                        created=s.group(2), source=s.group(3).strip() or None)
+        else:
+            item = Item(None, rest.strip(), done)
+        details: list[str] = []
+        i += 1
+        while i < end and lines[i].startswith("  "):
+            drop.add(i)
+            d = lines[i].rstrip("\r\n").strip()
+            if d.startswith("- "):
+                d = d[2:].strip()
+            elif d == "-":
+                d = ""
+            if d:
+                details.append(d)
+            i += 1
+        items.append((item, details))
+    return items, "".join(ln for n, ln in enumerate(lines) if n not in drop)
 
 
 class Conflict(Exception):

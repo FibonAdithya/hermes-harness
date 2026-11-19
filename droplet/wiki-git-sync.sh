@@ -22,6 +22,25 @@ if in_progress; then
   exit 1
 fi
 
+# Generated files: only the todo commands and the nightly job write them, through GitHub.
+# A local edit (including a deletion) would be snapshotted and pushed over the generated
+# copy, so restore them from HEAD first. A local copy that HEAD lacks (untracked or newly
+# staged) would be pushed as if generated, so remove it.
+for p in agent-todos.jsonl agent-todos.md; do
+  if ! git cat-file -e "HEAD:$p" 2>/dev/null; then
+    if [ -e "$p" ] || [ -L "$p" ] || git ls-files --error-unmatch -- "$p" >/dev/null 2>&1; then
+      git rm -q --cached --ignore-unmatch -- "$p"
+      rm -f -- "$p"
+      echo "removed local $p; only the todo commands write it" >&2
+    fi
+    continue
+  fi
+  if ! git diff --quiet HEAD -- "$p"; then
+    git restore --staged --worktree --source=HEAD -- "$p"
+    echo "discarded local edit to $p" >&2
+  fi
+done
+
 git add -A
 if ! git diff --cached --quiet; then
   git commit -q -m "wiki: auto-snapshot $(date -Iseconds)"
