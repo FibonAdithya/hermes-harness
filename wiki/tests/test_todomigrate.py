@@ -8,7 +8,7 @@ import pytest
 from hermes_wiki import cli, todomigrate
 from hermes_wiki.config import WikiConfig
 from hermes_wiki.todorecords import loads
-from hermes_wiki.todos import TodoError
+from hermes_wiki.todos import TodoError, take_section_items
 from hermes_wiki.todotree import DryTree
 
 FIX = Path(__file__).parent / "fixtures" / "todos-migrate.md"
@@ -131,7 +131,7 @@ def test_ids_kept_fresh_for_missing_and_duplicate(cfg, tree):
     assert by_id(records)["4f6cc0"].title.startswith("Merge widget")
     r = by_id(records)["272d63"]
     assert (r.created, r.source) == ("2026-11-12", "claude-box")
-    assert titles["Old client item without an id"] and by_id(records)["aaaaaa"].created == "2026-11-19"
+    assert by_id(records)["aaaaaa"].created == "2026-11-19"
     assert by_id(records)["aaaaaa"].source == "claude-box"
     # catches: dropping or overwriting items that repeat or lack an id
 
@@ -187,6 +187,7 @@ def test_one_commit_with_four_files_and_owner_sections_intact(cfg, tmp_path):
         "## Agent follow-ups\n![[agent-todos]]\nOpen the page to tick: [[agent-todos]]\n\n")
     assert new[new.index("## See also"):] == old[end:]
     assert "Buy a desk lamp" in new and "999999" in new
+    assert take_section_items(new)[0] == []
     # catches: touching owner sections, or losing the blank line before the next heading
 
 
@@ -270,11 +271,44 @@ def test_cli_public_only_refused_without_github_call(tmp_path, capsys):
     # catches: migrating (or contacting GitHub) from a public_only config
 
 
-def test_todos_md_without_section_is_left_alone(cfg, tmp_path):
+def test_refuses_without_section(cfg, tmp_path):
     d = tmp_path / "n"
     d.mkdir()
     (d / "todos.md").write_text("# T\n\n## Other\n- [ ] x\n", encoding="utf-8")
     tree = RecordingTree(d)
-    assert run_migrate(cfg, tree) == []
-    assert tree.commits[0][0]["todos.md"] == "# T\n\n## Other\n- [ ] x\n"
-    # catches: crashing on a todos.md that has no Agent follow-ups heading
+    with pytest.raises(TodoError, match="no .## Agent follow-ups. section") as e:
+        run_migrate(cfg, tree)
+    assert e.value.code == 1 and tree.commits == []
+    # catches: committing a migration (and an embed) when the heading is absent
+
+
+def test_merge_hyphen_title_gets_no_check(cfg, tree):
+    t = tree.dir / "todos.md"
+    t.write_text(t.read_text(encoding="utf-8").replace(
+        "- [ ] Old client item without an id",
+        "- [ ] Merge-conflict fix (2026-11-16, claude-box, id 777777)\n  - https://github.com/FibonAdithya/widget/pull/9\n- [ ] Old client item without an id"),
+        encoding="utf-8")
+    r = by_id(run_migrate(cfg, tree, new_id=gen("aaaaaa", "bbbbbb")))["777777"]
+    assert r.done_when == []
+    # catches: the title guard using \\b, which matches Merge-conflict
+
+
+def test_history_ignores_other_ids_and_rejects_garbage(cfg, tree):
+    hist = HISTORY + [{"m": "todo: done 123456", "d": "2026-01-01T00:00:00Z"},
+                      {"m": "todo: done a1b2c3\n\nbody", "d": "2026-11-12T08:00:00Z"}]
+    records = run_migrate(cfg, tree, run=FakeRun(history=hist))
+    assert by_id(records)["a1b2c3"].closed["by"] == "agent"
+    assert by_id(records)["a1b2c3"].closed["at"] == "2026-11-12"
+    assert by_id(records)["b2c3d4"].closed["at"] == "2026-11-16"
+    # catches: matching the whole message instead of its first line, or applying unrelated commits
+
+
+def test_history_garbage_line_refuses(cfg, tree):
+    class Garbage(FakeRun):
+        def __call__(self, argv, **kw):
+            return subprocess.CompletedProcess(argv, 0, stdout="not json\n", stderr="")
+
+    with pytest.raises(TodoError) as e:
+        run_migrate(cfg, tree, run=Garbage())
+    assert e.value.code == 1 and "commit history" in str(e.value)
+    # catches: ignoring a malformed history line and falling back to today

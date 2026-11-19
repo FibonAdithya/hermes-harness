@@ -22,7 +22,7 @@ _REPO_PATTERNS = [re.compile(p) for p in (
     r"github\.com/FibonAdithya/" + _NAME, r"FibonAdithya/" + _NAME,
     r"~/TIG/" + _NAME, r"/TIG/" + _NAME)]
 _PREFIX = re.compile(r"^([a-z0-9-]+)[: ]")
-_MERGE = re.compile(r"^(Merge|Review and merge)\b")
+_MERGE = re.compile(r"^(Merge|Review and merge)\s")
 _PR = re.compile(r"github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)")
 _CHECK_REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 
@@ -94,10 +94,7 @@ def _new_todos(text: str) -> str:
     """todos.md with the section items replaced by the page embed and link lines."""
     _, rest = take_section_items(text)
     lines = _split(rest)
-    sec = _section(lines)
-    if sec is None:
-        return text
-    h, end = sec
+    h, end = _section(lines)
     body = lines[h + 1:end]
     while body and not body[0].strip():
         body.pop(0)
@@ -133,6 +130,8 @@ def migrate(cfg: WikiConfig, tree, *, today: date, run, log: Callable[[str], Non
     if todos_md is None:
         raise TodoError("todos.md is missing; nothing to migrate", 1)
 
+    if _section(_split(todos_md)) is None:
+        raise TodoError('todos.md has no "## Agent follow-ups" section', 1)
     items, _ = take_section_items(todos_md)
     texts = [" ".join([it.title, *d]) for it, d in items]
     repos = set().union(*(_candidates(t) for t in texts)) if texts else set()
