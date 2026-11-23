@@ -499,6 +499,103 @@ and `.txt` files only if the removal succeeded. `remind-owner --prune` deletes
 than 10 minutes old. If `jobs.json` is malformed, `--prune` exits 1 and deletes
 nothing.
 
+## Repo registry
+
+`hermes-wiki repos` writes two pages to the wiki through the GitHub contents
+API: `repos.md` (public) and `repos-private.md` (private). Each lists the repos
+that are yours or cloned on the laptop, the box or the droplet, with a purpose,
+an activity band, the last commit, and links to wiki pages that mention the
+repo. The public page never names a repo that is private, and never takes a
+purpose or page link from a private page. If it would, or if a secret pattern
+appears in either page, the command writes nothing and exits 1.
+
+A laptop timer, `hermes-wiki-repos.timer`, runs the command daily at 08:00
+(`Persistent=true`, so a missed run happens at the next login). Units are in
+`wiki/units/`; `wiki/install-laptop.sh` copies them to `~/.config/systemd/user/`
+and runs `daemon-reload`, but does not turn the timer on.
+
+To see what it would write, without writing:
+
+```
+hermes-wiki repos --dry-run
+```
+
+This pulls the wiki clone, prints both pages to stdout, and writes no page and
+no state. The state file is `<state_dir>/repos-state.json` on the laptop. It
+keeps the last good checkout paths per host, which are reused (with the date)
+when a host is unreachable.
+
+### Overrides
+
+`~/.config/hermes-wiki/repos.toml` (or `--overrides PATH`). The file is
+required: a missing file exits 2, because it is where private repos that no
+wiki page names are listed. It stays on the laptop and is never committed, so
+those repo names never reach this public repo. The installer seeds it with
+`private = []` only if absent. Keys, all optional within the file:
+
+| key | meaning | default |
+|---|---|---|
+| `owners` | GitHub owners whose repos are listed | `["FibonAdithya"]` |
+| `clone_owners` | owners whose cloned repos are listed even when not in `owners` | `["FibonAdithya", "tig-foundation", "AIDDA-Institute"]` |
+| `include` | repos to list although not otherwise listed (wins over `exclude`) | none |
+| `exclude` | repos to leave off | none |
+| `private` | repos to list on the private page only | none |
+| `[purpose]` | one-line purpose per repo key, used before any wiki page text | none |
+
+An entry in `private` is `owner/name`, `local:name` for a
+checkout with no GitHub remote, or a bare name. Every form moves every row with
+that repo name, whatever its owner, because the public page is checked by bare
+name. The same holds for a private wiki page: a repo name it lists is private.
+Example:
+
+```toml
+exclude = ["FibonAdithya/old-experiment"]
+private = ["FibonAdithya/notes-private", "scratch"]
+
+[purpose]
+"FibonAdithya/hermes-harness" = "Hermes deploys, runbooks and the tuner."
+"local:scratch" = "Throwaway experiments."
+```
+
+Run `hermes-wiki repos --dry-run` after editing.
+
+### Logs and exit codes
+
+```
+journalctl --user -u hermes-wiki-repos -n 50
+```
+
+| exit | meaning | what to do |
+|---|---|---|
+| 0 | pages written, or unchanged | nothing |
+| 1 | aborted; the reason is on stderr. Nothing written: wiki pull failed, GitHub down or returned nothing, the wiki is unreadable or a page has unparseable frontmatter or an unparseable `repos` entry (such as a list missing `]` or a comma; the message names the page), a secret pattern, or a private repo name in public text. Possibly written: a store failure (the message says how many pages were written first) or state not saved (both pages written) | read the reason; for a private name add an override (`exclude`, `private` or `purpose`); otherwise fix the cause and rerun. The service retries exit 1 every 15 minutes, at most 4 starts in 3 hours |
+| 2 | bad overrides: the file is missing, invalid TOML, a wrong type, an unknown key, empty `owners`, or an unreadable file | fix `repos.toml`; the message names the file |
+
+### Rollout (laptop)
+
+```
+wiki/install-laptop.sh
+hermes-wiki repos --dry-run
+hermes-wiki repos
+systemctl --user start hermes-wiki-repos.service
+journalctl --user -u hermes-wiki-repos -n 20
+systemctl --user enable --now hermes-wiki-repos.timer
+systemctl --user list-timers hermes-wiki-repos.timer
+```
+
+Check the dry-run output before the first real run: no private repo name on the
+public page. Run the unit once by hand before turning on the timer, because the
+unit's environment differs from a shell's: `systemctl --user start` exits 0 when
+the run succeeded, and the journal shows the command's own output (`repos: wrote
+2 page(s)` or `repos: unchanged`) or the reason it aborted. After
+the timer is on, `list-timers` shows the next 08:00 run.
+
+The wiki pull goes over ssh to github.com and needs the ssh agent. MEASURED
+2026-11-23: in the wiki clone, `env -u SSH_AUTH_SOCK git ls-remote origin HEAD`
+fails with `Permission denied (publickey)`; with the agent it succeeds. The unit
+sets `SSH_AUTH_SOCK=%t/keyring/ssh`; if the agent socket ever moves, change that
+line in `wiki/units/hermes-wiki-repos.service` and rerun the installer.
+
 ## Day to day
 
 - **The curator's report** arrives on Telegram after 01:00 when it changed

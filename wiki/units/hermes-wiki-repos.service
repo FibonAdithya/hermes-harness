@@ -1,0 +1,16 @@
+[Unit]
+Description=Refresh the repo registry pages in the hermes wiki
+# network-online.target does not exist in the user manager, so a catch-up run at login can
+# start before the network is up; Restart= below retries it instead of losing the day
+StartLimitIntervalSec=3h
+StartLimitBurst=4
+
+[Service]
+Type=oneshot
+# the wiki pull goes over ssh and needs the agent; set it here, not from the manager environment
+Environment=SSH_AUTH_SOCK=%t/keyring/ssh
+ExecStart=%h/.local/bin/hermes-wiki repos
+Restart=on-failure
+RestartSec=15min
+# exit 2 is a bad overrides file, which only the owner can fix
+RestartPreventExitStatus=2
