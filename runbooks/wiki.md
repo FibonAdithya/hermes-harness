@@ -568,7 +568,7 @@ journalctl --user -u hermes-wiki-repos -n 50
 | exit | meaning | what to do |
 |---|---|---|
 | 0 | pages written, or unchanged | nothing |
-| 1 | aborted, nothing written; the reason is on stderr: wiki pull failed, GitHub down or returned nothing, the wiki is unreadable or a page has unparseable frontmatter or an unparseable `repos` entry (such as a list missing `]` or a comma; the message names the page), a secret pattern, a private repo name in public text, a store failure, or state not saved | read the reason; for a private name add an override (`exclude`, `private` or `purpose`); otherwise fix the cause and rerun |
+| 1 | aborted; the reason is on stderr. Nothing written: wiki pull failed, GitHub down or returned nothing, the wiki is unreadable or a page has unparseable frontmatter or an unparseable `repos` entry (such as a list missing `]` or a comma; the message names the page), a secret pattern, or a private repo name in public text. Possibly written: a store failure (the message says how many pages were written first) or state not saved (both pages written) | read the reason; for a private name add an override (`exclude`, `private` or `purpose`); otherwise fix the cause and rerun. The service retries exit 1 every 15 minutes, at most 4 starts in 3 hours |
 | 2 | bad overrides: the file is missing, invalid TOML, a wrong type, an unknown key, empty `owners`, or an unreadable file | fix `repos.toml`; the message names the file |
 
 ### Rollout (laptop)

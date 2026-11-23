@@ -232,6 +232,7 @@ def one_repo(slug: str, run, since_iso: str, gh: str = "gh") -> GhRepo | None:
 
 PURPOSE_MAX = 160
 _SENTENCE_END = re.compile(r"[.!?](?:\s|$)")
+_ABBREV = re.compile(r"(?<!\w)(?:e\.g|i\.e|vs|cf)\.$", re.IGNORECASE)  # not a sentence end
 
 
 def _cap(text: str) -> str:
@@ -275,9 +276,10 @@ def _first_sentence(body: str) -> str:
             continue
         para.append(line)
     text = " ".join(" ".join(para).split())
-    m = _SENTENCE_END.search(text)
-    if m:
-        text = text[: m.start() + 1]
+    for m in _SENTENCE_END.finditer(text):
+        if not _ABBREV.search(text[: m.start() + 1]):
+            text = text[: m.start() + 1]
+            break
     return _cap(text)
 
 

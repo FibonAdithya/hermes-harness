@@ -407,3 +407,10 @@ def test_overrides_parse_and_reject(tmp_path):
         f.write_text(bad)
         with pytest.raises(ValueError):
             load_overrides(f)
+
+
+@pytest.mark.parametrize("abbr", ["e.g.", "i.e.", "vs.", "cf.", "E.g."])
+def test_purpose_does_not_end_at_an_abbreviation(tmp_path, abbr):
+    body = f"Tools for agents, {abbr} Claude and Codex. Second sentence.\n"
+    root = build_wiki(tmp_path, extra_tags=TAGS, extra_pages={"p": fm("[r]") + body})
+    assert page_index(root)["r"][0].purpose == f"Tools for agents, {abbr} Claude and Codex."

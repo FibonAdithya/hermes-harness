@@ -38,3 +38,15 @@ def test_installer_seeds_overrides_before_reload_and_survives_reload_failure():
     reload = text.index("systemctl --user daemon-reload")
     assert guard < seed < reload
     assert "systemctl --user daemon-reload ||" in text
+
+
+def test_unit_retries_failures_but_not_bad_overrides():
+    # network-online.target does not exist in the user manager, so a catch-up run at login
+    # can start before the network is up; the service retries instead of losing the day
+    svc = (UNITS / "hermes-wiki-repos.service").read_text()
+    service = svc[svc.index("[Service]"):]
+    unit = svc[:svc.index("[Service]")]
+    assert "Restart=on-failure\n" in service and "RestartSec=15min\n" in service
+    assert "RestartPreventExitStatus=2\n" in service  # bad overrides needs the owner
+    assert "StartLimitIntervalSec=3h\n" in unit and "StartLimitBurst=4\n" in unit
+    assert "After=network-online" not in svc and "Wants=network-online" not in svc  # no-ops here
