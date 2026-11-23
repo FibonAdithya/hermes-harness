@@ -302,8 +302,28 @@ def _add_todo(sub) -> None:
         child.add_argument("--config", default=argparse.SUPPRESS, help="config file path")
 
 
+def _cmd_repos(args, cfg, *, run=None, store=None, now=None, out=None, err=None) -> int:
+    from datetime import datetime, timezone
+
+    from . import reposcmd, todos
+
+    run = run or subprocess.run
+    return reposcmd.run_repos(
+        cfg, run=run, store=store or todos.store_for(cfg, run),
+        now=now or datetime.now(timezone.utc), overrides_path=Path(args.overrides).expanduser(),
+        dry_run=args.dry_run, out=out or sys.stdout, err=err or sys.stderr)
+
+
+def _add_repos(sub) -> None:
+    p = sub.add_parser("repos", help="refresh repos.md and repos-private.md in the wiki",
+                       epilog="--dry-run still pulls the wiki clone; it writes no page and no state.")
+    p.add_argument("--dry-run", action="store_true", help="print both pages; write nothing")
+    p.add_argument("--overrides", default="~/.config/hermes-wiki/repos.toml", help="overrides TOML file")
+    p.set_defaults(func=_cmd_repos)
+
+
 _COMMANDS = [_add_mcp, _add_export_public, _add_worklist, _add_session_end, _add_drain, _add_extract_dir,
-             _add_install_hook, _add_import_memory, _add_seed, _add_todo]
+             _add_install_hook, _add_import_memory, _add_seed, _add_todo, _add_repos]
 
 
 def build_parser() -> argparse.ArgumentParser:

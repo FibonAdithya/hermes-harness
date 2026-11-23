@@ -1,3 +1,4 @@
+import subprocess
 from datetime import date
 from pathlib import Path
 
@@ -144,3 +145,30 @@ def test_heading_search_skips_frontmatter():  # catches searching for "# " / "##
     new, _ = todos.add_item(old, "T", [], source="s", today=TODAY, new_id=ids("abcdef"))
     assert new.startswith("---\n## owner comment\ntags: [people]\n---\n# Todos\n\n## Agent follow-ups\n")
     assert schema.is_private(frontmatter.parse(new)[0]) is True
+
+def test_update_writes_given_path(tmp_path):  # catches path ignored (would write todos.md)
+    store = todos.DryContents(tmp_path)
+    (tmp_path / "repos.md").write_text("old", encoding="utf-8")
+    assert todos.update(store, lambda t: ("new", "m"), sleep=lambda s: None, path="repos.md") is True
+    assert (tmp_path / "repos.md").read_text(encoding="utf-8") == "new"
+    assert not (tmp_path / "todos.md").exists()
+
+def test_update_missing_file_without_create_raises_naming_path(tmp_path):  # catches message naming todos.md
+    with pytest.raises(todos.TodoError, match="repos.md not found"):
+        todos.update(todos.DryContents(tmp_path), lambda t: ("x", "m"), sleep=lambda s: None, path="repos.md")
+
+def test_update_create_passes_empty_text_and_writes(tmp_path):  # catches create ignored (would raise)
+    seen = []
+    def edit(t):
+        seen.append(t)
+        return ("x", "m")
+    assert todos.update(todos.DryContents(tmp_path), edit, sleep=lambda s: None, path="repos.md", create=True)
+    assert seen == [""] and (tmp_path / "repos.md").read_text(encoding="utf-8") == "x"
+
+def test_ghcontents_put_without_sha_omits_sha_arg():  # catches sha= sent empty for a create
+    calls = []
+    def run(argv, **kw):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "{}", "")
+    todos.GhContents("o/r", "gh", run).put("repos.md", "x", None, "m")
+    assert not any(a.startswith("sha=") for a in calls[0])

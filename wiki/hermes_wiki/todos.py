@@ -264,7 +264,7 @@ class GhContents:
         try:
             r = self.run(argv, capture_output=True, text=True, timeout=30)
         except subprocess.TimeoutExpired:
-            raise StoreError("timed out reading todos.md") from None
+            raise StoreError(f"timed out reading {path}") from None
         except OSError as e:
             raise StoreError(str(e)) from None
         if r.returncode != 0:
@@ -277,11 +277,13 @@ class GhContents:
         except (ValueError, KeyError, TypeError) as e:
             raise StoreError(f"unexpected response: {type(e).__name__}") from None
 
-    def put(self, path: str, text: str, sha: str, message: str) -> None:
+    def put(self, path: str, text: str, sha: str | None, message: str) -> None:
         content = base64.b64encode(text.encode("utf-8")).decode("ascii")
         argv = [self.gh, "api", "-X", "PUT", f"repos/{self.repo}/contents/{path}",
-                "-f", f"message={message}", "-f", f"content={content}",
-                "-f", f"sha={sha}", "-f", "branch=main"]
+                "-f", f"message={message}", "-f", f"content={content}"]
+        if sha is not None:
+            argv += ["-f", f"sha={sha}"]
+        argv += ["-f", "branch=main"]
         try:
             r = self.run(argv, capture_output=True, text=True, timeout=30)
         except subprocess.TimeoutExpired:
@@ -309,7 +311,7 @@ class DryContents:
         text = f.read_text(encoding="utf-8")
         return text, self._sha(text)
 
-    def put(self, path: str, text: str, sha: str, message: str) -> None:
+    def put(self, path: str, text: str, sha: str | None, message: str) -> None:
         cur = self.get(path)
         if cur is not None and cur[1] != sha:
             raise Conflict()
@@ -324,32 +326,35 @@ def store_for(cfg: WikiConfig, run) -> GhContents | DryContents:
 
 
 def update(store, edit: Callable[[str], tuple[str, str] | None], *, sleep,
-           item_id: Callable[[], str] = lambda: "") -> bool:
+           item_id: Callable[[], str] = lambda: "", path: str = PATH,
+           create: bool = False) -> bool:
     for attempt in range(ATTEMPTS):
         try:
-            got = store.get(PATH)
+            got = store.get(path)
         except StoreError as e:
             raise TodoError(f"GitHub: {e}") from None
         if got is None:
-            raise TodoError("todos.md not found on main")
+            if not create:
+                raise TodoError(f"{path} not found on main")
+            got = ("", None)
         text, sha = got
         out = edit(text)
         if out is None:
             return False
         new_text, message = out
         try:
-            store.put(PATH, new_text, sha, message)
+            store.put(path, new_text, sha, message)
             return True
         except Conflict:
             if attempt == ATTEMPTS - 1:
                 raise TodoError(
-                    f"todos.md kept changing; gave up after {ATTEMPTS} attempts") from None
+                    f"{path} kept changing; gave up after {ATTEMPTS} attempts") from None
             sleep(0.5 * 2 ** attempt + random.uniform(0, 0.5))
         except WriteUncertain:
             iid = item_id()
             what = f"item {iid}" if iid else "the write"
             raise TodoError(
-                f"timed out writing todos.md; {what} may or may not have landed") from None
+                f"timed out writing {path}; {what} may or may not have landed") from None
         except StoreError as e:
             raise TodoError(f"GitHub: {e}") from None
     raise AssertionError("unreachable")

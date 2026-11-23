@@ -54,4 +54,19 @@ fi
 "$bin_dir/hermes-wiki" install-hook --settings "$HOME/.claude/settings.json" \
   --command "$bin_dir/hermes-wiki session-end"
 
+if [ ! -f "$conf_dir/repos.toml" ]; then
+  mkdir -p "$conf_dir"
+  cat > "$conf_dir/repos.toml" <<'TOML'
+# Overrides for `hermes-wiki repos`; see the "Repo registry" section of runbooks/wiki.md.
+# List private repos that no private wiki page names, e.g. private = ["local:<dir>"].
+private = []
+TOML
+fi
+
+unit_dir="$HOME/.config/systemd/user"
+mkdir -p "$unit_dir"
+cp "$here/units/hermes-wiki-repos.service" "$here/units/hermes-wiki-repos.timer" "$unit_dir/"
+systemctl --user daemon-reload || echo "install-laptop: daemon-reload failed; run it after login" >&2
+
 echo "next: hermes-wiki import-claude-memory --projects ~/.claude/projects --dry-run"
+echo "repo registry: dry run, then turn on the timer during rollout (runbooks/wiki.md, Repo registry)"

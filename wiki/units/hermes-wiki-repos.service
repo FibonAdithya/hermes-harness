@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh the repo registry pages in the hermes wiki
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# the wiki pull goes over ssh and needs the agent; set it here, not from the manager environment
+Environment=SSH_AUTH_SOCK=%t/keyring/ssh
+ExecStart=%h/.local/bin/hermes-wiki repos
