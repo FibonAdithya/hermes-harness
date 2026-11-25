@@ -510,9 +510,9 @@ Setup (owner, GitHub > Settings > Developer settings > Fine-grained tokens):
    `GH_CONFIG_DIR=~/.hermes/gh-wiki gh api -X POST repos/FibonAdithya/hermes-wiki/git/blobs -f content=preflight -f encoding=utf-8 --jq .sha`
    prints a sha (an unreferenced blob, which GitHub garbage-collects).
 
-MEASURED 2026-11-25 on `hermes-vm`: the mirror token returned HTTP 403 on
-`repos/FibonAdithya/research-assistant/pulls/7`, so step 1 is still needed. When
-either token is rotated, set the same permissions on the new one.
+Both tokens were set up and checked on 2026-11-25 (see "Agent todos" in the
+Rollout log). When either token is rotated, set the same permissions on the new
+one.
 
 **Reminder or todo item.** Anything tied to a time goes through `remind-owner`.
 Everything else is a todo item.
@@ -669,3 +669,25 @@ All times UTC. The droplet is `hermes-vm`, the box `tig-adi`.
 | 12 | `banking-stack` (`finance`), `adithya` (`person`), `financial-plan` (no frontmatter): absent from the export, box `search`, `read` (not-found), `find /` in a `hermes-exec` container, and the brief (`context_dropped: ["banking-stack"]`). Gap: the task token `/etc/hermes-exec/github-token` can read and push the private wiki; see #31 | MEASURED | script on `tig-adi` | 2026-10-28 |
 | 13 | deferred: no `ANTHROPIC_API_KEY` on the droplet | — | — | — |
 | cost (spec §7) | not measured | — | — | — |
+
+### Agent todos (PR #60, PR #62)
+
+All times UTC. Rows dated 2026-11-19 are copied from todo 0daaae and were not
+re-measured on 2026-11-25.
+
+| check | result | MEASURED/ESTIMATED | command | when |
+|---|---|---|---|---|
+| laptop CLI and migration | laptop CLI at `c6e5c7a`; `todo migrate` landed as wiki `ded8b5e` (54 items, 41 open, 13 done) | recorded 2026-11-19, not re-measured | `hermes-wiki todo migrate` | 2026-11-19 |
+| agent rules | `~/.claude/CLAUDE.md` "Todo items" given the PR #60 rules: check `todo list` before adding, `--done-when` only when the event finishes the item, close other sessions' items, `rm` duplicates, `reopen` rejected suggestions. Before this, 0 of the 13 items added after migration had a check | MEASURED | `grep done-when ~/.claude/CLAUDE.md`; count of `done_when` on items created after 2026-11-19 | 2026-11-25 |
+| droplet code | PR #62 merged as `2f52b1b` 12:56; `harness-pull` logged `deployed 2f52b1b` | MEASURED | `journalctl --user -u harness-pull` | 2026-11-25 13:02 |
+| precheck | with no `~/.hermes/gh-wiki`: rc 1, `FATAL: no wiki write token in /home/hermes/.hermes/gh-wiki/hosts.yml ...`, nothing read | MEASURED | `~/.local/bin/todo-nightly.sh` | 2026-11-25, between 13:02 and 13:20 |
+| box | the bot's own ask could not run (`deploy ask: cannot read the box's deploy stamp: unknown verb: deployed`, box at `195a042`), so `deploy 2f52b1b` was refused twice with no request waiting. Deployed through `request_deploy`: stamp `~/.local/share/harness-deployed.sha` = `2f52b1b`; `todo add --help` lists `--done-when`; `todo list` refused (`public_only`) | MEASURED | approvals journal; `ssh tig-adi '~/.local/bin/hermes-wiki todo add --help'` | 2026-11-25 13:20 |
+| mirror token | `chain-acceptance#5` → `open`, `research-assistant#7` → `closed`; issues list readable | MEASURED | `GH_CONFIG_DIR=~/.hermes/gh-config gh api ...` | 2026-11-25 13:41 |
+| wiki token | blob POST to hermes-wiki → sha `7ac63ea6...`; `research-assistant#7` → HTTP 404; blob POST to hermes-harness → HTTP 403 | MEASURED | `GH_CONFIG_DIR=~/.hermes/gh-wiki gh api ...` | 2026-11-25 13:41 |
+| first nightly | `Result=success`; summary `closed 0, committed false, fetch_failures 0`; evidence file has 45 items with fetched PR state | MEASURED | `systemctl --user start todo-nightly.service`; `journalctl`; `~/.hermes/state/todo-evidence.json` | 2026-11-25 13:42 |
+| close by check | test item `e59a3a` with `--done-when pr:FibonAdithya/hermes-harness#62` closed `by: check`, reason `PR #62 merged 2026-11-25`, commit `d88c909 todo: nightly` | MEASURED | `todo add ...`; nightly run; `agent-todos.jsonl` at `origin/main` | 2026-11-25 13:43 |
+| timer | `enabled`; first scheduled run 2026-11-26 00:45 | MEASURED | `systemctl --user enable --now todo-nightly.timer`; `list-timers` | 2026-11-25 13:44 |
+| owner tick, laptop | tick on `5ff7ae` inside the `![[agent-todos]]` embed was staged at 13:45, but obsidian-git made no automatic commit (auto-save interval 5 min) until a manual commit-and-sync at 14:06 (`58b69e7`, merge `fbc532b`, no conflict). Next nightly `e98d7cd`: `by: owner`. The same edit had turned a "Recently done" line into `[] ...`; it was ignored and the page re-rendered | MEASURED | `git status` in `~/hermes-wiki`; `agent-todos.jsonl` at `origin/main` | 2026-11-25 14:07 |
+| owner tick, phone | phone git app commit `849279b` (`Last Sync: ... (Mobile)`, parent `e98d7cd`) ticked `6ff1b6`; nightly `c1d00c6`: `by: owner` | MEASURED | `git show 849279b`; nightly run | 2026-11-25 14:18 |
+| non-fast-forward text | GitHub's HTTP 422 wording on a racing ref update not seen live | — | — | — |
+| curator suggestions | none yet; the first scheduled nightly and curator run on 2026-11-26 | — | `journalctl --user -u todo-nightly.service`; `## Probably done, confirm` on the page | — |
