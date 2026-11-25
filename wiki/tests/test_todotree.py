@@ -25,8 +25,10 @@ class FakeRun:
         self.files = files or {}
         self.fail = fail or {}
         self.calls = []
+        self.kws = []
 
     def __call__(self, argv, **kw):
+        self.kws.append(kw)
         assert kw.get("capture_output") is True and kw.get("text") is True
         assert kw.get("timeout") == 30
         method = argv[argv.index("--method") + 1] if "--method" in argv else "GET"
@@ -177,3 +179,22 @@ def test_commit_errors_before_ref_update_are_store_errors(step, route, kind):
         tree(run).commit(SHA, {"a": "1"}, "m")
     assert not [c for c in run.calls if c[0] == "PATCH"]
     # catches `_json` ignoring returncode / unguarded response parsing
+
+
+def test_env_reaches_every_gh_call():
+    run = FakeRun(files={"agent-todos.jsonl": ""})
+    env = {"PATH": "/bin", "GH_CONFIG_DIR": "/wiki-token"}
+    t = todotree.GhTree("o/r", "gh", run, env=env)
+    base, _ = t.head(("agent-todos.jsonl",))
+    t.commit(base, {"agent-todos.jsonl": "x\n"}, "m")
+    kws = run.kws
+    assert len(kws) == 6
+    assert all(kw.get("env") is env for kw in kws)
+    # catches: an env that reaches the reads but not the writes, or no call at all
+
+
+def test_no_env_means_inherited_environment():
+    run = FakeRun(files={"agent-todos.jsonl": ""})
+    todotree.GhTree("o/r", "gh", run).head(("agent-todos.jsonl",))
+    assert run.kws and all("env" not in kw for kw in run.kws)
+    # catches: the laptop and box (no second token) getting a replaced environment

@@ -12,15 +12,18 @@ PATHS = ("agent-todos.jsonl", "agent-todos.md", "todos.md")
 
 
 class GhTree:
-    def __init__(self, repo: str, gh: str, run):
+    def __init__(self, repo: str, gh: str, run, env: dict[str, str] | None = None):
         self.repo = repo
         self.gh = gh
         self.run = run
+        self.env = env
 
     def _call(self, method: str, endpoint: str, body: dict | None = None,
               *, uncertain: bool = False):
         argv = [self.gh, "api", "--method", method, f"repos/{self.repo}/{endpoint}"]
         kw = {"capture_output": True, "text": True, "timeout": 30}
+        if self.env is not None:
+            kw["env"] = self.env
         if body is not None:
             argv += ["--input", "-"]
             kw["input"] = json.dumps(body)

@@ -402,8 +402,9 @@ change:
 **Nightly job (droplet).** `todo-nightly.timer` starts `todo-nightly.service` at
 00:45 (`Persistent=true`, so a missed run catches up), 15 minutes before the
 01:00 curator. The service runs `~/.local/bin/todo-nightly.sh`
-(`droplet/todo-nightly.sh`) as `hermes` with `GH_CONFIG_DIR=~/.hermes/gh-config`
-and a 10 minute timeout. In order:
+(`droplet/todo-nightly.sh`) as `hermes` with `GH_CONFIG_DIR=~/.hermes/gh-config` for reads and
+`HERMES_WIKI_TREE_GH_CONFIG_DIR=~/.hermes/gh-wiki` for the wiki write (see
+"Droplet tokens"), and a 10 minute timeout. In order:
 
 1. Read `.todo-suggestions.jsonl` from the sandbox checkout
    (`~/.hermes/sandboxes/docker/default/home/hermes-wiki/`, root-owned, read
@@ -478,15 +479,40 @@ prints `removed local FILE; only the todo commands write it`. A local edit or a
 locally created copy on the droplet therefore cannot be pushed over or in place
 of the generated files.
 
-**Droplet token.** The nightly job needs, for the token in
-`~/.hermes/gh-config`: read access to pull requests and issues on every
-repository a todo item references, and contents write on
-`FibonAdithya/hermes-wiki`. MEASURED 2026-11-19 on `hermes-vm` as `hermes` with
-that config: `gh api repos/FibonAdithya/chain-acceptance/pulls/5` returned HTTP
-403, and `gh api -X POST repos/FibonAdithya/hermes-wiki/git/blobs ...` returned
-HTTP 403. PR and issue reads worked only on `hermes-harness`. So the current
-token cannot run the job: widen it (and update the rotation reminder) before
-enabling the timer. Nothing is deployed yet.
+**Droplet tokens.** The nightly job uses two fine-grained tokens, so the one that
+can write never covers more than the wiki:
+
+| Config dir | Used for | Repositories | Permissions |
+|---|---|---|---|
+| `~/.hermes/gh-config` (`GH_CONFIG_DIR`) | PR and issue state; also the repo mirrors | All | Contents: Read, Pull requests: Read, Issues: Read |
+| `~/.hermes/gh-wiki` (`HERMES_WIKI_TREE_GH_CONFIG_DIR`) | the one wiki commit (git data API reads and writes) | `FibonAdithya/hermes-wiki` only | Contents: Read and write |
+
+`todo-nightly.sh` exports both and exits 1 with `FATAL: no wiki write token`
+before reading anything if `~/.hermes/gh-wiki/hosts.yml` has no `oauth_token`.
+`hermes-wiki todo` sends `HERMES_WIKI_TREE_GH_CONFIG_DIR`, when set, as
+`GH_CONFIG_DIR` to the gh calls that read and write the wiki; everything else
+keeps the process's `GH_CONFIG_DIR`. Laptop and box leave it unset and use their
+one login. Fine-grained token permissions apply to every repository the token
+selects, which is why write access lives on a separate token.
+
+Setup (owner, GitHub > Settings > Developer settings > Fine-grained tokens):
+
+1. Edit the mirror token and add Pull requests: Read and Issues: Read. Editing
+   keeps the token value, so nothing changes on the droplet.
+2. Create the wiki token: only `FibonAdithya/hermes-wiki`, Contents: Read and
+   write. Store it the same way as the mirror token (runbooks/dispatch.md,
+   mirrors Setup step 2):
+   `ssh -t hermes-vm 'mkdir -p ~/.hermes/gh-wiki && chmod 700 ~/.hermes/gh-wiki && GH_CONFIG_DIR=~/.hermes/gh-wiki gh auth login --with-token --insecure-storage'`
+   (paste the token, then Ctrl-D).
+3. Check, as `hermes` on the droplet:
+   `GH_CONFIG_DIR=~/.hermes/gh-config gh api repos/FibonAdithya/chain-acceptance/pulls/5 --jq .state`
+   prints a state, and
+   `GH_CONFIG_DIR=~/.hermes/gh-wiki gh api -X POST repos/FibonAdithya/hermes-wiki/git/blobs -f content=preflight -f encoding=utf-8 --jq .sha`
+   prints a sha (an unreferenced blob, which GitHub garbage-collects).
+
+MEASURED 2026-11-25 on `hermes-vm`: the mirror token returned HTTP 403 on
+`repos/FibonAdithya/research-assistant/pulls/7`, so step 1 is still needed. When
+either token is rotated, set the same permissions on the new one.
 
 **Reminder or todo item.** Anything tied to a time goes through `remind-owner`.
 Everything else is a todo item.
