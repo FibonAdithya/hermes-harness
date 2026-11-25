@@ -23,7 +23,11 @@ IGNORED = "hermes-wiki: --project/--done-when ignored until hermes-wiki todo mig
 def tree_for(cfg: WikiConfig, run) -> GhTree | DryTree:
     if os.environ.get("HERMES_WIKI_DRY_PUBLISH") == "1":
         return DryTree(cfg.state_dir / "dry")
-    return GhTree(cfg.repo, cfg.gh, run)
+    # The droplet nightly reads PRs with the all-repos read-only token (GH_CONFIG_DIR) and
+    # writes the wiki with a second token scoped to hermes-wiki (runbooks/wiki.md).
+    write_dir = os.environ.get("HERMES_WIKI_TREE_GH_CONFIG_DIR")
+    env = {**os.environ, "GH_CONFIG_DIR": write_dir} if write_dir else None
+    return GhTree(cfg.repo, cfg.gh, run, env=env)
 
 
 def _log(cfg: WikiConfig) -> Callable[[str], None]:

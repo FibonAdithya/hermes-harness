@@ -199,10 +199,13 @@ systemctl --user start hermes-repo-sync.service    # refresh now
 - **GitHub PAT** — regenerate the fine-grained token, then
   `ssh -t tig-server 'nano /etc/hermes-exec/github-token'`. Never pass it as a
   shell argument.
-- **Repo-mirror PAT** (mirrors only; all repos, Contents read-only) — regenerate,
+- **Repo-mirror PAT** (all repos; Contents, Pull requests and Issues read-only;
+  also read by the todo nightly job) — regenerate,
   then run step 2 of the mirrors' Setup again. Verify with
   `GH_CONFIG_DIR=~/.hermes/gh-config gh api user -q .login`. This token lives
   outside the agent's `/root` deliberately — do not move it into the sandbox.
+- **Wiki write PAT** (`~/.hermes/gh-wiki`; hermes-wiki only, Contents read and
+  write; used by the todo nightly job) — see runbooks/wiki.md, "Droplet tokens".
 - **Claude Code credential** — the executor mounts the box's own login,
   `~adi/.claude/.credentials.json`, read-only. Re-login with `ssh -t tig-adi claude`.
 - **Approvals bot token** — BotFather `/revoke`, then edit

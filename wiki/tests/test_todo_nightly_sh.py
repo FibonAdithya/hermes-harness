@@ -39,7 +39,7 @@ for a in "$@"; do
   fi
   prev=$a
 done
-echo "GH_CONFIG_DIR=$GH_CONFIG_DIR PYTHONPATH=$PYTHONPATH" > "$FAKE_ENV"
+echo "GH_CONFIG_DIR=$GH_CONFIG_DIR TREE=$HERMES_WIKI_TREE_GH_CONFIG_DIR PYTHONPATH=$PYTHONPATH" > "$FAKE_ENV"
 [ -z "$FAKE_MUTATE" ] || printf '%s' "$FAKE_MUTATE" > "$SBX_WIKI/.todo-suggestions.jsonl"
 echo '{"ok": true}'
 exit "${FAKE_PY_RC:-0}"
@@ -53,6 +53,9 @@ def sandbox(tmp_path):
         p.write_text(body)
         p.chmod(0o755)
     (tmp_path / "home").mkdir()
+    wiki_token = tmp_path / "home" / ".hermes" / "gh-wiki"
+    wiki_token.mkdir(parents=True)
+    (wiki_token / "hosts.yml").write_text("github.com:\n    oauth_token: x\n")
     (tmp_path / "wiki").mkdir()
     (tmp_path / "wiki" / ".todo-suggestions.jsonl").write_text(SUGGESTIONS)
     return tmp_path
@@ -98,9 +101,11 @@ def test_nightly_sh_env_and_tempfile_cleanup(sandbox):
     r, _ = run(sandbox)
     assert r.returncode == 0, r.stderr
     seen = (sandbox / "envseen").read_text().strip()
-    assert seen == f"GH_CONFIG_DIR={sandbox}/home/.hermes/gh-config PYTHONPATH={sandbox}/harness/wiki"
+    assert seen == (f"GH_CONFIG_DIR={sandbox}/home/.hermes/gh-config "
+                    f"TREE={sandbox}/home/.hermes/gh-wiki PYTHONPATH={sandbox}/harness/wiki")
     assert not Path((sandbox / "tmpname").read_text().strip()).exists()
-    # catches: missing gh config or PYTHONPATH exports, and a leaked temp file
+    # catches: missing gh config, wiki-write config or PYTHONPATH exports, the write token
+    # replacing the read token, and a leaked temp file
     # (a failing run also cleans up, via the EXIT trap)
 
 
@@ -155,3 +160,19 @@ def test_nightly_sh_read_is_readonly_and_networkless(sandbox):
     assert "--network=none" in read[0] and ":/wiki:ro" in read[0]
     assert "hermes-sandbox:latest" in read[0]
     # catches: mounting the checkout writable for the read, or allowing network
+
+
+@pytest.mark.parametrize("hosts", [None, "github.com:\n    user: x\n"])
+def test_nightly_sh_missing_wiki_token_aborts_before_anything(sandbox, hosts):
+    f = sandbox / "home" / ".hermes" / "gh-wiki" / "hosts.yml"
+    if hosts is None:
+        f.unlink()
+    else:
+        f.write_text(hosts)
+    r, log = run(sandbox)
+    assert r.returncode != 0
+    assert "FATAL" in r.stderr and "gh-wiki" in r.stderr
+    assert log == []
+    assert sug(sandbox).read_text() == SUGGESTIONS
+    # catches: running with no wiki write credential (every close fails at the write), or a
+    # token stored in a keyring the job cannot read (hosts.yml without oauth_token)

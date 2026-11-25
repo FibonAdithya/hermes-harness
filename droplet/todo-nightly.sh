@@ -11,8 +11,17 @@ DOCKER="${DOCKER:-docker}"
 PYTHON3="${PYTHON3:-python3}"
 HARNESS="${HARNESS:-$HOME/hermes-harness}"
 
+# Two tokens: gh-config (all repos, read-only, shared with the repo mirrors) reads PR and
+# issue state; gh-wiki (hermes-wiki only, contents write) makes the one wiki commit.
 export GH_CONFIG_DIR="$HOME/.hermes/gh-config"
+export HERMES_WIKI_TREE_GH_CONFIG_DIR="$HOME/.hermes/gh-wiki"
 export PYTHONPATH="$HARNESS/wiki"
+
+grep -q 'oauth_token:' "$HERMES_WIKI_TREE_GH_CONFIG_DIR/hosts.yml" 2>/dev/null || {
+  echo "FATAL: no wiki write token in $HERMES_WIKI_TREE_GH_CONFIG_DIR/hosts.yml; log in there" \
+       "with --insecure-storage (runbooks/wiki.md, Droplet tokens)" >&2
+  exit 1
+}
 
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT

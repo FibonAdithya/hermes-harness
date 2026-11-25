@@ -187,3 +187,33 @@ def test_unmigrated_new_commands_exit_1(env, monkeypatch, capsys):
         assert cli.main(["todo", *argv, "--config", str(env.conf())]) == 1
         assert "run hermes-wiki todo migrate first" in capsys.readouterr().err
     assert env.dry.read_text(encoding="utf-8") == before  # catches new commands touching todos.md
+
+
+def test_tree_gh_config_dir_env_selects_write_credential(env, monkeypatch, tmp_path, capsys):
+    log = tmp_path / "ghenv.log"
+    gh = tmp_path / "gh-envlog"
+    gh.write_text(f'#!/bin/sh\necho "$GH_CONFIG_DIR $KEEP_ME" >> {log}\nexit 97\n', encoding="utf-8")
+    gh.chmod(0o755)
+    monkeypatch.delenv("HERMES_WIKI_DRY_PUBLISH", raising=False)
+    monkeypatch.setenv("GH_CONFIG_DIR", "/read-token")
+    monkeypatch.setenv("KEEP_ME", "kept")
+    monkeypatch.setenv("HERMES_WIKI_TREE_GH_CONFIG_DIR", "/wiki-token")
+    conf = env.conf(gh=str(gh), source="claude-laptop")
+    cli.main(["todo", "--config", str(conf), "list"])
+    assert log.read_text().splitlines()[0] == "/wiki-token kept"
+    # catches: tree_for ignoring the variable, GhTree not passing env to gh, or an env
+    # holding only GH_CONFIG_DIR (gh then loses PATH, HOME and proxy settings)
+
+
+def test_tree_gh_config_dir_unset_keeps_gh_config_dir(env, monkeypatch, tmp_path, capsys):
+    log = tmp_path / "ghenv.log"
+    gh = tmp_path / "gh-envlog"
+    gh.write_text(f'#!/bin/sh\necho "$GH_CONFIG_DIR" >> {log}\nexit 97\n', encoding="utf-8")
+    gh.chmod(0o755)
+    monkeypatch.delenv("HERMES_WIKI_DRY_PUBLISH", raising=False)
+    monkeypatch.delenv("HERMES_WIKI_TREE_GH_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("GH_CONFIG_DIR", "/read-token")
+    conf = env.conf(gh=str(gh), source="claude-laptop")
+    cli.main(["todo", "--config", str(conf), "list"])
+    assert log.read_text().splitlines()[0] == "/read-token"
+    # catches: a default that points every machine at a second credential it doesn't have
