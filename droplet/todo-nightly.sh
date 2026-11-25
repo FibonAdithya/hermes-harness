@@ -19,7 +19,7 @@ export PYTHONPATH="$HARNESS/wiki"
 
 grep -q 'oauth_token:' "$HERMES_WIKI_TREE_GH_CONFIG_DIR/hosts.yml" 2>/dev/null || {
   echo "FATAL: no wiki write token in $HERMES_WIKI_TREE_GH_CONFIG_DIR/hosts.yml; log in there" \
-       "with --insecure-storage (runbooks/wiki.md, Droplet token)" >&2
+       "with --insecure-storage (runbooks/wiki.md, Droplet tokens)" >&2
   exit 1
 }
 
